@@ -57,6 +57,11 @@ defaults:
     trace_bytes_per_run: 134217728
     attachment_count: 16
     telemetry_events_per_run: 100000
+    image_pixels: 40000000
+    video_frames: 256
+    video_frame_pixels: 8500000
+    decoded_media_pixels: 500000000
+    media_duration_seconds: 600
   workers:
     count: 1
     startup_timeout_seconds: 120

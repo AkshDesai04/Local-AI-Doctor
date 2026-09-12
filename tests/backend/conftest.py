@@ -90,7 +90,10 @@ def embedding_model_dir(tmp_path: Path) -> Path:
     write_json(root / "tokenizer.json", {"model": {"type": "BPE", "vocab": {"a": 0}}})
     write_json(root / "preprocessor_config.json", {"processor_class": "Qwen3VLProcessor"})
     write_json(root / "video_preprocessor_config.json", {"fps": 2})
-    write_json(root / "1_Pooling" / "config.json", {"pooling_mode_lasttoken": True})
+    write_json(
+        root / "1_Pooling" / "config.json",
+        {"pooling_mode_lasttoken": True, "embedding_dimension": 128},
+    )
     (root / "2_Normalize").mkdir()
     write_safetensors(
         root / "model.safetensors",

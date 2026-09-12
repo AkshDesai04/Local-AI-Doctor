@@ -27,6 +27,7 @@ from collections.abc import Iterable, Mapping, MutableMapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -133,6 +134,44 @@ class ServerSettings(BaseModel):
     authentication_token: SecretStr | None = None
     csrf_protection: bool = True
 
+    @field_validator("authentication_token")
+    @classmethod
+    def require_usable_authentication_token(cls, token: SecretStr | None) -> SecretStr | None:
+        if token is None:
+            return None
+        value = token.get_secret_value()
+        if not value or any(character.isspace() or ord(character) < 0x20 for character in value):
+            raise ValueError("authentication token must be non-empty and contain no whitespace")
+        return token
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def require_exact_http_origins(cls, origins: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(origins)) != len(origins):
+            raise ValueError("allowed origins must not contain duplicates")
+        for origin in origins:
+            if origin == "*":
+                raise ValueError("wildcard CORS origins are not allowed")
+            parsed = urlsplit(origin)
+            try:
+                _ = parsed.port
+            except ValueError as exc:
+                raise ValueError(f"invalid allowed origin: {origin!r}") from exc
+            if (
+                parsed.scheme.casefold() not in {"http", "https"}
+                or parsed.hostname is None
+                or parsed.netloc.endswith(":")
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "allowed origins must be exact HTTP(S) origins without paths or credentials"
+                )
+        return origins
+
     @model_validator(mode="after")
     def external_binding_requires_explicit_security(self) -> ServerSettings:
         host = self.host.strip().lower()
@@ -146,8 +185,6 @@ class ServerSettings(BaseModel):
             )
         if not loopback and self.authentication_token is None:
             raise ValueError("non-loopback host requires server.authentication_token")
-        if "*" in self.allowed_origins and not loopback:
-            raise ValueError("wildcard CORS origins are not allowed for external access")
         return self
 
 
@@ -229,6 +266,11 @@ class LimitSettings(BaseModel):
     trace_bytes_per_run: int = Field(default=128 * 1024**2, ge=1024, le=100 * 1024**3)
     attachment_count: int = Field(default=16, ge=0, le=10_000)
     telemetry_events_per_run: int = Field(default=100_000, ge=1, le=100_000_000)
+    image_pixels: int = Field(default=40_000_000, ge=1, le=1_000_000_000)
+    video_frames: int = Field(default=256, ge=1, le=100_000)
+    video_frame_pixels: int = Field(default=8_500_000, ge=1, le=1_000_000_000)
+    decoded_media_pixels: int = Field(default=500_000_000, ge=1, le=100_000_000_000)
+    media_duration_seconds: float = Field(default=600.0, gt=0.0, le=86_400.0)
 
 
 class WorkerSettings(BaseModel):

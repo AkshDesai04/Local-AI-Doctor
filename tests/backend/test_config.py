@@ -72,6 +72,21 @@ def test_non_loopback_binding_requires_opt_in_and_authentication() -> None:
     assert "external" in caught.value.to_dict()["details"]["issues"][0]["message"]
 
 
+@pytest.mark.parametrize("token", ["", " ", "contains whitespace"])
+def test_authentication_token_must_be_usable_as_a_bearer_credential(token: str) -> None:
+    with pytest.raises(ValueError, match="non-empty and contain no whitespace"):
+        ServerSettings(authentication_token=SecretStr(token))
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["*", "ftp://example.test", "https://user@example.test", "https://example.test/path"],
+)
+def test_allowed_origins_are_exact_http_origins(origin: str) -> None:
+    with pytest.raises(ValueError, match="origin"):
+        ServerSettings(allowed_origins=(origin,))
+
+
 def test_redacted_config_and_inference_snapshot_hide_sensitive_values(tmp_path: Path) -> None:
     settings = AppSettings(
         paths=PathSettings(model_roots=(tmp_path / "private-models",)),

@@ -20,6 +20,7 @@ class ErrorCode(StrEnum):
     CONFIGURATION_VERSION = "configuration_version"
     PATH_OUTSIDE_ROOT = "path_outside_root"
     MODEL_NOT_FOUND = "model_not_found"
+    ATTACHMENT_NOT_FOUND = "attachment_not_found"
     MODEL_INVALID = "model_invalid"
     MODEL_CORRUPT = "model_corrupt"
     MISSING_COMPONENT = "missing_component"
@@ -36,6 +37,7 @@ class ErrorCode(StrEnum):
     INVALID_REQUEST = "invalid_request"
     LIMIT_EXCEEDED = "limit_exceeded"
     WORKER_BUSY = "worker_busy"
+    ACTIVE_RUN_CONFLICT = "active_run_conflict"
     CANCELLED = "cancelled"
     INTERNAL = "internal"
 
@@ -114,6 +116,11 @@ class ModelNotFoundError(WorkbenchError):
     http_status = 404
 
 
+class AttachmentNotFoundError(WorkbenchError):
+    code = ErrorCode.ATTACHMENT_NOT_FOUND
+    http_status = 404
+
+
 class ModelInvalidError(WorkbenchError):
     code = ErrorCode.MODEL_INVALID
     http_status = 422
@@ -179,8 +186,21 @@ class LimitExceededError(WorkbenchError):
     default_retryable = True
 
 
+class PayloadTooLargeError(WorkbenchError):
+    code = ErrorCode.LIMIT_EXCEEDED
+    http_status = 413
+
+
 class WorkerBusyError(WorkbenchError):
     code = ErrorCode.WORKER_BUSY
+    http_status = 409
+    default_retryable = True
+
+
+class ActiveRunConflictError(WorkbenchError):
+    """Raised when destructive workspace changes would invalidate an active run."""
+
+    code = ErrorCode.ACTIVE_RUN_CONFLICT
     http_status = 409
     default_retryable = True
 

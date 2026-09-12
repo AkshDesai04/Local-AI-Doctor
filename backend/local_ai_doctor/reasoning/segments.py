@@ -66,12 +66,19 @@ class TagReasoningSegmenter(ReasoningSegmentAdapter):
     ``unknown`` at token level while its slices remain precise.
     """
 
-    def __init__(self, opening_tag: str = "<think>", closing_tag: str = "</think>") -> None:
+    def __init__(
+        self,
+        opening_tag: str = "<think>",
+        closing_tag: str = "</think>",
+        *,
+        initially_inside: bool = False,
+    ) -> None:
         if not opening_tag or not closing_tag or opening_tag == closing_tag:
             raise ValueError("reasoning delimiters must be non-empty and distinct")
         self._opening_tag = opening_tag
         self._closing_tag = closing_tag
-        self._inside = False
+        self._inside = initially_inside
+        self._initially_inside = initially_inside
         self._pending: list[_Character] = []
         self._texts: dict[int, str] = {}
         self._labels: dict[int, list[tuple[SegmentClass, bool] | None]] = {}
@@ -202,9 +209,14 @@ class TagReasoningSegmenter(ReasoningSegmentAdapter):
             return ()
         self._drain(final=True)
         if self._inside:
-            self._warnings.append(
-                "reasoning opening delimiter was emitted without a matching closing delimiter"
-            )
+            if self._initially_inside:
+                self._warnings.append(
+                    "prompt-primed reasoning ended without an emitted closing delimiter"
+                )
+            else:
+                self._warnings.append(
+                    "reasoning opening delimiter was emitted without a matching closing delimiter"
+                )
         self._finalized = True
         return tuple(self._ready())
 

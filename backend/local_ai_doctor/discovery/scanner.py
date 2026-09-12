@@ -124,6 +124,39 @@ def _sentence_transformer_normalizes(directory: Path) -> bool:
     )
 
 
+def _sentence_transformer_embedding_dimension(directory: Path) -> int | None:
+    """Read the declared pooling width without importing checkpoint code."""
+
+    pooling, error = _safe_json(directory / "1_Pooling" / "config.json")
+    if error is not None:
+        return None
+    return _positive_int(pooling.get("embedding_dimension"))
+
+
+def _sentence_transformer_pooling(directory: Path) -> str | None:
+    """Return the explicitly configured pooling strategy, if unambiguous."""
+
+    pooling, error = _safe_json(directory / "1_Pooling" / "config.json")
+    if error is not None:
+        return None
+    direct = pooling.get("pooling_mode")
+    if isinstance(direct, str) and direct.strip():
+        normalized = direct.strip().casefold().replace("_", "-")
+        return {"lasttoken": "last-token", "weightedmean": "weighted-mean"}.get(
+            normalized, normalized
+        )
+    candidates = {
+        "cls": pooling.get("pooling_mode_cls_token"),
+        "max": pooling.get("pooling_mode_max_tokens"),
+        "mean": pooling.get("pooling_mode_mean_tokens"),
+        "mean-sqrt-length": pooling.get("pooling_mode_mean_sqrt_len_tokens"),
+        "weighted-mean": pooling.get("pooling_mode_weightedmean_tokens"),
+        "last-token": pooling.get("pooling_mode_lasttoken"),
+    }
+    enabled = [name for name, value in candidates.items() if value is True]
+    return enabled[0] if len(enabled) == 1 else None
+
+
 def _context_values(
     config: Mapping[str, Any],
     tokenizer: Mapping[str, Any],
@@ -563,14 +596,21 @@ class ModelScanner:
             or config.get("torch_dtype")
             or _nested_value(config, "text_config", "dtype")
         )
+        qwen_vl_embedding = (
+            task is ModelTask.MULTIMODAL_EMBEDDING and config.get("model_type") == "qwen3_vl"
+        )
         metadata: dict[str, Any] = {
             "task_evidence": task_evidence,
             "transformers_version": config.get("transformers_version"),
             "vocab_size": config.get("vocab_size")
             or _nested_value(config, "text_config", "vocab_size"),
-            "pooling": "sentence-transformers" if components.pooling else None,
+            "pooling": _sentence_transformer_pooling(directory),
             "normalization": (directory / "2_Normalize").is_dir()
             or _sentence_transformer_normalizes(directory),
+            "embedding_dimension": _sentence_transformer_embedding_dimension(directory),
+            "supports_dimension_truncation": qwen_vl_embedding,
+            "minimum_embedding_dimension": 64 if qwen_vl_embedding else None,
+            "joint_embedding_space": qwen_vl_embedding,
         }
         return ModelDescriptor(
             id=_safe_identifier(directory.name, fingerprint.value),

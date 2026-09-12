@@ -44,6 +44,35 @@ def test_unclosed_reasoning_is_reported_without_reclassifying_visible_tokens() -
     assert segmenter.warnings
 
 
+def test_prompt_primed_segmenter_starts_inside_reasoning() -> None:
+    segmenter = TagReasoningSegmenter(initially_inside=True)
+
+    assert segmenter.feed(0, "step</th") == ()
+    emitted = segmenter.feed(1, "ink>answer")
+
+    assert [item.classification for item in emitted] == [
+        SegmentClass.REASONING,
+        SegmentClass.UNKNOWN,
+    ]
+    assert emitted[1].slices[0].delimiter is True
+    assert emitted[1].slices[0].classification is SegmentClass.REASONING
+    assert emitted[1].slices[1].classification is SegmentClass.ANSWER
+    assert segmenter.inside_reasoning is False
+    assert segmenter.finalize() == ()
+    assert segmenter.warnings == ()
+
+
+def test_prompt_primed_unclosed_reasoning_has_specific_warning() -> None:
+    segmenter = TagReasoningSegmenter(initially_inside=True)
+    output = list(segmenter.feed(0, "unfinished"))
+    output.extend(segmenter.finalize())
+
+    assert output[0].classification is SegmentClass.REASONING
+    assert segmenter.warnings == (
+        "prompt-primed reasoning ended without an emitted closing delimiter",
+    )
+
+
 def test_unknown_adapter_never_claims_hidden_reasoning() -> None:
     segmenter = UnknownReasoningSegmenter()
     token = segmenter.feed(0, "analysis-like prose")[0]

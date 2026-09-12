@@ -43,6 +43,11 @@ def _partial(reason: str, *limitations: str) -> CapabilitySupport:
 
 
 def _backend(evidence: ModelEvidence, backend: BackendKind) -> CapabilitySupport:
+    if backend not in {BackendKind.CPU, BackendKind.CUDA}:
+        return CapabilitySupport(
+            state=CapabilityState.UNAVAILABLE_ON_BACKEND,
+            reason=f"the {backend.value} execution adapter is not implemented",
+        )
     if backend in evidence.available_backends:
         return _full()
     return CapabilitySupport(
@@ -97,12 +102,8 @@ def build_capability_matrix(evidence: ModelEvidence) -> CapabilityMatrix:
         if native_modalities
         else _unsupported("the model exposes no native file modality")
     )
-    entries[Capability.EXTRACTED_TEXT_FILE_INPUT] = (
-        _partial(
-            "document text extraction is an application preprocessing path, not a native model input"
-        )
-        if evidence.has_tokenizer
-        else _unsupported("no tokenizer-backed text input was discovered")
+    entries[Capability.EXTRACTED_TEXT_FILE_INPUT] = _unsupported(
+        "no extracted-text inference adapter is currently registered"
     )
     entries[Capability.REASONING_CHANNEL] = (
         _full()
@@ -112,9 +113,8 @@ def build_capability_matrix(evidence: ModelEvidence) -> CapabilityMatrix:
         )
     )
     entries[Capability.MOE_ROUTING] = (
-        _partial(
-            "router tensors require an architecture-specific instrumentation adapter",
-            "optimized or fused backends may hide routing",
+        _unsupported(
+            "the checkpoint appears to use experts, but no production router instrumentation adapter is registered"
         )
         if evidence.is_moe
         else _unsupported("not applicable: the checkpoint is dense, not mixture-of-experts")
@@ -124,21 +124,25 @@ def build_capability_matrix(evidence: ModelEvidence) -> CapabilityMatrix:
         Capability.RAW_LOGITS: "raw logits exist only for generation/scoring adapters",
         Capability.PROCESSED_LOGITS: "sampler logits exist only for generation adapters",
         Capability.TOP_K_ALTERNATIVES: "token alternatives do not apply to embedding runs",
-        Capability.PROMPT_SCORING: "prompt scoring requires a tokenizer-backed generation model",
         Capability.STREAMING: "token streaming does not apply to embedding runs",
         Capability.DETERMINISTIC_SEEDING: "sampling seeds do not select embedding outputs",
     }
     for capability, reason in generation_only.items():
         entries[capability] = _full() if generation else _unsupported(reason)
-    entries[Capability.ATTENTION_CAPTURE] = (
-        _partial("attention capture is opt-in and can disable optimized attention paths")
-        if evidence.architecture_known
-        else _unsupported("no compatible architecture adapter was identified")
+    entries[Capability.PROMPT_SCORING] = (
+        _full()
+        if evidence.task is ModelTask.TEXT_GENERATION
+        else _unsupported(
+            "encoder-decoder prompt scoring requires separate source and target text"
+            if evidence.task is ModelTask.ENCODER_DECODER_GENERATION
+            else "prompt scoring requires a tokenizer-backed generation model"
+        )
     )
-    entries[Capability.HIDDEN_STATE_CAPTURE] = (
-        _partial("hidden-state capture is opt-in and has a bounded trace size")
-        if evidence.architecture_known
-        else _unsupported("no compatible architecture adapter was identified")
+    entries[Capability.ATTENTION_CAPTURE] = _unsupported(
+        "the reference adapter does not currently capture attention tensors"
+    )
+    entries[Capability.HIDDEN_STATE_CAPTURE] = _unsupported(
+        "the reference adapter does not currently capture hidden-state traces"
     )
     entries[Capability.BATCHING] = (
         _partial("batching depends on compatible input shapes and the selected adapter")
