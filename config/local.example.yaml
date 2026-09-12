@@ -1,0 +1,17 @@
+# Copy to config/local.yaml (ignored by Git) and replace the placeholders.
+schema_version: 1
+defaults:
+  paths:
+    model_roots:
+      - X:/path/to/read-only-models
+  platform:
+    wsl_distribution: YourWslDistribution
+
+profiles:
+  native-windows:
+    runtime:
+      device: auto
+  native-wsl:
+    paths:
+      model_roots:
+        - /mnt/x/path/to/read-only-models

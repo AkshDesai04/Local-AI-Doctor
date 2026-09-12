@@ -1,0 +1,190 @@
+"""Structured, safe-to-serialize application errors.
+
+The core never exposes raw exception strings at transport boundaries.  Those
+strings frequently contain private paths, prompts, or implementation details.
+Instead, callers receive a stable error code, a concise message, and optional
+structured details that have been explicitly selected for disclosure.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from enum import StrEnum
+from pathlib import Path
+from typing import Any, ClassVar
+
+
+class ErrorCode(StrEnum):
+    CONFIGURATION_INVALID = "configuration_invalid"
+    CONFIGURATION_IO = "configuration_io"
+    CONFIGURATION_VERSION = "configuration_version"
+    PATH_OUTSIDE_ROOT = "path_outside_root"
+    MODEL_NOT_FOUND = "model_not_found"
+    MODEL_INVALID = "model_invalid"
+    MODEL_CORRUPT = "model_corrupt"
+    MISSING_COMPONENT = "missing_component"
+    UNSUPPORTED_ARCHITECTURE = "unsupported_architecture"
+    CAPABILITY_UNAVAILABLE = "capability_unavailable"
+    BACKEND_UNAVAILABLE = "backend_unavailable"
+    ADAPTER_NOT_FOUND = "adapter_not_found"
+    ADAPTER_CONFLICT = "adapter_conflict"
+    MODEL_NOT_LOADED = "model_not_loaded"
+    MODEL_ALREADY_LOADED = "model_already_loaded"
+    OUT_OF_MEMORY = "out_of_memory"
+    INVALID_SAMPLING_SETTINGS = "invalid_sampling_settings"
+    INVALID_LOGITS = "invalid_logits"
+    INVALID_REQUEST = "invalid_request"
+    LIMIT_EXCEEDED = "limit_exceeded"
+    WORKER_BUSY = "worker_busy"
+    CANCELLED = "cancelled"
+    INTERNAL = "internal"
+
+
+def _safe_detail(value: Any) -> Any:
+    """Convert deliberately supplied detail values to JSON-safe primitives."""
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        # Paths are redacted by default.  A caller may disclose a safe basename
+        # explicitly if that improves an error shown to the local user.
+        return f"<path:{value.name or 'root'}>"
+    if isinstance(value, Mapping):
+        return {str(key): _safe_detail(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_safe_detail(item) for item in value]
+    return type(value).__name__
+
+
+class WorkbenchError(Exception):
+    """Base class for errors that can safely cross an API boundary."""
+
+    code: ClassVar[ErrorCode] = ErrorCode.INTERNAL
+    http_status: ClassVar[int] = 500
+    default_retryable: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        hint: str | None = None,
+        details: Mapping[str, Any] | None = None,
+        retryable: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.hint = hint
+        self.details = dict(details or {})
+        self.retryable = self.default_retryable if retryable is None else retryable
+
+    def to_dict(self, *, include_details: bool = True) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "code": self.code.value,
+            "message": self.message,
+            "retryable": self.retryable,
+        }
+        if self.hint:
+            payload["hint"] = self.hint
+        if include_details and self.details:
+            payload["details"] = _safe_detail(self.details)
+        return payload
+
+
+class ConfigurationError(WorkbenchError):
+    code = ErrorCode.CONFIGURATION_INVALID
+    http_status = 422
+
+
+class ConfigurationIOError(WorkbenchError):
+    code = ErrorCode.CONFIGURATION_IO
+    http_status = 500
+
+
+class ConfigurationVersionError(ConfigurationError):
+    code = ErrorCode.CONFIGURATION_VERSION
+
+
+class PathSecurityError(WorkbenchError):
+    code = ErrorCode.PATH_OUTSIDE_ROOT
+    http_status = 403
+
+
+class ModelNotFoundError(WorkbenchError):
+    code = ErrorCode.MODEL_NOT_FOUND
+    http_status = 404
+
+
+class ModelInvalidError(WorkbenchError):
+    code = ErrorCode.MODEL_INVALID
+    http_status = 422
+
+
+class ModelCorruptError(ModelInvalidError):
+    code = ErrorCode.MODEL_CORRUPT
+
+
+class MissingComponentError(ModelInvalidError):
+    code = ErrorCode.MISSING_COMPONENT
+
+
+class UnsupportedArchitectureError(WorkbenchError):
+    code = ErrorCode.UNSUPPORTED_ARCHITECTURE
+    http_status = 422
+
+
+class CapabilityUnavailableError(WorkbenchError):
+    code = ErrorCode.CAPABILITY_UNAVAILABLE
+    http_status = 409
+
+
+class BackendUnavailableError(WorkbenchError):
+    code = ErrorCode.BACKEND_UNAVAILABLE
+    http_status = 503
+
+
+class AdapterNotFoundError(WorkbenchError):
+    code = ErrorCode.ADAPTER_NOT_FOUND
+    http_status = 422
+
+
+class AdapterConflictError(WorkbenchError):
+    code = ErrorCode.ADAPTER_CONFLICT
+    http_status = 409
+
+
+class InvalidSamplingSettingsError(WorkbenchError):
+    code = ErrorCode.INVALID_SAMPLING_SETTINGS
+    http_status = 422
+
+
+class InvalidLogitsError(WorkbenchError):
+    code = ErrorCode.INVALID_LOGITS
+    http_status = 422
+
+
+class InvalidRequestError(WorkbenchError):
+    code = ErrorCode.INVALID_REQUEST
+    http_status = 422
+
+
+class OutOfMemoryError(WorkbenchError):
+    code = ErrorCode.OUT_OF_MEMORY
+    http_status = 507
+    default_retryable = True
+
+
+class LimitExceededError(WorkbenchError):
+    code = ErrorCode.LIMIT_EXCEEDED
+    http_status = 429
+    default_retryable = True
+
+
+class WorkerBusyError(WorkbenchError):
+    code = ErrorCode.WORKER_BUSY
+    http_status = 409
+    default_retryable = True
+
+
+class CancelledError(WorkbenchError):
+    code = ErrorCode.CANCELLED
+    http_status = 499

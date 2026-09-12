@@ -1,0 +1,117 @@
+schema_version: 1
+active_profile: development
+
+defaults:
+  paths:
+    model_roots:
+      - ../models
+    database: ../data/workbench.sqlite3
+    uploads: ../data/uploads
+    cache: ../data/cache
+    exports: ../data/exports
+    backups: ../data/backups
+  server:
+    host: 127.0.0.1
+    port: 8000
+    allowed_origins:
+      - http://127.0.0.1:5173
+      - http://localhost:5173
+    allow_external_access: false
+    csrf_protection: true
+  runtime:
+    backend: auto
+    device: auto
+    allow_cpu_fallback: true
+    low_memory_loading: true
+    cpu_offload: false
+    device_placement: sequential
+    dtype: auto
+    quantization: none
+    attention_backend: auto
+    load_one_model_at_a_time: true
+    max_loaded_models: 1
+    max_batch_size: 1
+    max_concurrent_runs: 1
+    queue_limit: 32
+  inference:
+    conservative_context_limit: 4096
+    reserved_output_tokens: 512
+    max_prompt_tokens: 32768
+    local_files_only: true
+    trust_remote_code: false
+    deterministic_reference_mode: false
+    instrumentation: token
+    defaults:
+      max_output_tokens: 512
+      temperature: 0.7
+      top_k: 50
+      top_p: 0.95
+      min_p: 0.0
+      repetition_penalty: 1.0
+      frequency_penalty: 0.0
+      presence_penalty: 0.0
+      alternatives: 10
+  limits:
+    upload_bytes: 104857600
+    prompt_bytes: 4194304
+    trace_bytes_per_run: 134217728
+    attachment_count: 16
+    telemetry_events_per_run: 100000
+  workers:
+    count: 1
+    startup_timeout_seconds: 120
+    load_timeout_seconds: 600
+    inference_timeout_seconds: 3600
+    shutdown_grace_seconds: 15
+  telemetry:
+    retention_days: 30
+    persist_token_events: true
+    persist_router_traces: false
+    router_trace_token_limit: 256
+    hardware_sample_interval_seconds: 1.0
+    write_batch_size: 128
+    write_flush_interval_ms: 100
+  logging:
+    level: info
+    json: true
+    redact_paths: true
+    log_prompts: false
+    log_model_output: false
+  features:
+    attention_probe: false
+    hidden_state_probe: false
+    activation_probe: false
+    logit_lens: false
+    full_router_traces: false
+    multi_gpu: false
+  platform:
+    container_model_root: /models
+    container_data_root: /data
+    container_gpu_profile: false
+
+profiles:
+  development:
+    logging:
+      level: debug
+      json: false
+    telemetry:
+      retention_days: 7
+  test:
+    runtime:
+      device: cpu
+      cpu_threads: 1
+    inference:
+      conservative_context_limit: 1024
+      instrumentation: full
+  native-windows:
+    runtime:
+      device: auto
+  native-wsl:
+    runtime:
+      device: auto
+  container-cpu: {}
+  container-nvidia: {}
+  production:
+    logging:
+      level: info
+      json: true
