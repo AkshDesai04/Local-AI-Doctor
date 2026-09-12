@@ -1,0 +1,221 @@
+name: ${COMPOSE_PROJECT_NAME:-local-ai-doctor}
+
+x-build-common: &build-common
+  context: .
+  dockerfile: Dockerfile
+
+x-cpu-image: &cpu-image
+  image: ${CPU_IMAGE_NAME:-local-ai-doctor-cpu}:${IMAGE_TAG:-dev}
+  build:
+    <<: *build-common
+    target: cpu
+
+x-nvidia-image: &nvidia-image
+  image: ${NVIDIA_IMAGE_NAME:-local-ai-doctor-nvidia}:${IMAGE_TAG:-dev}
+  build:
+    <<: *build-common
+    target: nvidia
+
+x-persistent-mounts: &persistent-mounts
+  - type: bind
+    source: ${MODEL_PATH:?Set MODEL_PATH in the ignored .env file to a WSL-visible model directory}
+    target: /models
+    read_only: true
+    bind:
+      create_host_path: false
+  - type: bind
+    source: ${APP_CONFIG_PATH:-./config/local.example.yaml}
+    target: /app/config/local.yaml
+    read_only: true
+    bind:
+      create_host_path: false
+  - type: volume
+    source: database
+    target: /data/database
+  - type: volume
+    source: uploads
+    target: /data/uploads
+  - type: volume
+    source: cache
+    target: /data/cache
+  - type: volume
+    source: exports
+    target: /data/exports
+  - type: volume
+    source: backups
+    target: /data/backups
+
+x-app-environment: &app-environment
+  LAD_CONFIG: /app/config/default.yaml
+  LAD_USER_CONFIG: /app/config/local.yaml
+  LAD_SERVER__HOST: 127.0.0.1
+  LAD_SERVER__PORT: ${CONTAINER_PORT:-8000}
+  LAD_SERVER__ALLOWED_ORIGINS: '["http://127.0.0.1:${HOST_PORT:-8000}","http://localhost:${HOST_PORT:-8000}"]'
+  LAD_PATHS__MODEL_ROOTS: '["/models"]'
+  LAD_PATHS__DATABASE: /data/database/workbench.sqlite3
+  LAD_PATHS__UPLOADS: /data/uploads
+  LAD_PATHS__CACHE: /data/cache
+  LAD_PATHS__EXPORTS: /data/exports
+  LAD_PATHS__BACKUPS: /data/backups
+  LAD_PLATFORM__CONTAINER_MODEL_ROOT: /models
+  LAD_PLATFORM__CONTAINER_DATA_ROOT: /data
+  LAD_RUNTIME__CPU_THREADS: ${CPU_THREADS:-8}
+  LAD_WORKERS__COUNT: ${MODEL_WORKERS:-1}
+  CONTAINER_LISTEN_HOST: 0.0.0.0
+  CONTAINER_LISTEN_PORT: ${CONTAINER_PORT:-8000}
+  UVICORN_WORKERS: ${UVICORN_WORKERS:-1}
+  SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS:-20}
+  HF_HOME: /data/cache/huggingface
+  TORCH_HOME: /data/cache/torch
+  XDG_CACHE_HOME: /data/cache/xdg
+
+x-security: &security
+  user: "10001:10001"
+  privileged: false
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=${TMPFS_SIZE:-1g},uid=10001,gid=10001,mode=1770
+
+x-preflight: &preflight
+  <<: *security
+  restart: "no"
+  init: true
+  entrypoint:
+    - python
+    - /app/docker/preflight.py
+  command: []
+  network_mode: none
+  volumes: *persistent-mounts
+  healthcheck:
+    disable: true
+
+x-app: &app
+  <<: *security
+  restart: unless-stopped
+  init: true
+  stop_signal: SIGTERM
+  stop_grace_period: ${STOP_GRACE_PERIOD:-30s}
+  volumes: *persistent-mounts
+  ports:
+    - name: http
+      target: ${CONTAINER_PORT:-8000}
+      published: "${HOST_PORT:-8000}"
+      host_ip: 127.0.0.1
+      protocol: tcp
+      app_protocol: http
+      mode: host
+  cpus: "${CONTAINER_CPUS:-8.0}"
+  mem_limit: ${CONTAINER_MEMORY_LIMIT:-16g}
+  mem_reservation: ${CONTAINER_MEMORY_RESERVATION:-2g}
+  pids_limit: ${CONTAINER_PIDS_LIMIT:-512}
+  shm_size: ${TMPFS_SIZE:-1g}
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - >-
+        import os,urllib.request;
+        u='http://127.0.0.1:'+os.environ.get('CONTAINER_LISTEN_PORT','8000')+'/api/v1/health';
+        r=urllib.request.urlopen(u,timeout=3);
+        raise SystemExit(0 if r.status==200 else 1)
+    interval: 15s
+    timeout: 5s
+    start_period: 30s
+    retries: 5
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  preflight-cpu:
+    <<:
+      - *preflight
+      - *cpu-image
+    profiles:
+      - cpu
+
+  app-cpu:
+    <<:
+      - *app
+      - *cpu-image
+    container_name: ${CPU_CONTAINER_NAME:-local-ai-doctor-cpu}
+    profiles:
+      - cpu
+    depends_on:
+      preflight-cpu:
+        condition: service_completed_successfully
+        restart: true
+    environment:
+      <<: *app-environment
+      LAD_PROFILE: container-cpu
+      LAD_RUNTIME__DEVICE: cpu
+      LAD_RUNTIME__ALLOW_CPU_FALLBACK: "true"
+
+  preflight-nvidia:
+    <<:
+      - *preflight
+      - *nvidia-image
+    profiles:
+      - nvidia
+
+  app-nvidia:
+    <<:
+      - *app
+      - *nvidia-image
+    container_name: ${NVIDIA_CONTAINER_NAME:-local-ai-doctor-nvidia}
+    profiles:
+      - nvidia
+    depends_on:
+      preflight-nvidia:
+        condition: service_completed_successfully
+        restart: true
+    gpus: all
+    environment:
+      <<: *app-environment
+      LAD_PROFILE: container-nvidia
+      LAD_RUNTIME__DEVICE: cuda
+      LAD_RUNTIME__ALLOW_CPU_FALLBACK: "false"
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+
+  database-maintenance:
+    <<:
+      - *security
+      - *cpu-image
+    profiles:
+      - maintenance
+    restart: "no"
+    network_mode: none
+    entrypoint:
+      - python
+      - /app/docker/sqlite_backup.py
+    command:
+      - backup
+    volumes:
+      - type: volume
+        source: database
+        target: /data/database
+      - type: volume
+        source: backups
+        target: /data/backups
+    healthcheck:
+      disable: true
+
+volumes:
+  database:
+    name: ${DATABASE_VOLUME_NAME:-local-ai-doctor-database}
+  uploads:
+    name: ${UPLOADS_VOLUME_NAME:-local-ai-doctor-uploads}
+  cache:
+    name: ${CACHE_VOLUME_NAME:-local-ai-doctor-cache}
+  exports:
+    name: ${EXPORTS_VOLUME_NAME:-local-ai-doctor-exports}
+  backups:
+    name: ${BACKUPS_VOLUME_NAME:-local-ai-doctor-backups}

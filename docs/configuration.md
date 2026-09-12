@@ -1,0 +1,182 @@
+# Configuration reference
+
+## Sources and precedence
+
+Configuration is parsed once through `SettingsLoader` and validated as `AppSettings`. From lowest to highest precedence:
+
+1. Pydantic model defaults.
+2. The portable configuration's `defaults` section.
+3. The selected built-in profile.
+4. The selected profile in the portable configuration.
+5. The user-local configuration's `defaults`, then its selected profile.
+6. `LAD_` environment overrides.
+7. Repeated command-line `--set` overrides.
+
+The checked-in portable file is `config/default.yaml`. Native commands automatically use the ignored `config/local.yaml` when it exists. Select alternatives with `--config`, `--user-config`, `LAD_CONFIG`, and `LAD_USER_CONFIG`.
+
+Profile selection uses `--profile`, then `LAD_PROFILE`, then `active_profile` in the portable configuration, then `development`. Available profiles are `development`, `test`, `native-windows`, `native-wsl`, `container-cpu`, `container-nvidia`, and `production`.
+
+All documents require schema version 1. The loader can migrate the pre-release version-0 keys `models_path` and `database_path`; a file with a future schema version fails with an actionable error.
+
+## File shape
+
+```yaml
+schema_version: 1
+active_profile: native-windows
+
+defaults:
+  paths:
+    model_roots:
+      - X:/models
+  runtime:
+    device: auto
+
+profiles:
+  native-windows:
+    runtime:
+      cpu_threads: 8
+```
+
+A document without a `defaults` key is also accepted as a flat settings document. Unknown fields are rejected. Relative application paths are resolved against the portable configuration directory, so checked-in `../data/...` defaults resolve at the repository root. Prefer absolute model roots in local configuration to avoid ambiguity.
+
+Copy `config/local.example.yaml` to `config/local.yaml`; never edit the example with personal paths and never commit the local file.
+
+## Environment and CLI values
+
+Environment variables use `LAD_` and double underscores between nested keys. Values are parsed as safe YAML scalars, so booleans, numbers, lists, and `null` retain their types.
+
+```powershell
+$env:LAD_PROFILE = 'native-windows'
+$env:LAD_RUNTIME__DEVICE = 'cpu'
+$env:LAD_PATHS__MODEL_ROOTS = '["X:/models","Y:/more-models"]'
+$env:LAD_SERVER__PORT = '8080'
+local-ai-doctor config
+```
+
+CLI keys use dots and may be repeated:
+
+```powershell
+local-ai-doctor serve `
+  --profile native-windows `
+  --set runtime.device=cuda `
+  --set runtime.dtype=bfloat16 `
+  --set inference.defaults.max_output_tokens=256
+```
+
+`local-ai-doctor config` prints the effective settings while replacing secrets, local paths, and the WSL distribution identifier with redaction markers. `GET /api/v1/configuration` returns the same safe view. Each run stores an inference-relevant snapshot and SHA-256 configuration digest.
+
+## Settings
+
+### `paths`
+
+| Field | Portable default | Current behavior |
+| --- | --- | --- |
+| `model_roots` | `../models` | One or more read-only roots scanned at startup and refresh. Duplicates and an empty list are rejected. |
+| `database` | `../data/workbench.sqlite3` | SQLite database path. Parent directories are created. |
+| `uploads` | `../data/uploads` | Content-addressed attachment storage. |
+| `cache` | `../data/cache` | Reserved native cache location; containers separately point framework cache variables at `/data/cache`. |
+| `exports` | `../data/exports` | Reserved for persisted exports; current HTTP exports are generated responses. |
+| `backups` | `../data/backups` | Automatic pre-migration SQLite backups. |
+
+### `server`
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `host` | `127.0.0.1` | Loopback is the safe default. |
+| `port` | `8000` | 1 through 65535. |
+| `allowed_origins` | Vite origins on `127.0.0.1:5173` and `localhost:5173` | Exact additional HTTP Origin allowlist for CORS, state-changing requests, and WebSockets. The request target's own origin is also accepted, including the HTTP-equivalent origin for WS/WSS. |
+| `allow_external_access` | `false` | Must be explicitly true for a non-loopback host. |
+| `authentication_token` | `null` | Required for a non-loopback host. HTTP APIs use `Authorization: Bearer`; the browser encodes the same tab-scoped token in a `lad.auth.*` WebSocket subprotocol so it never appears in a URL. |
+| `csrf_protection` | `true` | When enabled, state-changing requests with an Origin must match the allowlist. CORS remains configured independently. |
+
+Non-loopback configuration is rejected unless external access and a token are both present. Origins must be exact HTTP(S) origins without paths or credentials; duplicates and wildcards are rejected in every profile. HTTP Host values are limited to the configured listener and the hostnames in `allowed_origins`; list every reviewed browser-facing hostname there. The application does not provide TLS, account management, rate limiting, or token rotation; place a reviewed authenticated TLS proxy in front if remote access is genuinely required.
+
+### `runtime`
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `backend` | `auto` | Reserved selector; the current worker uses its reference Transformers/SentenceTransformers paths. |
+| `device` | `auto` | `auto`, `cpu`, or `cuda`. Auto chooses the first usable CUDA device, otherwise CPU. |
+| `allow_cpu_fallback` | `true` | Allows an unavailable CUDA request to fall back to CPU. |
+| `cpu_threads` | logical CPU count | Passed to `torch.set_num_threads`; test and container profiles override it. |
+| `ram_budget_bytes`, `vram_budget_bytes` | `null` | Before load, the selected backend rejects a checkpoint whose discovered SafeTensors weight bytes exceed its configured budget. This is a lower-bound preflight, not an estimate or cap for peak runtime memory. |
+| `low_memory_loading` | `true` | Passed to Transformers model loading. |
+| `cpu_offload` | `false` | The reference adapter rejects model load when true; no offload map is implemented. |
+| `device_placement` | `sequential` | Reserved for adapter placement policies. |
+| `dtype` | `auto` | `float32`, `float16`, or `bfloat16`; auto uses BF16 on CUDA capability 8+, FP16 on older CUDA, and FP32 on CPU. CPU FP16 is rejected. |
+| `quantization` | `none` | Any non-`none` value is rejected at model load because no compatible weight-quantization adapter is installed. |
+| `attention_backend` | `auto` | `eager`, `sdpa`, or `flash-attention-2` is passed to Transformers when selected. |
+| `load_one_model_at_a_time` | `true` | Requires `max_loaded_models=1`; the worker unloads before loading a different checkpoint. |
+| `max_loaded_models` | `1` | Values above one require disabling the policy, but the current single worker still holds one model. |
+| `max_batch_size` | `1` | Used as the maximum SentenceTransformers encode batch; generation remains batch one. |
+| `max_concurrent_runs` | `1` | Validated policy; the single admission lease serializes generation, embeddings, and prompt scoring regardless of larger values. |
+| `queue_limit` | `32` | Number of inference reservations allowed to wait beyond the one runnable/active slot. `0` permits one inference with no waiter. Overflow returns a structured 429 before chat/run mutation. Explicit model load/unload rejects while any inference is admitted. |
+
+### `inference`
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `conservative_context_limit` | `4096` | Included among discovered context candidates; the minimum plausible value is enforced for generation. |
+| `reserved_output_tokens` | `512` | For causal generation, subtracted from the effective context when computing the maximum admitted rendered-prompt length. Encoder-decoder source and decoder lengths are treated separately, so it is not subtracted from the source limit. |
+| `max_prompt_tokens` | `32768` | Enforced for generation after chat rendering/tokenization. The prompt limit is the minimum of this value and the architecture-specific context allowance. Requested output is also clipped to remaining context. |
+| `local_files_only` | `true` | The worker currently enforces local-only loading regardless of override. |
+| `trust_remote_code` | `false` | `true` is rejected globally. |
+| `deterministic_reference_mode` | `false` | Default policy; each generation request may opt in separately. |
+| `instrumentation` | `token` | Default request level: `off`, `basic`, `token`, `full`, or `expert`. See [Metrics](metrics.md). |
+| `defaults.*` | 512 tokens, temperature 0.7, top-k 50, top-p 0.95 | Central sampling defaults. An omitted request field inherits the corresponding effective configured value. |
+
+Sampling also includes `min_p=0`, repetition penalty `1`, frequency/presence penalties `0`, and 10 alternatives.
+
+### `limits`
+
+| Field | Default | Enforcement |
+| --- | --- | --- |
+| `upload_bytes` | 100 MiB | Exact uploaded-file limit, enforced while streaming to temporary storage. Multipart request bodies are independently capped at this value plus a 1 MiB framing allowance. |
+| `prompt_bytes` | 4 MiB | Enforced on rendered generation prompts, embedding text, prompt scoring, and standalone message content. Non-multipart POST/PUT/PATCH bodies are independently capped at this value plus a 1 MiB JSON/form envelope allowance. |
+| `trace_bytes_per_run` | 128 MiB | Caps persisted per-token payload bytes for token rows/raw token events. Live inference continues and emits a warning when token-row persistence is truncated. |
+| `attachment_count` | 16 | Enforced for standalone-message and generation attachment IDs, plus attachment-backed embedding inputs. Generation media is still rejected by the reference adapter. |
+| `telemetry_events_per_run` | 100,000 | Caps persisted token events per run. It does not cap live WebSocket delivery or stop inference. |
+| `image_pixels` | 40,000,000 | Maximum decoded width times height for an uploaded image. |
+| `video_frames` | 256 | Maximum decoded frames for video and maximum frames for an animated image. |
+| `video_frame_pixels` | 8,500,000 | Maximum decoded width times height for each video frame. |
+| `decoded_media_pixels` | 500,000,000 | Maximum cumulative decoded pixels for a video or animated image. |
+| `media_duration_seconds` | 600 | Maximum declared or decoded duration for video and audio. |
+
+Declared `Content-Length` and streamed bytes are both checked. Oversized request envelopes or decoded media return HTTP 413. Supported image, video, and audio uploads are decoder-validated before their attachment record is created; the byte limit alone is not treated as sufficient protection from compressed media expansion.
+
+### `workers`
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `count` | `1` | Reserved; application composition currently starts exactly one spawned worker. |
+| `startup_timeout_seconds` | `120` | Reserved for a startup handshake. |
+| `load_timeout_seconds` | `600` | Model-load request timeout. |
+| `inference_timeout_seconds` | `3600` | Generation, embedding, and prompt-score timeout. |
+| `shutdown_grace_seconds` | `15` | Worker unload/exit grace and model unload timeout. |
+
+### `telemetry`
+
+`write_batch_size` (128) and `write_flush_interval_ms` (100) configure asynchronous SQLite batching. Terminal events force a flush before persistence. `persist_token_events=false` suppresses token rows and durable raw token events while leaving live delivery and terminal state intact. `retention_days` expresses profile policy but is not run by a scheduler; old terminal runs are removed only through the confirmed, timezone-aware `DELETE /api/v1/storage/telemetry` operation. `persist_router_traces`, `router_trace_token_limit`, and `hardware_sample_interval_seconds` remain inactive because production router capture and periodic utilization sampling are not implemented.
+
+### `logging`
+
+`level` controls Uvicorn log level. `json`, `redact_paths`, `log_prompts`, and `log_model_output` express the logging contract. Enabling prompt or model-output logging is rejected. The current application does not yet install a separate structured JSON logger; transport errors and worker diagnostics are deliberately bounded and redacted.
+
+### `features`
+
+`attention_probe`, `hidden_state_probe`, `activation_probe`, `logit_lens`, `full_router_traces`, and `multi_gpu` default to false. They are reserved capability gates and do not activate probes in the current worker.
+
+### `platform`
+
+`wsl_distribution` records a local WSL selection, while `container_model_root`, `container_data_root`, and `container_gpu_profile` describe container intent. Docker orchestration uses `.env` and `scripts/wsl-docker.ps1`; application business logic does not invoke WSL or Docker.
+
+## Profile behavior
+
+- `development`: debug, human-readable logs and seven-day retention intent. Interactive API docs are available at `/api/docs`.
+- `test`: isolated test paths, CPU with one thread, full instrumentation, and a 1,024-token conservative context.
+- `native-windows` and `native-wsl`: automatic device selection.
+- `container-cpu`: `/models` and `/data` paths, explicit CPU, JSON-log intent.
+- `container-nvidia`: container paths, required CUDA without CPU fallback, GPU profile marker.
+- `production`: info/JSON-log intent and 30-day retention intent. Interactive docs are disabled.
+
+Compose supplies additional deployment controls such as port publication, CPU/memory/PID limits, volume names, and NVIDIA device visibility. Those are documented in [deployment.md](deployment.md), not parsed as application settings.
