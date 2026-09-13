@@ -470,13 +470,20 @@ function MessageRow({
   const [copied, setCopied] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.content);
-  const tokenized = nerdMode && message.role === "assistant" && (run?.id === message.runId || run?.messageId === message.id);
+  const runMatchesMessage = run?.id === message.runId || run?.messageId === message.id;
+  const tokenized = nerdMode && message.role === "assistant" && runMatchesMessage;
   const rawNerdFallback = nerdMode && message.role === "assistant" && !tokenized;
   const reasoningPrimed = message.reasoningPrimed === true || Boolean(
     message.role === "assistant"
-    && (run?.id === message.runId || run?.messageId === message.id)
+    && runMatchesMessage
     && run?.tokens.some((token) => token.reasoningSegment === "reasoning")
   );
+  const assistantOutput = message.role === "assistant"
+    ? splitAssistantOutput(message.content, reasoningPrimed)
+    : null;
+  const endedWithoutAnswer = message.status === "complete"
+    && assistantOutput?.hasReasoning === true
+    && assistantOutput.answer.length === 0;
   const copy = (): void => {
     const copyValue = message.role === "assistant" && !nerdMode ? cleanAssistantOutput(message.content, reasoningPrimed) : message.content;
     void navigator.clipboard.writeText(copyValue).then(() => {
@@ -498,6 +505,13 @@ function MessageRow({
           <NerdRawResponse content={message.content} reasoningPrimed={reasoningPrimed} />
         ) : (
           <div className="message-content"><MarkdownMessage assistant={message.role === "assistant"} content={message.content} reasoningPrimed={reasoningPrimed} />{message.status === "streaming" && <span className="stream-caret" />}</div>
+        )}
+        {endedWithoutAnswer && (
+          <div className="assistant-output-warning" role="status">
+            {runMatchesMessage && run?.metrics?.finishReason === "length"
+              ? "No final answer: this response reached its token limit. Increase Max tokens and regenerate."
+              : "No final answer was produced. Regenerate the response to try again."}
+          </div>
         )}
         {message.error && <div className="message-error">{message.error}</div>}
         <div className="message-actions">

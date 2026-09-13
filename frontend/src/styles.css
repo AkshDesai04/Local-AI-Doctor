@@ -206,6 +206,7 @@ button:disabled, input:disabled, textarea:disabled, select:disabled { cursor: no
 .reasoning-content > :first-child { margin-top: 0; }
 .reasoning-content > :last-child { margin-bottom: 0; }
 .stream-caret { animation: pulse .75s infinite; background: var(--accent); border-radius: 1px; display: inline-block; height: 1em; margin-left: 2px; vertical-align: -2px; width: 2px; }
+.assistant-output-warning { background: color-mix(in srgb, var(--warning) 9%, var(--surface-1)); border: 1px solid color-mix(in srgb, var(--warning) 34%, var(--border)); border-radius: 7px; color: #dfbf7f; font-size: 12px; line-height: 1.5; margin-top: 8px; padding: 8px 10px; }
 .message-error { background: var(--danger-dim); border: 1px solid #613033; border-radius: 7px; color: #f1a2a2; font-size: 11px; margin-top: 8px; padding: 8px 10px; }
 .message-actions { align-items: center; display: flex; gap: 2px; margin-left: -5px; margin-top: 9px; min-height: 25px; opacity: 0; transition: opacity .15s; }
 .message-row:hover .message-actions, .message-row:focus-within .message-actions { opacity: 1; }

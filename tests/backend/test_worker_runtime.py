@@ -290,10 +290,15 @@ class FakeReasoningTokenizer:
         }
 
     def convert_ids_to_tokens(self, token_id: int) -> str:
+        if token_id == self.eos_token_id:
+            return "</s>"
         return self._pieces[token_id - 2]
 
     def decode(self, token_ids: list[int], **_kwargs: Any) -> str:
-        return "".join(self._pieces[token_id - 2] for token_id in token_ids)
+        return "".join(
+            "</s>" if token_id == self.eos_token_id else self._pieces[token_id - 2]
+            for token_id in token_ids
+        )
 
 
 class FakeReasoningEncoderDecoderModel:
@@ -388,11 +393,11 @@ def configured_causal_runtime() -> tuple[WorkerRuntime, FakeCausalModel, FakeQue
 
 
 def configured_reasoning_runtime(
-    pieces: tuple[str, ...], *, prompt_primed: bool
+    pieces: tuple[str, ...], *, prompt_primed: bool, token_ids: tuple[int, ...] | None = None
 ) -> tuple[WorkerRuntime, FakeQueue]:
     output = FakeQueue()
     runtime = WorkerRuntime(cast(Any, FakeQueue()), cast(Any, output), FakeCancelEvent())
-    runtime.model = FakeReasoningEncoderDecoderModel(tuple(range(2, len(pieces) + 2)))
+    runtime.model = FakeReasoningEncoderDecoderModel(token_ids or tuple(range(2, len(pieces) + 2)))
     runtime.tokenizer = FakeReasoningTokenizer(pieces, prompt_primed=prompt_primed)
     runtime.model_info = {
         "id": "tiny-reasoner",
@@ -540,6 +545,139 @@ def test_generation_stream_segments_split_delimiters_and_prompt_priming(
             {"start": 0, "end": 4, "classification": "reasoning", "delimiter": True},
             {"start": 4, "end": 10, "classification": "answer", "delimiter": False},
         ]
+
+
+def test_reasoning_that_fills_the_output_limit_gets_a_bounded_answer_allowance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, output = configured_reasoning_runtime(
+        ("deliberation", "</think>", "Final answer"),
+        prompt_primed=True,
+        token_ids=(2, 3, 4, 99),
+    )
+    command = generation_command()
+    command["reasoning"] = True
+    command["sampling"]["max_output_tokens"] = 2
+
+    runtime._generate(command)
+
+    events = [item for item in output.items if item["kind"] == "run_event"]
+    stage = next(item["payload"] for item in events if item["event_type"] == "stage")
+    warnings = [item["payload"] for item in events if item["event_type"] == "warning"]
+    tokens = [item["payload"] for item in events if item["event_type"] == "token"]
+    completed = next(item["payload"] for item in events if item["event_type"] == "completed")
+
+    assert stage["configured_max_output_tokens"] == 2
+    assert stage["reasoning_answer_allowance"] == 2
+    assert stage["generation_token_limit"] == 4
+    assert [item["display_text"] for item in tokens] == [
+        "deliberation",
+        "</think>",
+        "Final answer",
+        "</s>",
+    ]
+    assert [item["segment"] for item in tokens] == [
+        "reasoning",
+        "reasoning",
+        "answer",
+        "answer",
+    ]
+    assert [item["code"] for item in warnings] == ["reasoning_answer_allowance_activated"]
+    assert completed["finish_reason"] == "eos"
+    assert completed["configured_max_output_tokens"] == 2
+    assert completed["reasoning_answer_allowance"] == 2
+    assert completed["reasoning_answer_allowance_used"] == 2
+    assert completed["text"] == "deliberation</think>Final answer</s>"
+
+
+def test_unclosed_reasoning_at_the_output_limit_can_close_and_answer_in_allowance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, output = configured_reasoning_runtime(
+        ("first thought", "second thought", "</think>", "Final answer"),
+        prompt_primed=True,
+    )
+    command = generation_command()
+    command["reasoning"] = True
+    command["sampling"]["max_output_tokens"] = 2
+
+    runtime._generate(command)
+
+    events = [item for item in output.items if item["kind"] == "run_event"]
+    warnings = [item["payload"] for item in events if item["event_type"] == "warning"]
+    tokens = [item["payload"] for item in events if item["event_type"] == "token"]
+    completed = next(item["payload"] for item in events if item["event_type"] == "completed")
+
+    assert [item["display_text"] for item in tokens] == [
+        "first thought",
+        "second thought",
+        "</think>",
+        "Final answer",
+    ]
+    assert [item["segment"] for item in tokens] == [
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "answer",
+    ]
+    assert [item["code"] for item in warnings] == ["reasoning_answer_allowance_activated"]
+    assert completed["finish_reason"] == "length"
+    assert completed["reasoning_answer_allowance_used"] == 2
+    assert completed["text"] == "first thoughtsecond thought</think>Final answer"
+
+
+def test_reasoning_answer_allowance_is_not_used_when_answer_starts_within_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, output = configured_reasoning_runtime(
+        ("deliberation", "</think>Final answer", "should not be generated"),
+        prompt_primed=True,
+    )
+    command = generation_command()
+    command["reasoning"] = True
+    command["sampling"]["max_output_tokens"] = 2
+
+    runtime._generate(command)
+
+    events = [item for item in output.items if item["kind"] == "run_event"]
+    tokens = [item["payload"] for item in events if item["event_type"] == "token"]
+    warnings = [item["payload"] for item in events if item["event_type"] == "warning"]
+    completed = next(item["payload"] for item in events if item["event_type"] == "completed")
+
+    assert [item["display_text"] for item in tokens] == [
+        "deliberation",
+        "</think>Final answer",
+    ]
+    assert warnings == []
+    assert completed["finish_reason"] == "length"
+    assert completed["reasoning_answer_allowance_used"] == 0
+
+
+def test_reasoning_answer_allowance_respects_an_explicit_disabled_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, output = configured_reasoning_runtime(
+        ("deliberation", "</think>", "must not be generated"),
+        prompt_primed=True,
+    )
+    command = generation_command()
+    command["reasoning"] = False
+    command["sampling"]["max_output_tokens"] = 2
+
+    runtime._generate(command)
+
+    events = [item for item in output.items if item["kind"] == "run_event"]
+    stage = next(item["payload"] for item in events if item["event_type"] == "stage")
+    tokens = [item["payload"] for item in events if item["event_type"] == "token"]
+    completed = next(item["payload"] for item in events if item["event_type"] == "completed")
+
+    assert stage["reasoning_answer_allowance"] == 0
+    assert [item["display_text"] for item in tokens] == ["deliberation", "</think>"]
+    assert completed["reasoning_answer_allowance_used"] == 0
 
 
 def test_decoder_start_token_resolution_and_missing_metadata_diagnostic() -> None:

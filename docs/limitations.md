@@ -31,6 +31,7 @@ This page describes the implemented 0.1-series workbench, not the eventual adapt
 - `max_prompt_tokens` is enforced after rendering/tokenization. Causal generation also subtracts `reserved_output_tokens` when admitting the prompt and clips output to remaining context. Encoder-decoder source and decoder lengths are treated separately; this is a conservative generic policy, not an architecture-specific memory guarantee.
 - Prompt scoring enforces `limits.prompt_bytes` but does not separately apply `inference.max_prompt_tokens`; an over-context scoring input is left to the tokenizer/model path to reject.
 - Stop-sequence detection occurs after a token has been selected and decoded. The matching text remains in the stored/displayed output.
+- Tagged reasoning models can use one additional, context-clipped output window when the configured token budget ends before visible answer text. This recovery is reported in warning and terminal telemetry; it cannot produce an answer when no model context remains or when the model continues reasoning through the entire allowance.
 - DeepSeek system-prompt guidance generates a warning but is not a hard rejection.
 - A WebSocket disconnect does not stop a run. Explicit cancellation is required.
 - Partial message content is checkpointed every eight tokens and at terminal events. A sudden process loss can leave the message text behind the durable token/event rows; restart marks the run failed rather than regenerating it.

@@ -139,6 +139,8 @@ The response includes camel-case convenience fields and canonical objects:
 
 Generation attachments are rejected by the current adapter. `seed` accepts the full unsigned 64-bit range and zero is valid. JavaScript clients should preserve large returned seeds as strings.
 
+`sampling.max_output_tokens` is the normal generated-token limit. For explicitly tagged reasoning models only, if the whole configured budget is spent before any visible answer text, the worker can use one additional context-clipped answer window of at most the configured size. Warning events and the terminal summary expose whether that allowance activated and how many additional tokens were used.
+
 Generation, embeddings, and prompt scoring share single-worker admission. At most one inference is runnable/active and `runtime.queue_limit` additional operations may wait. Queue overflow is a structured 429 and occurs before a generation creates chat/run state. Explicit model load/unload returns a worker-busy conflict while any inference is admitted.
 
 Replay requires a completed generation, an attached assistant/user branch, and a currently registered model with the recorded fingerprint. It creates a new assistant sibling and run linked through `parent_run_id`, reconstructs that branch's messages, and executes with the recorded seed, sampler, instrumentation, and deterministic-mode settings. The response has the same `runId`, `messageId`, `websocketUrl`, `run`, and `assistant_message` fields as creation, plus `parentRunId`. Replay is a new forward pass; matching output still depends on the recorded environment being reproducible.

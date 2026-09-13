@@ -16,7 +16,12 @@ from multiprocessing.queues import Queue
 from pathlib import Path
 from typing import Any
 
-from ..reasoning import SegmentedToken, TagReasoningSegmenter, UnknownReasoningSegmenter
+from ..reasoning import (
+    SegmentClass,
+    SegmentedToken,
+    TagReasoningSegmenter,
+    UnknownReasoningSegmenter,
+)
 
 # This must be set before the worker imports torch or initializes CUDA.  It is
 # required by cuBLAS when deterministic/reference mode enables deterministic
@@ -256,6 +261,22 @@ def _reasoning_segmenter(
             initially_inside=reasoning_primed,
         ),
         reasoning_primed,
+    )
+
+
+def _contains_visible_answer(token: SegmentedToken) -> bool:
+    """Return whether an exactly segmented token contains answer text.
+
+    A closing reasoning delimiter can share a decoded token with the first
+    answer characters. Inspecting the character slices avoids treating the
+    delimiter itself (or trailing whitespace after it) as an answer.
+    """
+
+    return any(
+        item.classification is SegmentClass.ANSWER
+        and not item.delimiter
+        and bool(token.text[item.start : item.end].strip())
+        for item in token.slices
     )
 
 
@@ -727,6 +748,30 @@ class WorkerRuntime:
         if max_new_tokens <= 0:
             raise ValueError("rendered prompt consumes the effective context limit")
 
+        configured_delimiters = self.model_info.get("reasoning_delimiters")
+        tagged_reasoning_enabled = (
+            reasoning_requested is not False
+            and isinstance(configured_delimiters, (list, tuple))
+            and len(configured_delimiters) == 2
+            and all(isinstance(item, str) and item for item in configured_delimiters)
+            and configured_delimiters[0] != configured_delimiters[1]
+        )
+        # ``max_output_tokens`` normally remains a hard limit. A tagged
+        # reasoning model is the one exception: if emitted reasoning reaches
+        # that boundary before any answer text, it receives one bounded
+        # additional output window. Otherwise a valid run can end with only
+        # reasoning (or just ``</think>``) and the non-Nerd UI has nothing to
+        # display. The allowance is still clipped to the remaining context.
+        reasoning_answer_allowance = (
+            min(
+                configured_max_output_tokens,
+                max(0, available_output_tokens - max_new_tokens),
+            )
+            if tagged_reasoning_enabled
+            else 0
+        )
+        generation_token_limit = max_new_tokens + reasoning_answer_allowance
+
         generator = torch.Generator(device=self.device)
         generator.manual_seed(int(command["effective_seed"]))
         generated: list[int] = []
@@ -747,8 +792,11 @@ class WorkerRuntime:
             self.model_info, rendered_prompt
         )
         pending_token_events: dict[int, dict[str, Any]] = {}
+        reasoning_observed = reasoning_primed
+        visible_answer_observed = False
 
         def emit_segmented_tokens(tokens: Sequence[SegmentedToken]) -> None:
+            nonlocal reasoning_observed, visible_answer_observed
             for token in tokens:
                 payload = pending_token_events.pop(token.token_index)
                 token_segment = token.classification.value
@@ -760,6 +808,10 @@ class WorkerRuntime:
                 raw_logprob = payload.get("raw_logprob")
                 if isinstance(raw_logprob, float):
                     raw_segment_logprobs[token_segment].append(raw_logprob)
+                if any(item.classification is SegmentClass.REASONING for item in token.slices):
+                    reasoning_observed = True
+                if payload["token_id"] not in eos_set and _contains_visible_answer(token):
+                    visible_answer_observed = True
                 self._emit_run(run_id, "token", payload)
 
         prefill_started = time.monotonic_ns()
@@ -781,6 +833,9 @@ class WorkerRuntime:
                 else None,
                 "reasoning_primed": reasoning_primed,
                 "reasoning_requested": reasoning_requested,
+                "configured_max_output_tokens": configured_max_output_tokens,
+                "generation_token_limit": generation_token_limit,
+                "reasoning_answer_allowance": reasoning_answer_allowance,
                 "template_ms": (template_ended - template_started) / 1e6,
                 "tokenization_ms": (tokenization_ended - tokenization_started) / 1e6,
             },
@@ -819,6 +874,7 @@ class WorkerRuntime:
         emission_times_ns: list[int] = []
         finish_reason = "length"
         eos_set = _eos_token_ids(self.model, self.tokenizer)
+        reasoning_answer_allowance_active = False
         stop_sequences = tuple(settings.get("stop_sequences", ()))
         operation_order = [
             "repetition_penalty",
@@ -849,7 +905,7 @@ class WorkerRuntime:
             },
         )
 
-        for token_index in range(max_new_tokens):
+        for token_index in range(generation_token_limit):
             if self.cancel_event.is_set():
                 finish_reason = "cancelled"
                 break
@@ -1049,7 +1105,46 @@ class WorkerRuntime:
             if stop_sequences and any(current_text.endswith(stop) for stop in stop_sequences):
                 finish_reason = "stop_sequence"
                 break
-            if token_index + 1 >= max_new_tokens:
+            generated_count = token_index + 1
+            if generated_count >= max_new_tokens and not reasoning_answer_allowance_active:
+                reasoning_without_answer = (
+                    tagged_reasoning_enabled
+                    and reasoning_observed
+                    and isinstance(reasoning_segmenter, TagReasoningSegmenter)
+                    and not visible_answer_observed
+                )
+                if reasoning_answer_allowance and reasoning_without_answer:
+                    reasoning_answer_allowance_active = True
+                    self._emit_run(
+                        run_id,
+                        "warning",
+                        {
+                            "code": "reasoning_answer_allowance_activated",
+                            "message": (
+                                "Reasoning consumed the configured output limit before visible "
+                                "answer text; generation is continuing within a bounded answer "
+                                "allowance."
+                            ),
+                            "configured_max_output_tokens": configured_max_output_tokens,
+                            "reasoning_answer_allowance": reasoning_answer_allowance,
+                        },
+                    )
+                else:
+                    if reasoning_without_answer:
+                        self._emit_run(
+                            run_id,
+                            "warning",
+                            {
+                                "code": "reasoning_answer_allowance_unavailable",
+                                "message": (
+                                    "Reasoning consumed the output budget and the model context "
+                                    "has no remaining capacity for an answer."
+                                ),
+                                "configured_max_output_tokens": configured_max_output_tokens,
+                            },
+                        )
+                    break
+            if generated_count >= generation_token_limit:
                 break
 
             selected_tensor = torch.tensor([[chosen_id]], device=self.device)
@@ -1108,6 +1203,18 @@ class WorkerRuntime:
                 "warning",
                 {"code": "reasoning_segmentation_warning", "message": warning},
             )
+        if reasoning_answer_allowance_active and not visible_answer_observed:
+            self._emit_run(
+                run_id,
+                "warning",
+                {
+                    "code": "reasoning_answer_missing",
+                    "message": (
+                        "The model ended without visible answer text after using its bounded "
+                        "reasoning answer allowance."
+                    ),
+                },
+            )
 
         completed_ns = time.monotonic_ns()
         total_generation_seconds = max((completed_ns - generation_started) / 1e9, 1e-9)
@@ -1134,6 +1241,9 @@ class WorkerRuntime:
         payload = {
             "finish_reason": finish_reason,
             "generated_token_count": len(generated),
+            "configured_max_output_tokens": configured_max_output_tokens,
+            "reasoning_answer_allowance": reasoning_answer_allowance,
+            "reasoning_answer_allowance_used": max(0, len(generated) - max_new_tokens),
             "text": previous_text,
             "conditional_response_perplexity": math.exp(
                 min(700.0, -cumulative_logprob / len(generated))

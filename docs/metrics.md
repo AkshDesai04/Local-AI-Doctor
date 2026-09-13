@@ -93,6 +93,8 @@ Reasoning is classified only from an explicitly discovered emitted delimiter pai
 
 Run completion includes token count for reasoning, answer, and unknown groups. Mean raw log probability and perplexity are populated at `token`, `full`, and `expert` and are null for groups without detailed raw likelihood. No hidden or latent reasoning is exposed. Duration and throughput by segment are not yet returned by the production worker.
 
+For a model with an explicit reasoning delimiter pair, `max_output_tokens` is the normal generation limit. If that entire budget is consumed by emitted reasoning before any visible answer text, the worker may continue for one additional window of at most the same size, clipped to the remaining model context. The stage and terminal payloads report `configured_max_output_tokens`, `reasoning_answer_allowance`, and `reasoning_answer_allowance_used`, and activation is recorded as a warning event. Non-reasoning runs and runs that already produced answer text retain the configured hard limit.
+
 ## Timing
 
 All engine phase measurements use a monotonic nanosecond clock. Persisted lifecycle timestamps such as `received_at` are UTC wall-clock values and should not be subtracted for precision benchmarking.

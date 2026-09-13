@@ -69,6 +69,54 @@ describe("chat response rendering", () => {
     expect(screen.getByLabelText("Termination tokens")).toHaveTextContent("<｜end▁of▁sentence｜>");
   });
 
+  it("explains a persisted completed reasoning-only response instead of leaving a blank answer", () => {
+    const reasoningOnlyMessage: Message = {
+      ...message,
+      content: "unfinished reasoning that exhausted the response budget",
+      reasoningPrimed: true,
+    };
+    const run: RunDetails = {
+      id: "run-1",
+      messageId: "assistant-1",
+      modelId: "model-1",
+      status: "complete",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [{ index: 0, tokenId: 10, piece: "unfinished reasoning", displayText: "unfinished reasoning", reasoningSegment: "reasoning" }],
+      metrics: { finishReason: "length" },
+    };
+
+    const { rerender } = render(conversation([reasoningOnlyMessage]));
+
+    expect(screen.getByText("Thinking…")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("No final answer was produced");
+
+    rerender(conversation([reasoningOnlyMessage], { run }));
+
+    expect(screen.getByRole("status")).toHaveTextContent("reached its token limit");
+    expect(screen.getByRole("status")).toHaveTextContent("Increase Max tokens and regenerate");
+  });
+
+  it("does not report a missing answer while reasoning is still streaming", () => {
+    const streamingMessage: Message = {
+      ...message,
+      content: "unfinished reasoning",
+      reasoningPrimed: true,
+      status: "streaming",
+    };
+    const run: RunDetails = {
+      id: "run-1",
+      messageId: "assistant-1",
+      modelId: "model-1",
+      status: "running",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [{ index: 0, tokenId: 10, piece: "unfinished reasoning", displayText: "unfinished reasoning", reasoningSegment: "reasoning" }],
+    };
+
+    render(conversation([streamingMessage], { run, runningRunId: run.id, streamConnected: true }));
+
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
   it("groups clickable reasoning tokens and exposes explicit boundaries in Nerd Mode", () => {
     const run: RunDetails = {
       id: "run-1",
