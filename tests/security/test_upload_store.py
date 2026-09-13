@@ -191,5 +191,5 @@ async def test_symlink_escape_is_rejected_when_platform_supports_symlinks(
         }
     )
 
-    with pytest.raises(PathSecurityError, match="escaped"):
+    with pytest.raises(PathSecurityError, match="symlinks are not allowed"):
         await store.resolve(attachment["id"])
