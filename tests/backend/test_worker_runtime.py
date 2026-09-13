@@ -191,11 +191,11 @@ class FakeTokenizer:
 
     @staticmethod
     def convert_ids_to_tokens(token_id: int) -> str:
-        return {2: "hello", 3: "</s>"}[token_id]
+        return {2: "hello", 3: "</s>", 4: "alternate"}[token_id]
 
     @staticmethod
     def decode(token_ids: list[int], **_kwargs: Any) -> str:
-        return "".join({2: "hello", 3: "</s>"}[token_id] for token_id in token_ids)
+        return "".join({2: "hello", 3: "</s>", 4: "alternate"}[token_id] for token_id in token_ids)
 
 
 class FakeEncoder:
@@ -230,10 +230,40 @@ class FakeEncoderDecoderModel:
     def __call__(self, **kwargs: Any) -> Any:
         self.decoder_calls.append(kwargs)
         if len(self.decoder_calls) == 1:
-            logits = FakeTensor([[[0.0, 0.0, 9.0, 1.0]]])
+            logits = FakeTensor([[[0.0, 0.0, 9.0, 1.0, 3.0]]])
         else:
-            logits = FakeTensor([[[0.0, 0.0, 1.0, 9.0]]])
+            logits = FakeTensor([[[0.0, 0.0, 1.0, 9.0, 0.0]]])
         return SimpleNamespace(logits=logits, past_key_values=f"cache-{len(self.decoder_calls)}")
+
+
+class FakeCausalModel:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(is_encoder_decoder=False, eos_token_id=3)
+        self.generation_config = SimpleNamespace(eos_token_id=3)
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        input_ids = kwargs["input_ids"].tolist()
+        past = kwargs["past_key_values"]
+        values = np.full((1, 1, 5), -10.0, dtype=np.float32)
+        if len(self.calls) == 1:
+            assert input_ids == [[5, 6]]
+            assert past is None
+            # The original path would choose token 2; the branch substitutes 4.
+            values[0, 0, 2] = 10.0
+            next_cache = "cache-after-prompt"
+        elif len(self.calls) == 2:
+            assert input_ids == [[4]]
+            assert past == "cache-after-prompt"
+            values[0, 0, 2] = 10.0
+            next_cache = "cache-after-substitution-4"
+        else:
+            assert input_ids == [[2]]
+            assert past == "cache-after-substitution-4"
+            values[0, 0, 3] = 10.0
+            next_cache = "cache-after-suffix-2"
+        return SimpleNamespace(logits=FakeTensor(values), past_key_values=next_cache)
 
 
 class FakeSentenceModel:
@@ -339,6 +369,21 @@ def configured_encoder_decoder_runtime(
     }
     runtime.decoder_start_token_id = 1
     runtime.decoder_start_token_source = "config.decoder_start_token_id"
+    return runtime, model, output
+
+
+def configured_causal_runtime() -> tuple[WorkerRuntime, FakeCausalModel, FakeQueue]:
+    output = FakeQueue()
+    runtime = WorkerRuntime(cast(Any, FakeQueue()), cast(Any, output), FakeCancelEvent())
+    model = FakeCausalModel()
+    runtime.model = model
+    runtime.tokenizer = FakeTokenizer()
+    runtime.model_info = {
+        "id": "tiny-causal",
+        "display_name": "Tiny Causal Fixture",
+        "task": "text_generation",
+        "effective_context_limit": 32,
+    }
     return runtime, model, output
 
 
@@ -498,6 +543,62 @@ def test_encoder_decoder_generation_encodes_once_and_reuses_cached_decoder(
     assert completed["text"] == "hello</s>"
     assert fake_torch.deterministic_calls == [(False, False)]
     assert fake_torch.backends.cudnn.benchmark is False
+
+
+def test_generation_forces_a_selected_prefix_then_continues_from_its_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, model, output = configured_encoder_decoder_runtime()
+    command = generation_command()
+    command["forced_prefix_token_ids"] = [4]
+
+    runtime._generate(command)
+
+    events = [item for item in output.items if item["kind"] == "run_event"]
+    tokens = [item["payload"] for item in events if item["event_type"] == "token"]
+    completed = next(item["payload"] for item in events if item["event_type"] == "completed")
+    assert [item["token_id"] for item in tokens] == [4, 3]
+    assert tokens[0]["filters"] == ["greedy_argmax", "forced_prefix"]
+    assert tokens[0]["sample_probability"] == 0.0
+    assert model.decoder_calls[1]["decoder_input_ids"].tolist() == [[4]]
+    assert completed["text"] == "alternate</s>"
+
+
+def test_causal_generation_advances_cache_with_substituted_prefix_before_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, model, output = configured_causal_runtime()
+    command = generation_command()
+    command["forced_prefix_token_ids"] = [4]
+
+    runtime._generate(command)
+
+    events = [item for item in output.items if item["kind"] == "run_event"]
+    tokens = [item["payload"] for item in events if item["event_type"] == "token"]
+    completed = next(item["payload"] for item in events if item["event_type"] == "completed")
+    assert [item["token_id"] for item in tokens] == [4, 2, 3]
+    assert tokens[0]["filters"] == ["greedy_argmax", "forced_prefix"]
+    assert model.calls[1]["input_ids"].tolist() == [[4]]
+    assert model.calls[1]["past_key_values"] == "cache-after-prompt"
+    assert model.calls[2]["input_ids"].tolist() == [[2]]
+    assert model.calls[2]["past_key_values"] == "cache-after-substitution-4"
+    assert completed["finish_reason"] == "eos"
+    assert completed["text"] == "alternatehello</s>"
+
+
+def test_generation_rejects_a_forced_prefix_longer_than_the_recorded_output_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, _model, _output = configured_encoder_decoder_runtime()
+    command = generation_command()
+    command["sampling"]["max_output_tokens"] = 1
+    command["forced_prefix_token_ids"] = [2, 4]
+
+    with pytest.raises(ValueError, match="configured output limit"):
+        runtime._generate(command)
 
 
 def test_deterministic_mode_is_set_explicitly_for_each_generation(

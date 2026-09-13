@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AUTH_CHANGED_EVENT } from "../api/auth";
 import { api, ApiError, subscribeToRun } from "../api/client";
 import type {
+  AlternativeDistribution,
   Attachment,
   ChatSummary,
   ConfigurationSnapshot,
@@ -13,6 +14,7 @@ import type {
   RunDetails,
   RunMetrics,
   RunStreamEvent,
+  TokenAlternative,
 } from "../api/types";
 import { cleanAssistantOutput } from "../utils/markdown";
 
@@ -133,6 +135,77 @@ function mergeMetrics(current: RunMetrics | undefined, update: Partial<RunMetric
   };
 }
 
+const CLIENT_TELEMETRY_STORAGE_KEY = "local-ai-doctor.client-telemetry.v1";
+
+interface PersistedClientTelemetry {
+  storedAt: string;
+  clientTtftMs?: number;
+  firstVisibleTextMs?: number;
+  tokenTimings: Record<string, { clientInterArrivalMs?: number; transportOverheadMs?: number }>;
+}
+
+function readClientTelemetry(): Record<string, PersistedClientTelemetry> {
+  try {
+    const decoded: unknown = JSON.parse(window.localStorage.getItem(CLIENT_TELEMETRY_STORAGE_KEY) ?? "{}");
+    return asRecord(decoded) as Record<string, PersistedClientTelemetry>;
+  } catch {
+    return {};
+  }
+}
+
+function persistClientTelemetry(run: RunDetails): void {
+  const tokenTimings = Object.fromEntries(run.tokens.flatMap((token) => {
+    const timing = token.timing;
+    if (timing?.clientInterArrivalMs === undefined && timing?.transportOverheadMs === undefined) return [];
+    return [[String(token.index), {
+      clientInterArrivalMs: timing.clientInterArrivalMs,
+      transportOverheadMs: timing.transportOverheadMs,
+    }]];
+  }));
+  const clientTtftMs = run.metrics?.timing?.clientTtftMs;
+  const firstVisibleTextMs = run.metrics?.timing?.firstVisibleTextMs;
+  if (clientTtftMs === undefined && firstVisibleTextMs === undefined && !Object.keys(tokenTimings).length) return;
+  try {
+    const entries = Object.entries({
+      ...readClientTelemetry(),
+      [run.id]: { storedAt: new Date().toISOString(), clientTtftMs, firstVisibleTextMs, tokenTimings },
+    }).sort(([, left], [, right]) => left.storedAt.localeCompare(right.storedAt)).slice(-100);
+    window.localStorage.setItem(CLIENT_TELEMETRY_STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    // Client timing is supplemental; storage limits must never break the workbench.
+  }
+}
+
+function restoreClientTelemetry(run: RunDetails): RunDetails {
+  const cached = readClientTelemetry()[run.id];
+  if (!cached) return run;
+  return {
+    ...run,
+    metrics: mergeMetrics(run.metrics, { timing: {
+      clientTtftMs: cached.clientTtftMs,
+      firstVisibleTextMs: cached.firstVisibleTextMs,
+    } }),
+    tokens: run.tokens.map((token) => {
+      const timing = cached.tokenTimings[String(token.index)];
+      return timing ? { ...token, timing: { ...token.timing, ...timing } } : token;
+    }),
+  };
+}
+
+function mergeRefreshedRun(persisted: RunDetails, live: RunDetails): RunDetails {
+  const liveTokens = new Map(live.tokens.map((token) => [token.index, token]));
+  return {
+    ...persisted,
+    metrics: mergeMetrics(persisted.metrics, live.metrics ?? {}),
+    tokens: persisted.tokens.map((token) => {
+      const liveToken = liveTokens.get(token.index);
+      return liveToken ? { ...token, timing: { ...token.timing, ...liveToken.timing } } : token;
+    }),
+    rawEvents: live.rawEvents ?? persisted.rawEvents,
+    warnings: Array.from(new Set([...(persisted.warnings ?? []), ...(live.warnings ?? [])])),
+  };
+}
+
 function appendTokenContent(current: Message[], messageId: string, text: string, replaceFrom?: number): Message[] {
   return current.map((message) =>
     message.id === messageId ? { ...message, content: replaceFrom === undefined ? `${message.content}${text}` : `${message.content.slice(0, replaceFrom)}${text}`, status: "streaming" } : message,
@@ -181,6 +254,7 @@ export interface WorkbenchState {
   selectedModel: ModelSummary | null;
   selectedRun: RunDetails | null;
   runningRunId: string | null;
+  branching: boolean;
   streamConnected: boolean;
   settings: GenerationSettings;
   defaultSettings: GenerationSettings;
@@ -203,6 +277,8 @@ export interface WorkbenchState {
   submit: (content: string, parentMessageId?: string | null) => Promise<void>;
   stop: () => Promise<void>;
   inspectRun: (id: string) => Promise<void>;
+  loadSelectedRunEvents: () => Promise<void>;
+  branchFromAlternative: (tokenIndex: number, distribution: AlternativeDistribution, alternative: TokenAlternative) => Promise<void>;
   addAttachment: (file: File) => Promise<void>;
   removeAttachment: (id: string) => void;
   retryMessage: (message: Message) => Promise<void>;
@@ -222,6 +298,7 @@ export function useWorkbench(): WorkbenchState {
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedRun, setSelectedRun] = useState<RunDetails | null>(null);
   const [runningRunId, setRunningRunId] = useState<string | null>(null);
+  const [branching, setBranching] = useState(false);
   const [streamConnected, setStreamConnected] = useState(false);
   const [settings, setSettings] = useState<GenerationSettings>(defaultGenerationSettings);
   const [configuredDefaults, setConfiguredDefaults] = useState<GenerationSettings>(defaultGenerationSettings);
@@ -230,13 +307,16 @@ export function useWorkbench(): WorkbenchState {
   const [notice, setNotice] = useState<string | null>(null);
   const [authRevision, setAuthRevision] = useState(0);
   const streamCleanup = useRef<(() => void) | null>(null);
+  const branchPending = useRef(false);
+  const activeChatIdRef = useRef<string | null>(null);
+  const runSelectionEpoch = useRef(0);
   const locallyCreatedChat = useRef<string | null>(null);
   const clientRequestStarted = useRef<number | null>(null);
   const lastClientReceipt = useRef<number | null>(null);
   const streamVisibility = useRef(new Map<string, StreamVisibilityBuffer>());
 
   const selectedModel = useMemo(
-    () => models.find((model) => model.id === selectedModelId) ?? models[0] ?? null,
+    () => models.find((model) => model.id === selectedModelId) ?? (selectedModelId ? null : models[0] ?? null),
     [models, selectedModelId],
   );
 
@@ -304,8 +384,20 @@ export function useWorkbench(): WorkbenchState {
   useEffect(() => () => streamCleanup.current?.(), []);
 
   useEffect(() => {
+    activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
+
+  useEffect(() => {
+    if (selectedRun && ["complete", "cancelled", "failed"].includes(selectedRun.status)) {
+      persistClientTelemetry(selectedRun);
+    }
+  }, [selectedRun]);
+
+  useEffect(() => {
+    const restoreEpoch = ++runSelectionEpoch.current;
     if (!activeChatId) {
       setMessages([]);
+      setSelectedRun(null);
       return;
     }
     if (locallyCreatedChat.current === activeChatId) {
@@ -315,8 +407,23 @@ export function useWorkbench(): WorkbenchState {
     let alive = true;
     setMessagesLoading(true);
     api.messages(activeChatId)
-      .then((value) => {
-        if (alive) setMessages(value);
+      .then(async (value) => {
+        if (!alive || runSelectionEpoch.current !== restoreEpoch) return;
+        setMessages(value);
+        const latestRunId = [...value].reverse().find((message) => message.role === "assistant" && message.runId)?.runId;
+        if (!latestRunId) {
+          setSelectedRun(null);
+          return;
+        }
+        try {
+          const run = restoreClientTelemetry(await api.run(latestRunId));
+          if (alive && runSelectionEpoch.current === restoreEpoch && activeChatIdRef.current === activeChatId) {
+            setSelectedModelId(run.modelId);
+            setSelectedRun(run);
+          }
+        } catch (cause) {
+          if (alive && runSelectionEpoch.current === restoreEpoch) setError(readableError(cause));
+        }
       })
       .catch((cause: unknown) => {
         if (alive) setError(readableError(cause));
@@ -330,15 +437,21 @@ export function useWorkbench(): WorkbenchState {
   }, [activeChatId]);
 
   const selectChat = useCallback((id: string): Promise<void> => {
+    runSelectionEpoch.current += 1;
+    locallyCreatedChat.current = null;
+    activeChatIdRef.current = id;
     setActiveChatId(id);
     setSelectedRun(null);
     return Promise.resolve();
   }, []);
 
   const createChat = useCallback(async (): Promise<void> => {
+    runSelectionEpoch.current += 1;
+    locallyCreatedChat.current = null;
     try {
       const chat = await api.createChat();
       setChats((current) => [chat, ...current]);
+      activeChatIdRef.current = chat.id;
       setActiveChatId(chat.id);
       setMessages([]);
       setSelectedRun(null);
@@ -354,6 +467,11 @@ export function useWorkbench(): WorkbenchState {
       if (updated.archived) {
         setChats((current) => current.filter((chat) => chat.id !== id));
         setArchivedChats((current) => [updated, ...current.filter((chat) => chat.id !== id)]);
+        if (activeChatIdRef.current === id) {
+          runSelectionEpoch.current += 1;
+          activeChatIdRef.current = null;
+          locallyCreatedChat.current = null;
+        }
         setActiveChatId((current) => (current === id ? null : current));
       } else {
         setArchivedChats((current) => current.filter((chat) => chat.id !== id));
@@ -382,6 +500,11 @@ export function useWorkbench(): WorkbenchState {
       await api.deleteChat(id);
       setChats((current) => current.filter((chat) => chat.id !== id));
       setArchivedChats((current) => current.filter((chat) => chat.id !== id));
+      if (activeChatIdRef.current === id) {
+        runSelectionEpoch.current += 1;
+        activeChatIdRef.current = null;
+        locallyCreatedChat.current = null;
+      }
       setActiveChatId((current) => (current === id ? null : current));
     } catch (cause) {
       setError(readableError(cause));
@@ -393,6 +516,9 @@ export function useWorkbench(): WorkbenchState {
       await api.clearChats();
       setChats([]);
       setArchivedChats([]);
+      runSelectionEpoch.current += 1;
+      activeChatIdRef.current = null;
+      locallyCreatedChat.current = null;
       setActiveChatId(null);
       setMessages([]);
     } catch (cause) {
@@ -520,8 +646,18 @@ export function useWorkbench(): WorkbenchState {
       streamVisibility.current.delete(runId);
       locallyCreatedChat.current = null;
       void synchronizeRuntimeState();
+      void api.run(runId).then((persistedRun) => {
+        const restored = restoreClientTelemetry(persistedRun);
+        setSelectedRun((current) => current?.id === runId
+          ? mergeRefreshedRun(restored, current)
+          : current);
+      }).catch(() => {
+        // Live telemetry remains available if the durable snapshot cannot be refreshed yet.
+      });
       void Promise.all([api.messages(chatId), api.chats(false)]).then(([persistedMessages, persistedChats]) => {
-        setMessages(persistedMessages.map((message) => message.id === assistantId ? { ...message, runId: message.runId ?? runId } : message));
+        if (activeChatIdRef.current === chatId) {
+          setMessages(persistedMessages.map((message) => message.id === assistantId ? { ...message, runId: message.runId ?? runId } : message));
+        }
         setChats(persistedChats);
       }).catch(() => {
         // The completed stream remains usable even if the persistence refresh is temporarily unavailable.
@@ -530,7 +666,8 @@ export function useWorkbench(): WorkbenchState {
   }, [synchronizeRuntimeState]);
 
   const submit = useCallback(async (content: string, parentMessageId?: string | null): Promise<void> => {
-    if (!content.trim() || !selectedModel || runningRunId) return;
+    if (!content.trim() || !selectedModel || runningRunId || branchPending.current) return;
+    runSelectionEpoch.current += 1;
     setError(null);
     let chatId = activeChatId;
     let temporaryUserId: string | null = null;
@@ -540,6 +677,7 @@ export function useWorkbench(): WorkbenchState {
         chatId = chat.id;
         setChats((current) => [chat, ...current]);
         locallyCreatedChat.current = chat.id;
+        activeChatIdRef.current = chat.id;
         setActiveChatId(chat.id);
       }
       const resolvedChatId = chatId;
@@ -632,12 +770,122 @@ export function useWorkbench(): WorkbenchState {
 
   const inspectRun = useCallback(async (id: string): Promise<void> => {
     if (selectedRun?.id === id) return;
+    const inspectEpoch = ++runSelectionEpoch.current;
     try {
-      setSelectedRun(await api.run(id));
+      const run = restoreClientTelemetry(await api.run(id));
+      if (runSelectionEpoch.current === inspectEpoch) setSelectedRun(run);
+    } catch (cause) {
+      if (runSelectionEpoch.current === inspectEpoch) setError(readableError(cause));
+    }
+  }, [selectedRun?.id]);
+
+  const loadSelectedRunEvents = useCallback(async (): Promise<void> => {
+    const runId = selectedRun?.id;
+    if (!runId || selectedRun.rawEvents !== undefined) return;
+    try {
+      const rawEvents = await api.runEvents(runId);
+      setSelectedRun((current) => current?.id === runId ? { ...current, rawEvents } : current);
     } catch (cause) {
       setError(readableError(cause));
     }
-  }, [selectedRun?.id]);
+  }, [selectedRun?.id, selectedRun?.rawEvents]);
+
+  const branchFromAlternative = useCallback(async (
+    tokenIndex: number,
+    distribution: AlternativeDistribution,
+    alternative: TokenAlternative,
+  ): Promise<void> => {
+    if (!selectedRun || runningRunId || branchPending.current) return;
+    if (selectedRun.status !== "complete") {
+      setError("Wait for the current run to finish before branching from a token.");
+      return;
+    }
+    if (selectedRun.branchableThroughTokenIndex === undefined || tokenIndex > selectedRun.branchableThroughTokenIndex) {
+      setError("That token was not retained in persisted telemetry and cannot be used as a branch point.");
+      return;
+    }
+    runSelectionEpoch.current += 1;
+    branchPending.current = true;
+    setBranching(true);
+    setError(null);
+    setNotice("Creating a new chat from the selected token…");
+    clientRequestStarted.current = performance.now();
+    lastClientReceipt.current = null;
+    try {
+      const response = await api.branchRun(selectedRun.id, {
+        tokenIndex,
+        distribution,
+        rank: alternative.rank,
+        tokenId: alternative.tokenId,
+      });
+      const chatId = response.chatId ?? response.run?.chatId;
+      if (!chatId) throw new Error("The branched run did not return its new chat.");
+      const assistantId = response.messageId ?? `run-message-${response.runId}`;
+      const assistantMessage: Message = {
+        id: assistantId,
+        chatId,
+        role: "assistant",
+        content: "",
+        createdAt: new Date().toISOString(),
+        status: "streaming",
+        runId: response.runId,
+      };
+      const run: RunDetails = {
+        ...response.run,
+        id: response.runId,
+        chatId,
+        messageId: assistantId,
+        modelId: response.modelId ?? response.run?.modelId ?? selectedRun.modelId,
+        status: response.run?.status ?? "queued",
+        createdAt: response.run?.createdAt ?? new Date().toISOString(),
+        tokens: [],
+        rawEvents: [],
+      };
+      locallyCreatedChat.current = chatId;
+      activeChatIdRef.current = chatId;
+      setActiveChatId(chatId);
+      setMessages([assistantMessage]);
+      setSelectedModelId(run.modelId);
+      setSelectedRun(run);
+      setRunningRunId(response.runId);
+      setNotice("Branched into a new chat. Continuing from the selected token…");
+      streamCleanup.current?.();
+      streamCleanup.current = subscribeToRun(
+        response.runId,
+        (event) => handleStreamEvent(event, response.runId, assistantId, chatId),
+        setStreamConnected,
+        response.websocketUrl,
+      );
+      void api.messages(chatId).then((persistedMessages) => {
+        if (activeChatIdRef.current !== chatId) return;
+        setMessages((current) => {
+          const currentAssistant = current.find((message) => message.id === assistantId) ?? assistantMessage;
+          const persistedAssistant = persistedMessages.find((message) => message.id === assistantId);
+          const mergedAssistant = persistedAssistant
+            ? { ...persistedAssistant, ...currentAssistant, parentMessageId: persistedAssistant.parentMessageId }
+            : currentAssistant;
+          return persistedMessages.some((message) => message.id === assistantId)
+            ? persistedMessages.map((message) => message.id === assistantId ? mergedAssistant : message)
+            : [...persistedMessages, mergedAssistant];
+        });
+      }).catch(() => {
+        // The branch remains usable from its stream if the history refresh is transiently unavailable.
+      });
+      void api.chats(false).then(setChats).catch(() => {
+        // The new chat is already active; the sidebar can refresh after the run completes.
+      });
+    } catch (cause) {
+      clientRequestStarted.current = null;
+      lastClientReceipt.current = null;
+      locallyCreatedChat.current = null;
+      setRunningRunId(null);
+      setNotice(null);
+      setError(readableError(cause));
+    } finally {
+      branchPending.current = false;
+      setBranching(false);
+    }
+  }, [handleStreamEvent, runningRunId, selectedRun]);
 
   const addAttachment = useCallback(async (file: File): Promise<void> => {
     if (!selectedModel) return;
@@ -665,7 +913,8 @@ export function useWorkbench(): WorkbenchState {
   }, []);
 
   const retryMessage = useCallback(async (message: Message): Promise<void> => {
-    if (!message.runId || runningRunId) return;
+    if (!message.runId || runningRunId || branchPending.current) return;
+    runSelectionEpoch.current += 1;
     setError(null);
     clientRequestStarted.current = performance.now();
     lastClientReceipt.current = null;
@@ -728,6 +977,7 @@ export function useWorkbench(): WorkbenchState {
     selectedModel,
     selectedRun,
     runningRunId,
+    branching,
     streamConnected,
     settings,
     defaultSettings: configuredDefaults,
@@ -750,6 +1000,8 @@ export function useWorkbench(): WorkbenchState {
     submit,
     stop,
     inspectRun,
+    loadSelectedRunEvents,
+    branchFromAlternative,
     addAttachment,
     removeAttachment,
     retryMessage,

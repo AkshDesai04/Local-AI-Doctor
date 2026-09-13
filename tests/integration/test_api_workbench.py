@@ -449,6 +449,17 @@ def test_terminal_event_cannot_overtake_batched_tokens_during_replay(
     portal.call(services.events.publish, run_id, "token", {"token_index": 0})
     portal.call(services.events.publish, run_id, "completed", {"finish_reason": "length"})
 
+    persisted = api_client.get(f"/api/v1/runs/{run_id}", headers=API_HEADERS)
+    assert persisted.status_code == 200
+    assert "events" not in persisted.json()
+    events = api_client.get(f"/api/v1/runs/{run_id}/events", headers=API_HEADERS)
+    assert events.status_code == 200
+    assert [(event["sequence"], event["type"]) for event in events.json()["events"]] == [
+        (1, "token"),
+        (2, "completed"),
+    ]
+    assert all("payload_json" not in event for event in events.json()["events"])
+
     async def reconnect() -> list[tuple[int, str]]:
         return [
             (event.sequence, event.type)

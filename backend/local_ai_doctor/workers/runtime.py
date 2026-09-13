@@ -665,9 +665,18 @@ class WorkerRuntime:
                 "rendered prompt exceeds the effective prompt-token limit "
                 f"({prompt_tokens} > {effective_prompt_limit})"
             )
+        forced_prefix_token_ids = [int(item) for item in command.get("forced_prefix_token_ids", ())]
+        available_output_tokens = (
+            max(0, context_limit - 1) if encoder_decoder else max(0, context_limit - prompt_tokens)
+        )
+        configured_max_output_tokens = int(settings["max_output_tokens"])
+        if len(forced_prefix_token_ids) > configured_max_output_tokens:
+            raise ValueError("forced generation prefix exceeds the configured output limit")
+        if len(forced_prefix_token_ids) > available_output_tokens:
+            raise ValueError("forced generation prefix exceeds the available model context")
         max_new_tokens = min(
-            int(settings["max_output_tokens"]),
-            max(0, context_limit - 1) if encoder_decoder else max(0, context_limit - prompt_tokens),
+            configured_max_output_tokens,
+            available_output_tokens,
         )
         if max_new_tokens <= 0:
             raise ValueError("rendered prompt consumes the effective context limit")
@@ -807,14 +816,22 @@ class WorkerRuntime:
                 float(settings["frequency_penalty"]),
                 float(settings["presence_penalty"]),
             )
+            forced_token_id = (
+                forced_prefix_token_ids[token_index]
+                if token_index < len(forced_prefix_token_ids)
+                else None
+            )
+            if forced_token_id is not None and not 0 <= forced_token_id < raw.numel():
+                raise ValueError("forced generation prefix contains an invalid token ID")
             temperature = float(settings["temperature"])
             if temperature == 0:
-                chosen_id = int(torch.argmax(processed).item())
-                sampler_logprob = 0.0
-                sampler_probability = 1.0
+                sampled_id = int(torch.argmax(processed).item())
+                chosen_id = forced_token_id if forced_token_id is not None else sampled_id
+                sampler_logprob: float | None = 0.0 if chosen_id == sampled_id else None
+                sampler_probability = 1.0 if chosen_id == sampled_id else 0.0
                 sampler_entropy: float | None = 0.0 if detailed_metrics else None
                 filtered = torch.full_like(processed, -torch.inf)
-                filtered[chosen_id] = 0.0
+                filtered[sampled_id] = 0.0
                 filters: list[str] = ["greedy_argmax"]
                 sampler_log_probs = filtered
             else:
@@ -828,8 +845,12 @@ class WorkerRuntime:
                 )
                 sampler_log_probs = torch.log_softmax(filtered, dim=-1)
                 sampler_probs = torch.exp(sampler_log_probs)
-                chosen_id = int(torch.multinomial(sampler_probs, 1, generator=generator).item())
-                sampler_logprob = float(sampler_log_probs[chosen_id].item())
+                sampled_id = int(torch.multinomial(sampler_probs, 1, generator=generator).item())
+                chosen_id = forced_token_id if forced_token_id is not None else sampled_id
+                selected_sampler_logprob = float(sampler_log_probs[chosen_id].item())
+                sampler_logprob = (
+                    selected_sampler_logprob if math.isfinite(selected_sampler_logprob) else None
+                )
                 sampler_probability = float(sampler_probs[chosen_id].item())
                 if detailed_metrics:
                     finite = torch.isfinite(sampler_log_probs)
@@ -838,6 +859,8 @@ class WorkerRuntime:
                     )
                 else:
                     sampler_entropy = None
+            if forced_token_id is not None:
+                filters.append("forced_prefix")
             if detailed_metrics:
                 raw_log_probs = torch.log_softmax(raw, dim=-1)
                 raw_logprob_value = float(raw_log_probs[chosen_id].item())
@@ -953,7 +976,9 @@ class WorkerRuntime:
                 "sample_logprob": sampler_logprob,
                 "sample_probability": sampler_probability,
                 "entropy": sampler_entropy,
-                "surprise": -sampler_logprob if detailed_metrics else None,
+                "surprise": (
+                    -sampler_logprob if detailed_metrics and sampler_logprob is not None else None
+                ),
                 "cumulative_logprob": cumulative_logprob if detailed_metrics else None,
                 "running_perplexity": running_perplexity,
                 "alternatives": alternatives,

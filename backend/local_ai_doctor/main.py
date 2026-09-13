@@ -49,6 +49,7 @@ from .api.schemas import (
     MessageCreate,
     ModelLoadRequest,
     PromptScoreRequest,
+    TokenBranchCreate,
 )
 from .config import AppSettings, ProfileName, SettingsLoader
 from .errors import InvalidRequestError, PayloadTooLargeError, WorkbenchError
@@ -679,16 +680,29 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         run = await services.repository.get_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="run not found")
-        run["tokens"] = await services.repository.list_run_tokens(run_id)
+        tokens = await services.repository.list_run_tokens(run_id)
+        run["tokens"] = tokens
+        branchable_through = -1
+        for token in tokens:
+            if int(token["token_index"]) != branchable_through + 1:
+                break
+            branchable_through += 1
+        run["branchable_through_token_index"] = (
+            branchable_through if branchable_through >= 0 else None
+        )
         run["phases"] = await services.repository.list_phase_metrics(run_id)
         run["environment"] = await services.repository.get_environment_snapshot(run_id)
-        terminal_events = [
-            event
-            for event in await services.repository.get_raw_events(run_id)
-            if event["type"] in {"completed", "cancelled", "error"}
-        ]
-        run["summary"] = terminal_events[-1]["payload"] if terminal_events else None
+        terminal_event = await services.repository.get_latest_terminal_event(run_id)
+        run["summary"] = terminal_event["payload"] if terminal_event else None
+        run["warnings"] = await services.repository.get_run_warnings(run_id)
         return run
+
+    @api.get("/runs/{run_id}/events")
+    async def get_run_events(request: Request, run_id: str) -> dict[str, Any]:
+        services = _services(request)
+        if await services.repository.get_run(run_id) is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        return {"events": await services.repository.get_raw_events(run_id)}
 
     @api.post("/runs/{run_id}/cancel")
     async def cancel_run(request: Request, run_id: str) -> dict[str, Any]:
@@ -704,6 +718,18 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             "runId": created["run"]["id"],
             "messageId": created["assistant_message"]["id"],
             "parentRunId": run_id,
+            "websocketUrl": f"/ws/v1/runs/{created['run']['id']}",
+            **created,
+        }
+
+    @api.post("/runs/{run_id}/branch", status_code=202)
+    async def branch_run(request: Request, run_id: str, body: TokenBranchCreate) -> dict[str, Any]:
+        created = await _services(request).runs.branch_generation(run_id, body)
+        return {
+            "chatId": created["chat"]["id"],
+            "runId": created["run"]["id"],
+            "messageId": created["assistant_message"]["id"],
+            "sourceRunId": run_id,
             "websocketUrl": f"/ws/v1/runs/{created['run']['id']}",
             **created,
         }

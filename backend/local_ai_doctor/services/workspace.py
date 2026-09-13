@@ -106,6 +106,7 @@ class WorkspaceService:
                     "instantaneous_tps",
                     "rolling_tps",
                     "segment",
+                    "reasoning_slices",
                 }
                 exported_tokens.append(
                     {
@@ -211,6 +212,13 @@ class WorkspaceService:
             source_parent = message.get("parent_id")
             metadata = dict(message.get("metadata", {}))
             metadata["imported_from_message_id"] = message["id"]
+            cloned_run_id = metadata.get("cloned_from_run_id")
+            if isinstance(cloned_run_id, str):
+                if cloned_run_id in run_map:
+                    metadata["cloned_from_run_id"] = run_map[cloned_run_id]
+                else:
+                    metadata.pop("cloned_from_run_id")
+                    metadata["imported_from_cloned_run_id"] = cloned_run_id
             remapped_messages.append(
                 {
                     **message,

@@ -7,6 +7,7 @@ import { formatBytes } from "../utils/format";
 interface ComposerProps {
   model: ModelSummary | null;
   connected: boolean;
+  busy: boolean;
   running: boolean;
   attachments: Attachment[];
   onSubmit: (value: string) => void;
@@ -15,7 +16,7 @@ interface ComposerProps {
   onRemoveAttachment: (id: string) => void;
 }
 
-export function Composer({ model, connected, running, attachments, onSubmit, onStop, onAttach, onRemoveAttachment }: ComposerProps): React.ReactNode {
+export function Composer({ model, connected, busy, running, attachments, onSubmit, onStop, onAttach, onRemoveAttachment }: ComposerProps): React.ReactNode {
   const [value, setValue] = useState("");
   const [attachmentMenu, setAttachmentMenu] = useState(false);
   const textarea = useRef<HTMLTextAreaElement>(null);
@@ -35,7 +36,7 @@ export function Composer({ model, connected, running, attachments, onSubmit, onS
   }, [value]);
 
   const send = (): void => {
-    if (!canSubmit || running) return;
+    if (!canSubmit || running || busy) return;
     onSubmit(value);
     setValue("");
   };
@@ -59,7 +60,7 @@ export function Composer({ model, connected, running, attachments, onSubmit, onS
             aria-expanded={attachmentMenu}
             aria-label="Attach a file"
             className="composer-tool"
-            disabled={accepted.length === 0 || running}
+            disabled={accepted.length === 0 || running || busy}
             onClick={() => setAttachmentMenu((current) => !current)}
             title={accepted.length ? "Attach supported media or a document" : "This model has no supported attachment path"}
             type="button"
@@ -90,7 +91,7 @@ export function Composer({ model, connected, running, attachments, onSubmit, onS
         </div>
         <textarea
           aria-label="Message"
-          disabled={!connected || running || !generationSupported}
+          disabled={!connected || running || busy || !generationSupported}
           onChange={(event) => setValue(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey) {
@@ -106,7 +107,7 @@ export function Composer({ model, connected, running, attachments, onSubmit, onS
         {running ? (
           <button aria-label="Stop generation" className="send-button stop" onClick={onStop} title="Stop and preserve partial output" type="button"><Square fill="currentColor" size={14} /></button>
         ) : (
-          <button aria-label="Send message" className="send-button" disabled={!canSubmit} onClick={send} type="button"><ArrowUp size={18} /></button>
+          <button aria-label="Send message" className="send-button" disabled={!canSubmit || busy} onClick={send} type="button"><ArrowUp size={18} /></button>
         )}
       </div>
       <div className="composer-meta">

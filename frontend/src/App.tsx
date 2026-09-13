@@ -15,7 +15,7 @@ import { useWorkbench } from "./hooks/useWorkbench";
 
 export default function App(): React.ReactNode {
   const workbench = useWorkbench();
-  const { connected, createChat, models, selectedModel, setSelectedModelId } = workbench;
+  const { connected, createChat, loadSelectedRunEvents, models, selectedModel, setSelectedModelId } = workbench;
   const [view, setView] = useState<WorkspaceView>("chat");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(() => !window.matchMedia("(max-width: 760px)").matches);
@@ -29,6 +29,12 @@ export default function App(): React.ReactNode {
   useEffect(() => {
     setSelectedToken(null);
   }, [workbench.selectedRun?.id]);
+
+  useEffect(() => {
+    if (inspectorOpen && nerdMode && inspectorTab === "events") {
+      void loadSelectedRunEvents();
+    }
+  }, [inspectorOpen, inspectorTab, loadSelectedRunEvents, nerdMode]);
 
   useEffect(() => {
     const requireAuthentication = (): void => {
@@ -129,6 +135,7 @@ export default function App(): React.ReactNode {
                 />
                 <Composer
                   attachments={workbench.attachments}
+                  busy={workbench.branching}
                   connected={workbench.connected}
                   model={workbench.selectedModel}
                   onAttach={(file) => void workbench.addAttachment(file)}
@@ -167,9 +174,12 @@ export default function App(): React.ReactNode {
           </div>
           <Inspector
             activeTab={inspectorTab}
+            branching={workbench.branching}
             configuration={workbench.configuration}
             health={workbench.health}
             model={workbench.selectedModel}
+            nerdMode={nerdMode}
+            onBranchAlternative={workbench.branchFromAlternative}
             onClose={() => setInspectorOpen(false)}
             onSelectToken={setSelectedToken}
             onTabChange={setInspectorTab}

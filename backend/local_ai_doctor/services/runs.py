@@ -17,6 +17,7 @@ from ..api.schemas import (
     GenerationRunCreate,
     PromptScoreRequest,
     SamplingRequest,
+    TokenBranchCreate,
 )
 from ..config import AppSettings, DeviceMode, DType, InstrumentationLevel
 from ..domain.models import ModelDescriptor, ModelTask
@@ -35,8 +36,8 @@ INSERT OR REPLACE INTO token_events(
     processed_logit, sample_logprob, sample_probability, entropy, surprise,
     cumulative_logprob, running_perplexity, decode_ms, sample_ms, emit_ms,
     inter_token_ms, cumulative_ms, instantaneous_tps, rolling_tps, segment,
-    selected_experts_json, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    reasoning_slices_json, selected_experts_json, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 ALTERNATIVE_INSERT_SQL = """
@@ -329,6 +330,7 @@ class RunManager:
                     token.get("instantaneous_tps"),
                     token.get("rolling_tps"),
                     token.get("segment", "unknown"),
+                    json.dumps(token.get("reasoning_slices", [])),
                     json.dumps(token.get("expert_routing")),
                     now,
                 )
@@ -367,6 +369,7 @@ class RunManager:
         device: Any,
         dtype: Any,
         reservation: InferenceReservation,
+        forced_prefix_token_ids: list[int] | None = None,
     ) -> None:
         output = ""
         token_count = 0
@@ -399,15 +402,20 @@ class RunManager:
                 max_prompt_tokens=self.settings.inference.max_prompt_tokens,
                 reserved_output_tokens=self.settings.inference.reserved_output_tokens,
                 timeout_seconds=self.settings.workers.inference_timeout_seconds,
+                forced_prefix_token_ids=forced_prefix_token_ids or (),
             ):
                 event_type = str(worker_event["event_type"])
                 payload = dict(worker_event.get("payload", {}))
                 if event_type == "stage" and payload.get("stage") == "prefill":
+                    current_message = await self.repository.get_message(message_id)
                     await self.repository.update_message(
                         message_id,
                         content=output,
                         status="streaming",
-                        metadata={"reasoning_primed": bool(payload.get("reasoning_primed"))},
+                        metadata={
+                            **dict((current_message or {}).get("metadata") or {}),
+                            "reasoning_primed": bool(payload.get("reasoning_primed")),
+                        },
                     )
                     await self.repository.update_run(
                         run_id,
@@ -499,6 +507,9 @@ class RunManager:
                             "expert_routing": payload.get("expert_routing"),
                         },
                     )
+                    # A terminal run status promises that every accepted token and
+                    # alternative is durable, including to polling API clients.
+                    await self.telemetry.flush()
                     await self.repository.update_message(message_id, content=output, status=status)
                     await self.repository.update_run(
                         run_id,
@@ -508,6 +519,7 @@ class RunManager:
                         completed_at=_now(),
                     )
                 elif event_type == "error":
+                    await self.telemetry.flush()
                     await self.repository.update_message(
                         message_id, content=output, status="failed"
                     )
@@ -519,11 +531,6 @@ class RunManager:
                         error_message=payload.get("message"),
                         completed_at=_now(),
                     )
-                if event_type in {"completed", "cancelled", "error"}:
-                    # A terminal event tells WebSocket consumers that it is safe to
-                    # refetch the run. Commit the final message/run state and drain
-                    # queued token telemetry before making that notification visible.
-                    await self.telemetry.flush()
                 await self.events.publish(run_id, event_type, payload)
         except Exception as exc:
             logger.error("generation run %s failed (%s)", run_id, type(exc).__name__)
@@ -537,6 +544,10 @@ class RunManager:
                     "message": "generation failed at an application boundary",
                     "hint": "Review local application logs for the private diagnostic details.",
                 }
+            # Establish the same durability barrier used by normal terminal
+            # events before making the failed state visible to polling clients.
+            with suppress(Exception):
+                await self.telemetry.flush()
             await self.repository.update_message(message_id, content=output, status="failed")
             await self.repository.update_run(
                 run_id,
@@ -546,8 +557,6 @@ class RunManager:
                 error_message=error.get("message"),
                 completed_at=_now(),
             )
-            with suppress(Exception):
-                await self.telemetry.flush()
             # EventBroker fans out before surfacing an optional persistence
             # failure, so suppressing here avoids an unhandled background task
             # while connected clients still receive exactly one terminal error.
@@ -812,6 +821,252 @@ class RunManager:
             lambda _task: self._release_generation_reservation(run_id, reservation)
         )
         return {"run": run, "assistant_message": assistant_message}
+
+    async def branch_generation(
+        self, parent_run_id: str, request: TokenBranchCreate
+    ) -> dict[str, Any]:
+        """Continue a completed generation after replacing one token with a recorded alternative."""
+
+        source = await self.repository.get_run(parent_run_id)
+        if source is None:
+            raise CapabilityUnavailableError(
+                "the source run does not exist", details={"run_id": parent_run_id}
+            )
+        if source["kind"] != "generation" or source["status"] != "complete":
+            raise CapabilityUnavailableError(
+                "only completed generation runs can be branched",
+                details={"run_id": parent_run_id, "status": source["status"]},
+            )
+        if source.get("model_id") is None:
+            raise CapabilityUnavailableError(
+                "the recorded model is no longer registered",
+                hint="Restore the original checkpoint and refresh the model registry.",
+            )
+        descriptor = self.registry.get(str(source["model_id"]))
+        if source.get("model_fingerprint") != descriptor.fingerprint.value:
+            raise CapabilityUnavailableError(
+                "the recorded model fingerprint no longer matches the registered checkpoint",
+                details={"run_id": parent_run_id, "model_id": descriptor.id},
+            )
+
+        persisted_tokens = await self.repository.list_run_tokens(parent_run_id)
+        prefix = [
+            token for token in persisted_tokens if int(token["token_index"]) <= request.token_index
+        ]
+        if len(prefix) != request.token_index + 1 or any(
+            int(token["token_index"]) != expected for expected, token in enumerate(prefix)
+        ):
+            raise InvalidRequestError(
+                "the selected token does not have a complete persisted prefix",
+                hint="Choose a token whose telemetry is still available.",
+                details={"run_id": parent_run_id, "token_index": request.token_index},
+            )
+        selected = next(
+            (
+                alternative
+                for alternative in prefix[-1].get("alternatives", [])
+                if alternative["distribution"] == request.distribution
+                and int(alternative["rank"]) == request.rank
+                and int(alternative["token_id"]) == request.token_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise InvalidRequestError(
+                "the selected token alternative is not present in persisted telemetry",
+                hint="Refresh the run inspector and choose one of the recorded alternatives.",
+                details={
+                    "run_id": parent_run_id,
+                    "token_index": request.token_index,
+                    "distribution": request.distribution,
+                    "rank": request.rank,
+                    "token_id": request.token_id,
+                },
+            )
+        forced_prefix_token_ids = [int(token["token_id"]) for token in prefix[:-1]]
+        forced_prefix_token_ids.append(request.token_id)
+
+        source_message_id = source.get("message_id")
+        source_message = (
+            await self.repository.get_message(str(source_message_id))
+            if source_message_id is not None
+            else None
+        )
+        if source_message is None or source_message["role"] != "assistant":
+            raise CapabilityUnavailableError(
+                "the source generation is not attached to an assistant message"
+            )
+        branch_parent_id = source_message.get("parent_id")
+        if branch_parent_id is None:
+            raise CapabilityUnavailableError(
+                "the source generation has no branchable parent message"
+            )
+        lineage = await self.repository.get_message_lineage(str(branch_parent_id))
+        if not lineage or lineage[-1]["role"] != "user":
+            raise CapabilityUnavailableError(
+                "the source generation branch does not end in a user message"
+            )
+        messages = _generation_messages(lineage)
+        rendered_bytes = _rendered_history_bytes(messages)
+        if rendered_bytes > self.settings.limits.prompt_bytes:
+            raise InvalidRequestError(
+                "rendered conversation exceeds the configured prompt byte limit",
+                hint="Shorten the selected branch or raise limits.prompt_bytes in local configuration.",
+                details={
+                    "maximum_bytes": self.settings.limits.prompt_bytes,
+                    "rendered_history_bytes": rendered_bytes,
+                    "message_count": len(messages),
+                },
+            )
+        source_chat = await self.repository.get_chat(str(source_message["chat_id"]))
+        if source_chat is None:
+            raise CapabilityUnavailableError("the source generation chat no longer exists")
+
+        settings = dict(source.get("settings") or {})
+        try:
+            sampling = SamplingRequest.model_validate(settings.get("sampling", {})).model_dump(
+                mode="json"
+            )
+            instrumentation = InstrumentationLevel(
+                settings.get("instrumentation", self.settings.inference.instrumentation.value)
+            )
+            effective_seed = int(source["effective_seed"])
+            if not 0 <= effective_seed <= 2**64 - 1:
+                raise ValueError("seed is outside the unsigned 64-bit range")
+        except (TypeError, ValueError) as exc:
+            raise CapabilityUnavailableError(
+                "the recorded generation settings are not replayable",
+                details={"run_id": parent_run_id},
+            ) from exc
+        deterministic_reference_mode = bool(settings.get("deterministic_reference_mode", False))
+        recorded_reproducibility = dict(source.get("reproducibility") or {})
+        recorded_device = recorded_reproducibility.get("device")
+        device: DeviceMode | None = None
+        if isinstance(recorded_device, Mapping):
+            requested_device = recorded_device.get("requested")
+            try:
+                device = DeviceMode(requested_device) if isinstance(requested_device, str) else None
+            except ValueError:
+                device = None
+        dtype: DType | None = None
+        recorded_dtype = recorded_reproducibility.get("dtype")
+        try:
+            dtype = DType(recorded_dtype) if isinstance(recorded_dtype, str) else None
+        except ValueError:
+            dtype = None
+        selection = self.registry.choose_hardware(device=device, dtype=dtype)
+
+        branch_details = {
+            "source_run_id": parent_run_id,
+            "source_token_index": request.token_index,
+            "source_token_id": int(prefix[-1]["token_id"]),
+            "selected_token_id": request.token_id,
+            "selected_piece": str(selected["piece"]),
+            "distribution": request.distribution,
+            "rank": request.rank,
+            "forced_prefix_token_count": len(forced_prefix_token_ids),
+        }
+        reproducibility = {
+            **recorded_reproducibility,
+            "branched_from": branch_details,
+            "requested_seed": (
+                None if source.get("requested_seed") is None else str(source["requested_seed"])
+            ),
+            "effective_seed": str(effective_seed),
+            "rng_algorithm": source["rng_algorithm"],
+            "generator_device": selection.device_identifier,
+            "sampling": sampling,
+            "model_fingerprint": descriptor.fingerprint.model_dump(mode="json"),
+            "backend": "transformers-reference-loop",
+            "device": selection.model_dump(mode="json"),
+            "dtype": selection.effective_dtype.value,
+            "quantization": self.settings.runtime.quantization.value,
+            "attention_implementation": self.settings.runtime.attention_backend.value,
+            "deterministic_reference_mode": deterministic_reference_mode,
+            "deterministic_kernels": {
+                "torch_use_deterministic_algorithms": deterministic_reference_mode,
+                "cublas_workspace_config": ":4096:8" if deterministic_reference_mode else None,
+                "cudnn_benchmark": False,
+            },
+            "seed_affected_token_selection": sampling["temperature"] > 0,
+            "batching": {"batch_size": 1, "concurrent_runs": 1},
+            "software_versions": (
+                self.registry.hardware.software_versions if self.registry.hardware else {}
+            ),
+        }
+        run_id = str(uuid.uuid4())
+        reservation = self.registry.reserve_inference(run_id, "generation_token_branch")
+        self._reservations[run_id] = reservation
+        try:
+            hardware_snapshot = (
+                self.registry.hardware.model_dump(mode="json") if self.registry.hardware else {}
+            )
+            source_title = str(source_chat.get("title") or "New chat")
+            setup = await self.repository.create_token_branch_setup(
+                title=f"{source_title} · Branch",
+                lineage=lineage,
+                run={
+                    "id": run_id,
+                    "model_id": descriptor.id,
+                    # This run belongs to a self-contained new chat. Its source
+                    # provenance lives in token_branch/branched_from so workspace
+                    # exports do not contain a dangling cross-chat run parent.
+                    "parent_run_id": None,
+                    "kind": "generation",
+                    "status": "queued",
+                    "requested_seed": source.get("requested_seed"),
+                    "effective_seed": effective_seed,
+                    "rng_algorithm": source["rng_algorithm"],
+                    "generator_device": selection.device_identifier,
+                    "settings": {
+                        **settings,
+                        "sampling": sampling,
+                        "instrumentation": instrumentation.value,
+                        "deterministic_reference_mode": deterministic_reference_mode,
+                        "token_branch": branch_details,
+                    },
+                    "effective_config": self.settings.inference_snapshot(),
+                    "reproducibility": reproducibility,
+                    "model_fingerprint": descriptor.fingerprint.value,
+                    "tokenizer_fingerprint": source.get("tokenizer_fingerprint"),
+                },
+                assistant_metadata={"token_branch": branch_details},
+                hardware=hardware_snapshot,
+                software=hardware_snapshot.get("software_versions", {}),
+                backend={
+                    "name": "transformers-reference-loop",
+                    "selection": selection.model_dump(mode="json"),
+                    "attention_implementation": self.settings.runtime.attention_backend.value,
+                    "quantization": self.settings.runtime.quantization.value,
+                    "token_branch": branch_details,
+                },
+            )
+            assistant_message = setup["assistant_message"]
+            task = asyncio.create_task(
+                self._execute_generation(
+                    run_id=run_id,
+                    message_id=assistant_message["id"],
+                    model_id=descriptor.id,
+                    messages=messages,
+                    sampling=sampling,
+                    effective_seed=effective_seed,
+                    instrumentation=instrumentation.value,
+                    deterministic_reference_mode=deterministic_reference_mode,
+                    device=device,
+                    dtype=dtype,
+                    reservation=reservation,
+                    forced_prefix_token_ids=forced_prefix_token_ids,
+                ),
+                name=f"generation-token-branch-{run_id}",
+            )
+            self._tasks[run_id] = task
+            task.add_done_callback(
+                lambda _task: self._release_generation_reservation(run_id, reservation)
+            )
+            return setup
+        except BaseException:
+            self._release_generation_reservation(run_id, reservation)
+            raise
 
     async def create_embedding(
         self,

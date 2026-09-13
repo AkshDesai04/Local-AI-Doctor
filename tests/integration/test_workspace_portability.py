@@ -55,10 +55,15 @@ def test_chat_workspace_round_trip_remaps_ids_and_preserves_token_telemetry(
         """
         INSERT INTO token_events(
             run_id, token_index, token_id, piece, escaped_bytes, display_text,
-            raw_logprob, raw_probability, segment, selected_experts_json, created_at
-        ) VALUES (?, 0, 7, '4', '\\x34', '4', -0.25, 0.75, 'answer', '[1,2]', ?)
+            raw_logprob, raw_probability, segment, reasoning_slices_json,
+            selected_experts_json, created_at
+        ) VALUES (?, 0, 7, '4', '\\x34', '4', -0.25, 0.75, 'answer', ?, '[1,2]', ?)
         """,
-        (run["id"], now),
+        (
+            run["id"],
+            '[{"start":0,"end":1,"classification":"answer","delimiter":false}]',
+            now,
+        ),
     )
     portal.call(
         services.database.execute,
@@ -80,6 +85,9 @@ def test_chat_workspace_round_trip_remaps_ids_and_preserves_token_telemetry(
     assert exported["schema"] == "local-ai-doctor/chat-workspace"
     assert exported["schema_version"] == 1
     assert exported["runs"][0]["tokens"][0]["selected_experts"] == [1, 2]
+    assert exported["runs"][0]["tokens"][0]["reasoning_slices"] == [
+        {"start": 0, "end": 1, "classification": "answer", "delimiter": False}
+    ]
     assert exported["runs"][0]["tokens"][0]["alternatives"][0]["probability"] == 0.75
     assert "storage_name" not in exported_response.text
     assert "canonical_path" not in exported_response.text
@@ -101,6 +109,7 @@ def test_chat_workspace_round_trip_remaps_ids_and_preserves_token_telemetry(
     }
     imported_tokens = portal.call(services.repository.list_run_tokens, imported_runs[0]["id"])
     assert imported_tokens[0]["piece"] == "4"
+    assert imported_tokens[0]["reasoning_slices"][0]["classification"] == "answer"
     assert imported_tokens[0]["alternatives"][0]["probability"] == 0.75
 
     assert api_client.delete(f"/api/v1/chats/{chat['id']}", headers=API_HEADERS).status_code == 204
@@ -241,6 +250,374 @@ def test_replay_uses_recorded_configuration_and_creates_an_assistant_branch(
         )
     )
     portal.call(services.repository.delete_chat, chat["id"])
+
+
+def test_token_branch_validates_telemetry_and_clones_lineage_into_a_new_chat(
+    api_client: TestClient, monkeypatch: Any
+) -> None:
+    services = api_client.app.state.services
+    portal = api_client.portal
+    assert portal is not None
+    assert services.registry.report is not None
+    model = services.registry.report.models[0]
+    chat = portal.call(services.repository.create_chat, "token branch")
+    earlier_user = portal.call(
+        partial(
+            services.repository.create_message,
+            chat_id=chat["id"],
+            role="user",
+            content="Earlier question",
+        )
+    )
+    earlier_assistant = portal.call(
+        partial(
+            services.repository.create_message,
+            chat_id=chat["id"],
+            role="assistant",
+            content="Earlier answer",
+            parent_id=earlier_user["id"],
+            status="complete",
+        )
+    )
+    earlier_run = portal.call(
+        services.repository.create_run,
+        {
+            "message_id": earlier_assistant["id"],
+            "model_id": model.id,
+            "status": "complete",
+            "effective_seed": 123,
+            "settings": {"sampling": {"max_output_tokens": 8, "temperature": 0.7}},
+            "model_fingerprint": model.fingerprint.value,
+        },
+    )
+    earlier_now = utc_now()
+    portal.call(
+        partial(
+            services.repository.update_run,
+            earlier_run["id"],
+            rendered_prompt="Earlier question ->",
+            prompt_token_count=2,
+            generated_token_count=1,
+            finish_reason="stop",
+            completed_at=earlier_now,
+        )
+    )
+    portal.call(
+        partial(
+            services.repository.save_environment_snapshot,
+            earlier_run["id"],
+            hardware={"device": "test-gpu"},
+            software={"torch": "test"},
+            backend={"name": "test-backend"},
+        )
+    )
+    portal.call(
+        partial(
+            services.repository.upsert_phase_metric,
+            earlier_run["id"],
+            "generation",
+            duration_ms=12.5,
+            details={"decode_tokens_per_second": 80.0},
+        )
+    )
+    portal.call(
+        services.database.execute,
+        """
+        INSERT INTO token_events(
+            run_id, token_index, token_id, piece, escaped_bytes, display_text,
+            selected_experts_json, created_at, reasoning_slices_json
+        ) VALUES (?, 0, 7, 'Earlier', 'Earlier', 'Earlier', '[1]', ?,
+                  '[{"kind":"answer","start":0,"end":7}]')
+        """,
+        (earlier_run["id"], earlier_now),
+    )
+    portal.call(
+        services.database.execute,
+        """
+        INSERT INTO token_alternatives(
+            run_id, token_index, distribution, rank, token_id, piece, probability,
+            survived_filter
+        ) VALUES (?, 0, 'sampling', 1, 8, 'Alternative', 0.25, 1)
+        """,
+        (earlier_run["id"],),
+    )
+    portal.call(
+        services.database.execute,
+        """
+        INSERT INTO router_events(
+            run_id, token_index, layer_index, selected_json, executed_json,
+            router_entropy, dropped_assignments
+        ) VALUES (?, 0, 0, '[{"expert_id":1}]', '[{"expert_id":1}]', 0.4, 0)
+        """,
+        (earlier_run["id"],),
+    )
+    portal.call(
+        services.database.execute,
+        """
+        INSERT INTO router_aggregates(
+            run_id, layer_index, expert_id, activation_count, average_weight, load_fraction
+        ) VALUES (?, 0, 1, 1, 0.75, 1.0)
+        """,
+        (earlier_run["id"],),
+    )
+    portal.call(
+        services.repository.append_raw_event,
+        {
+            "run_id": earlier_run["id"],
+            "sequence": 1,
+            "type": "warning",
+            "monotonic_ns": 1,
+            "payload": {"message": "historical warning"},
+        },
+    )
+    portal.call(
+        services.repository.append_raw_event,
+        {
+            "run_id": earlier_run["id"],
+            "sequence": 2,
+            "type": "completed",
+            "monotonic_ns": 2,
+            "payload": {"finish_reason": "stop"},
+        },
+    )
+    user = portal.call(
+        partial(
+            services.repository.create_message,
+            chat_id=chat["id"],
+            role="user",
+            content="Pick a color",
+            parent_id=earlier_assistant["id"],
+        )
+    )
+    source_message = portal.call(
+        partial(
+            services.repository.create_message,
+            chat_id=chat["id"],
+            role="assistant",
+            content="red car",
+            parent_id=user["id"],
+            status="complete",
+        )
+    )
+    source_run = portal.call(
+        services.repository.create_run,
+        {
+            "message_id": source_message["id"],
+            "model_id": model.id,
+            "status": "complete",
+            "effective_seed": 987,
+            "requested_seed": 987,
+            "settings": {
+                "sampling": {"max_output_tokens": 8, "temperature": 0.7},
+                "instrumentation": "full",
+            },
+            "reproducibility": {
+                "device": {"requested": "cpu"},
+                "dtype": "float32",
+            },
+            "model_fingerprint": model.fingerprint.value,
+            "generated_token_count": 2,
+        },
+    )
+    now = utc_now()
+    portal.call(
+        services.database.executemany,
+        """
+        INSERT INTO token_events(
+            run_id, token_index, token_id, piece, escaped_bytes, display_text, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (source_run["id"], 0, 11, "red", "red", "red", now),
+            (source_run["id"], 1, 12, " car", " car", " car", now),
+        ],
+    )
+    portal.call(
+        services.database.execute,
+        """
+        INSERT INTO token_alternatives(
+            run_id, token_index, distribution, rank, token_id, piece, probability,
+            survived_filter
+        ) VALUES (?, 1, 'sampling', 2, 42, ' bike', 0.2, 1)
+        """,
+        (source_run["id"],),
+    )
+    persisted_source = api_client.get(
+        f"/api/v1/runs/{source_run['id']}", headers=API_HEADERS
+    ).json()
+    assert persisted_source["branchable_through_token_index"] == 1
+    assert "events" not in persisted_source
+    captured: dict[str, Any] = {}
+
+    async def fake_execute_generation(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(services.runs, "_execute_generation", fake_execute_generation)
+    oversized = api_client.post(
+        f"/api/v1/runs/{source_run['id']}/branch",
+        headers=API_HEADERS,
+        json={
+            "tokenIndex": 100_001,
+            "distribution": "sampling",
+            "rank": 2,
+            "tokenId": 42,
+        },
+    )
+    assert oversized.status_code == 422
+    stale = api_client.post(
+        f"/api/v1/runs/{source_run['id']}/branch",
+        headers=API_HEADERS,
+        json={"tokenIndex": 1, "distribution": "sampling", "rank": 2, "tokenId": 41},
+    )
+    assert stale.status_code == 422
+    assert stale.json()["error"]["code"] == "invalid_request"
+
+    response = api_client.post(
+        f"/api/v1/runs/{source_run['id']}/branch",
+        headers=API_HEADERS,
+        json={"tokenIndex": 1, "distribution": "sampling", "rank": 2, "tokenId": 42},
+    )
+    assert response.status_code == 202
+    branched = response.json()
+    assert branched["chatId"] != chat["id"]
+    assert branched["sourceRunId"] == source_run["id"]
+    assert "parentRunId" not in branched
+    assert branched["run"]["parent_run_id"] is None
+    assert branched["run"]["settings"]["token_branch"] == {
+        "source_run_id": source_run["id"],
+        "source_token_index": 1,
+        "source_token_id": 12,
+        "selected_token_id": 42,
+        "selected_piece": " bike",
+        "distribution": "sampling",
+        "rank": 2,
+        "forced_prefix_token_count": 2,
+    }
+    assert branched["run"]["reproducibility"]["generator_device"] == "cpu"
+    assert branched["run"]["reproducibility"]["quantization"] == (
+        services.settings.runtime.quantization.value
+    )
+    assert branched["run"]["reproducibility"]["attention_implementation"] == (
+        services.settings.runtime.attention_backend.value
+    )
+    new_chat = api_client.get(f"/api/v1/chats/{branched['chatId']}", headers=API_HEADERS).json()
+    assert new_chat["title"] == "token branch · Branch"
+    assert [message["role"] for message in new_chat["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert new_chat["messages"][0]["content"] == "Earlier question"
+    assert new_chat["messages"][0]["id"] != earlier_user["id"]
+    cloned_history_run_id = new_chat["messages"][1]["run_id"]
+    assert cloned_history_run_id != earlier_run["id"]
+    assert new_chat["messages"][1]["metadata"]["cloned_from_run_id"] == earlier_run["id"]
+    assert new_chat["messages"][2]["content"] == "Pick a color"
+    assert new_chat["messages"][2]["id"] != user["id"]
+    assert new_chat["messages"][3]["parent_id"] == new_chat["messages"][2]["id"]
+    assert [message["created_at"] for message in new_chat["messages"]] == sorted(
+        message["created_at"] for message in new_chat["messages"]
+    )
+    portal.call(asyncio.sleep, 0)
+    assert captured["messages"] == [
+        {"role": "user", "content": "Earlier question"},
+        {"role": "assistant", "content": "Earlier answer"},
+        {"role": "user", "content": "Pick a color"},
+    ]
+    assert captured["forced_prefix_token_ids"] == [11, 42]
+    assert captured["effective_seed"] == 987
+
+    assert portal.call(services.repository.delete_chat, chat["id"])
+    assert (
+        api_client.get(f"/api/v1/runs/{earlier_run['id']}", headers=API_HEADERS).status_code == 404
+    )
+    cloned_details_response = api_client.get(
+        f"/api/v1/runs/{cloned_history_run_id}", headers=API_HEADERS
+    )
+    assert cloned_details_response.status_code == 200
+    cloned_details = cloned_details_response.json()
+    assert cloned_details["message_id"] == new_chat["messages"][1]["id"]
+    assert cloned_details["parent_run_id"] is None
+    assert cloned_details["effective_seed"] == "123"
+    assert cloned_details["rendered_prompt"] == "Earlier question ->"
+    assert cloned_details["finish_reason"] == "stop"
+    assert cloned_details["environment"]["hardware"] == {"device": "test-gpu"}
+    assert cloned_details["phases"][0]["details"] == {"decode_tokens_per_second": 80.0}
+    assert cloned_details["tokens"][0]["reasoning_slices"] == [
+        {"kind": "answer", "start": 0, "end": 7}
+    ]
+    assert cloned_details["tokens"][0]["alternatives"][0]["token_id"] == 8
+    assert cloned_details["summary"] == {"finish_reason": "stop"}
+    assert cloned_details["warnings"] == ["historical warning"]
+    cloned_events = api_client.get(
+        f"/api/v1/runs/{cloned_history_run_id}/events", headers=API_HEADERS
+    ).json()["events"]
+    assert [event["type"] for event in cloned_events] == ["warning", "completed"]
+    for table in ("router_events", "router_aggregates"):
+        assert portal.call(
+            services.database.fetch_one,
+            f"SELECT COUNT(*) AS count FROM {table} WHERE run_id = ?",
+            (cloned_history_run_id,),
+        ) == {"count": 1}
+
+    nested_branch = api_client.post(
+        f"/api/v1/runs/{cloned_history_run_id}/branch",
+        headers=API_HEADERS,
+        json={"tokenIndex": 0, "distribution": "sampling", "rank": 1, "tokenId": 8},
+    )
+    assert nested_branch.status_code == 202
+    assert nested_branch.json()["sourceRunId"] == cloned_history_run_id
+    portal.call(
+        partial(
+            services.repository.update_run,
+            nested_branch.json()["runId"],
+            status="complete",
+            completed_at=utc_now(),
+        )
+    )
+    portal.call(services.repository.delete_chat, nested_branch.json()["chatId"])
+
+    replay = api_client.post(f"/api/v1/runs/{cloned_history_run_id}/replay", headers=API_HEADERS)
+    assert replay.status_code == 202
+    assert replay.json()["parentRunId"] == cloned_history_run_id
+    assert replay.json()["assistant_message"]["chat_id"] == branched["chatId"]
+    portal.call(
+        partial(
+            services.repository.update_message,
+            replay.json()["messageId"],
+            content="replayed",
+            status="complete",
+        )
+    )
+    portal.call(
+        partial(
+            services.repository.update_run,
+            replay.json()["runId"],
+            status="complete",
+            completed_at=utc_now(),
+        )
+    )
+
+    portal.call(
+        partial(
+            services.repository.update_run,
+            branched["runId"],
+            status="complete",
+            completed_at=utc_now(),
+        )
+    )
+    branch_export = api_client.get(
+        f"/api/v1/chats/{branched['chatId']}/export", headers=API_HEADERS
+    )
+    assert branch_export.status_code == 200
+    assert branch_export.json()["runs"][0]["parent_run_id"] is None
+    branch_import = api_client.post(
+        "/api/v1/chats/import", headers=API_HEADERS, json=branch_export.json()
+    )
+    assert branch_import.status_code == 201
+    portal.call(services.repository.delete_chat, branch_import.json()["chat"]["id"])
+    portal.call(services.repository.delete_chat, branched["chatId"])
 
 
 def test_generation_uses_only_the_selected_message_lineage(

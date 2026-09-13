@@ -1,6 +1,7 @@
 import type {
   ApiErrorPayload,
   Attachment,
+  BranchRunRequest,
   Capability,
   CapabilityKey,
   ChatSummary,
@@ -13,6 +14,7 @@ import type {
   Message,
   ModelInspection,
   ModelSummary,
+  ReasoningSlice,
   RunDetails,
   RunStreamEvent,
   TokenAlternative,
@@ -184,6 +186,20 @@ function normalizeAlternative(value: unknown): TokenAlternative {
   };
 }
 
+function normalizeReasoningSlice(value: unknown): ReasoningSlice | null {
+  const raw = asRecord(value);
+  const start = Number(raw.start);
+  const end = Number(raw.end);
+  const classification = raw.classification;
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start) return null;
+  return {
+    start,
+    end,
+    classification: classification === "reasoning" || classification === "answer" ? classification : "unknown",
+    delimiter: raw.delimiter === true,
+  };
+}
+
 function normalizeToken(value: unknown): TokenEvent {
   const raw = asRecord(value);
   const alternatives = asRecord(raw.alternatives);
@@ -206,6 +222,10 @@ function normalizeToken(value: unknown): TokenEvent {
     ? [raw.span_start, raw.span_end] as [number, number]
     : Array.isArray(raw.characterSpan) && raw.characterSpan.length === 2 ? raw.characterSpan as [number, number] : undefined;
   const segment = raw.reasoningSegment ?? raw.segment;
+  const reasoningSlicesValue = raw.reasoningSlices ?? raw.reasoning_slices;
+  const reasoningSlices = Array.isArray(reasoningSlicesValue)
+    ? reasoningSlicesValue.map(normalizeReasoningSlice).filter((slice): slice is ReasoningSlice => slice !== null)
+    : [];
   return {
     index: Number(raw.index ?? raw.token_index ?? 0),
     tokenId: Number(raw.tokenId ?? raw.token_id ?? -1),
@@ -226,6 +246,7 @@ function normalizeToken(value: unknown): TokenEvent {
     cumulativeLogProbability: asOptionalNumber(raw.cumulativeLogProbability ?? raw.cumulative_logprob),
     runningPerplexity: asOptionalNumber(raw.runningPerplexity ?? raw.running_perplexity),
     reasoningSegment: segment === "reasoning" || segment === "answer" ? segment : "unknown",
+    reasoningSlices: reasoningSlices.length > 0 ? reasoningSlices : undefined,
     rawAlternatives: Array.isArray(raw.rawAlternatives) ? raw.rawAlternatives.map(normalizeAlternative) : Array.isArray(alternatives.raw) ? alternatives.raw.map(normalizeAlternative) : storedRawAlternatives.length ? storedRawAlternatives.map(normalizeAlternative) : undefined,
     samplingAlternatives: Array.isArray(raw.samplingAlternatives) ? raw.samplingAlternatives.map(normalizeAlternative) : Array.isArray(alternatives.sampling) ? alternatives.sampling.map(normalizeAlternative) : storedSamplingAlternatives.length ? storedSamplingAlternatives.map(normalizeAlternative) : undefined,
     expertRoutes,
@@ -322,17 +343,21 @@ function normalizeStreamEvent(value: unknown): RunStreamEvent | null {
   if (version === null || sequence === undefined) return null;
   const type = asString(raw.type, "");
   const payload = asRecord(raw.payload);
-  if (type === "run.created" || type === "run_created") return { version, sequence, type: "run.created", run: type === "run.created" ? asRecord(raw.run) : { status: "queued", reproducibility: typeof payload.effective_seed === "string" ? { effectiveSeed: payload.effective_seed } : undefined } };
-  if (type === "stage.changed") return { version, sequence, type, stage: runStatus(raw.stage, "running"), detail: typeof raw.detail === "string" ? raw.detail : undefined };
+  const preserveEnvelope = (event: RunStreamEvent): RunStreamEvent => ({
+    ...event,
+    raw: { ...raw },
+  });
+  if (type === "run.created" || type === "run_created") return preserveEnvelope({ version, sequence, type: "run.created", run: type === "run.created" ? asRecord(raw.run) : { status: "queued", reproducibility: typeof payload.effective_seed === "string" ? { effectiveSeed: payload.effective_seed } : undefined } });
+  if (type === "stage.changed") return preserveEnvelope({ version, sequence, type, stage: runStatus(raw.stage, "running"), detail: typeof raw.detail === "string" ? raw.detail : undefined });
   if (type === "stage" || type === "model_loaded") {
     const stage = asString(payload.stage, "running");
-    return { version, sequence, type: "stage.changed", stage: stage.includes("load") ? "loading" : "running", detail: stage, metrics: metricsFromPayload(payload) };
+    return preserveEnvelope({ version, sequence, type: "stage.changed", stage: stage.includes("load") ? "loading" : "running", detail: stage, metrics: metricsFromPayload(payload) });
   }
-  if (type === "token") return { version, sequence, type, token: normalizeToken(raw.token ?? payload) };
+  if (type === "token") return preserveEnvelope({ version, sequence, type, token: normalizeToken(raw.token ?? payload) });
   if (type === "metrics" || type === "metric") {
     const metricPayload = asRecord(raw.metrics ?? payload);
     const samplingPipeline = Array.isArray(metricPayload.sampling_operation_order) ? metricPayload.sampling_operation_order.filter((item): item is string => typeof item === "string") : undefined;
-    return {
+    return preserveEnvelope({
       version,
       sequence,
       type: "metrics",
@@ -343,13 +368,13 @@ function normalizeStreamEvent(value: unknown): RunStreamEvent | null {
         rngAlgorithm: typeof metricPayload.rng_algorithm === "string" ? metricPayload.rng_algorithm : undefined,
         generatorDevice: typeof metricPayload.generator_device === "string" ? metricPayload.generator_device : undefined,
       } : undefined,
-    };
+    });
   }
-  if (type === "warning") return { version, sequence, type, message: asString(raw.message ?? payload.message, "Run warning") };
-  if (type === "completed") return { version, sequence, type, run: { status: "complete", metrics: metricsFromPayload(raw.run ?? payload) } };
-  if (type === "cancelled") return { version, sequence, type, reason: typeof (raw.reason ?? payload.reason) === "string" ? String(raw.reason ?? payload.reason) : undefined, metrics: metricsFromPayload(payload) };
-  if (type === "error") return { version, sequence, type, code: typeof (raw.code ?? payload.code) === "string" ? asString(raw.code ?? payload.code, "") : undefined, message: asString(raw.message ?? payload.message, "Generation failed") };
-  return { version, sequence, type: "warning", message: type === "resync_required" ? "The live buffer rolled over; reconnecting from persisted events." : `Ignored unsupported event type “${type}”.` };
+  if (type === "warning") return preserveEnvelope({ version, sequence, type, message: asString(raw.message ?? payload.message, "Run warning") });
+  if (type === "completed") return preserveEnvelope({ version, sequence, type, run: { status: "complete", metrics: metricsFromPayload(raw.run ?? payload) } });
+  if (type === "cancelled") return preserveEnvelope({ version, sequence, type, reason: typeof (raw.reason ?? payload.reason) === "string" ? String(raw.reason ?? payload.reason) : undefined, metrics: metricsFromPayload(payload) });
+  if (type === "error") return preserveEnvelope({ version, sequence, type, code: typeof (raw.code ?? payload.code) === "string" ? asString(raw.code ?? payload.code, "") : undefined, message: asString(raw.message ?? payload.message, "Generation failed") });
+  return preserveEnvelope({ version, sequence, type: "warning", message: type === "resync_required" ? "The live buffer rolled over; reconnecting from persisted events." : `Ignored unsupported event type “${type}”.` });
 }
 
 async function request<T>(path: string, init?: RequestInit, responseType: "json" | "blob" = "json"): Promise<T> {
@@ -443,7 +468,17 @@ function normalizeRun(value: unknown): RunDetails {
   const phaseMetrics = flattenPhaseMetrics(raw.phases ?? outer.phases);
   const summary = asRecord(raw.summary ?? outer.summary);
   const tokensRaw = Array.isArray(outer.tokens) ? outer.tokens : Array.isArray(raw.tokens) ? raw.tokens : [];
-  const tokens = tokensRaw.map(normalizeToken);
+  const eventsRaw = Array.isArray(outer.events) ? outer.events : Array.isArray(raw.events) ? raw.events : [];
+  const eventSlicesByToken = new Map<number, ReasoningSlice[]>();
+  for (const eventValue of eventsRaw) {
+    const event = asRecord(eventValue);
+    if (event.type !== "token") continue;
+    const eventToken = normalizeToken(event.payload ?? event.token);
+    if (eventToken.reasoningSlices?.length) eventSlicesByToken.set(eventToken.index, eventToken.reasoningSlices);
+  }
+  const tokens = tokensRaw.map(normalizeToken).map((token) => token.reasoningSlices?.length
+    ? token
+    : { ...token, reasoningSlices: eventSlicesByToken.get(token.index) });
   const reportedMetrics = metricsFromPayload({ ...raw, ...phaseMetrics, ...summary, ...asRecord(outer.metrics ?? raw.metrics) });
   const effectiveConfig = asRecord(raw.effective_config);
   const inferenceConfig = asRecord(effectiveConfig.inference);
@@ -502,6 +537,7 @@ function normalizeRun(value: unknown): RunDetails {
     createdAt: asString(raw.createdAt ?? raw.created_at, new Date(0).toISOString()),
     completedAt: typeof (raw.completedAt ?? raw.completed_at) === "string" ? String(raw.completedAt ?? raw.completed_at) : undefined,
     tokens,
+    branchableThroughTokenIndex: asOptionalNumber(raw.branchableThroughTokenIndex ?? raw.branchable_through_token_index),
     metrics,
     reproducibility,
     effectiveSettings: {
@@ -510,7 +546,7 @@ function normalizeRun(value: unknown): RunDetails {
     },
     samplingPipeline: Array.isArray(raw.samplingPipeline ?? raw.sampling_pipeline ?? phaseMetrics.sampling_operation_order) ? (raw.samplingPipeline ?? raw.sampling_pipeline ?? phaseMetrics.sampling_operation_order) as string[] : undefined,
     warnings: Array.isArray(raw.warnings) ? raw.warnings.filter((item): item is string => typeof item === "string") : undefined,
-    rawEvents: Array.isArray(outer.events) ? outer.events.map(normalizeStreamEvent).filter((event): event is RunStreamEvent => event !== null) : undefined,
+    rawEvents: eventsRaw.length > 0 ? eventsRaw.map(normalizeStreamEvent).filter((event): event is RunStreamEvent => event !== null) : undefined,
     error: typeof (raw.error ?? raw.error_message) === "string" ? String(raw.error ?? raw.error_message) : undefined,
   };
 }
@@ -563,11 +599,13 @@ function normalizeGenerationResponse(value: unknown): GenerateResponse {
   const user = asRecord(raw.user_message);
   const assistant = asRecord(raw.assistant_message);
   return {
+    chatId: typeof (raw.chatId ?? raw.chat_id ?? runRaw.chat_id) === "string" ? String(raw.chatId ?? raw.chat_id ?? runRaw.chat_id) : undefined,
     runId: asString(raw.runId ?? raw.run_id ?? runRaw.id, ""),
     messageId: typeof (raw.messageId ?? raw.message_id ?? assistant.id) === "string" ? String(raw.messageId ?? raw.message_id ?? assistant.id) : undefined,
     userMessageId: typeof user.id === "string" ? user.id : undefined,
     modelId: typeof runRaw.model_id === "string" ? runRaw.model_id : undefined,
     parentRunId: typeof (raw.parentRunId ?? raw.parent_run_id ?? runRaw.parent_run_id) === "string" ? String(raw.parentRunId ?? raw.parent_run_id ?? runRaw.parent_run_id) : undefined,
+    sourceRunId: typeof (raw.sourceRunId ?? raw.source_run_id) === "string" ? String(raw.sourceRunId ?? raw.source_run_id) : undefined,
     websocketUrl: typeof (raw.websocketUrl ?? raw.websocket_url) === "string" ? String(raw.websocketUrl ?? raw.websocket_url) : undefined,
     run: typeof runRaw.model_id === "string" || typeof runRaw.modelId === "string" ? normalizeRun(runRaw) : undefined,
   };
@@ -668,9 +706,25 @@ export const api = {
   async replayRun(id: string): Promise<GenerateResponse> {
     return normalizeGenerationResponse(await request(`/runs/${encodeURIComponent(id)}/replay`, { method: "POST" }));
   },
+  async branchRun(id: string, selection: BranchRunRequest): Promise<GenerateResponse> {
+    return normalizeGenerationResponse(await request(`/runs/${encodeURIComponent(id)}/branch`, {
+      method: "POST",
+      body: JSON.stringify({
+        token_index: selection.tokenIndex,
+        distribution: selection.distribution,
+        rank: selection.rank,
+        token_id: selection.tokenId,
+      }),
+    }));
+  },
   cancelRun: (id: string): Promise<void> => request(`/runs/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
   async run(id: string): Promise<RunDetails> {
     return normalizeRun(await request(`/runs/${encodeURIComponent(id)}`));
+  },
+  async runEvents(id: string): Promise<RunStreamEvent[]> {
+    const raw = asRecord(await request(`/runs/${encodeURIComponent(id)}/events`));
+    const events = Array.isArray(raw.events) ? raw.events : [];
+    return events.map(normalizeStreamEvent).filter((event): event is RunStreamEvent => event !== null);
   },
   upload: async (file: File, modelId: string): Promise<Attachment> => {
     const body = new FormData();

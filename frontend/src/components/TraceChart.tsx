@@ -15,6 +15,7 @@ interface TraceChartProps {
   title: string;
   tokens: TokenEvent[];
   metrics: ChartMetric[];
+  revealTokenText?: boolean;
   selectedToken: number | null;
   onSelectToken: (index: number) => void;
 }
@@ -29,7 +30,7 @@ function sampled<T>(items: T[], maximum: number): T[] {
   return Array.from({ length: maximum }, (_, index) => items[Math.round(index * stride)]).filter((item): item is T => item !== undefined);
 }
 
-export function TraceChart({ title, tokens, metrics, selectedToken, onSelectToken }: TraceChartProps): React.ReactNode {
+export function TraceChart({ title, tokens, metrics, revealTokenText = false, selectedToken, onSelectToken }: TraceChartProps): React.ReactNode {
   const [windowSize, setWindowSize] = useState<"128" | "512" | "all">("128");
   const [endIndex, setEndIndex] = useState<number | null>(null);
   const effectiveEnd = endIndex === null ? Math.max(0, tokens.length - 1) : Math.min(Math.max(endIndex, 0), Math.max(0, tokens.length - 1));
@@ -83,7 +84,7 @@ export function TraceChart({ title, tokens, metrics, selectedToken, onSelectToke
                   onClick={() => onSelectToken(token.index)}
                   r={selectedToken === token.index ? 5 : 2.5}
                   tabIndex={0}
-                ><title>#{String(token.index)} “{escapeToken(token.piece)}” · {formatNumber(value, 4)}</title></circle>
+                ><title>#{String(token.index)}{revealTokenText ? ` “${escapeToken(token.piece)}”` : ""} · {formatNumber(value, 4)}</title></circle>
               ))}
               <text className="chart-axis-title" x={(plot.left + width - plot.right) / 2} y={height - 7}>Generated token position</text>
             </svg>

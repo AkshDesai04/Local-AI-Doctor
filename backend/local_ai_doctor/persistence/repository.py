@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..errors import ActiveRunConflictError, InvalidRequestError
@@ -198,7 +199,8 @@ class WorkspaceRepository:
             SELECT messages.*,
                    (SELECT inference_runs.id FROM inference_runs
                     WHERE inference_runs.message_id = messages.id
-                    ORDER BY inference_runs.created_at DESC LIMIT 1) AS run_id
+                    ORDER BY inference_runs.created_at DESC, inference_runs.id DESC LIMIT 1
+                   ) AS run_id
             FROM messages WHERE chat_id = ? ORDER BY created_at, branch_index
             """,
             (chat_id,),
@@ -557,6 +559,272 @@ class WorkspaceRepository:
             "run": _decode_json_columns(dict(run_row)),
         }
 
+    async def create_token_branch_setup(
+        self,
+        *,
+        title: str,
+        lineage: Sequence[Mapping[str, Any]],
+        run: Mapping[str, Any],
+        assistant_metadata: Mapping[str, Any],
+        hardware: Mapping[str, Any],
+        software: Mapping[str, Any],
+        backend: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Clone one message lineage into a new chat and attach an active run atomically."""
+
+        if not lineage:
+            raise InvalidRequestError("a token branch requires a non-empty message lineage")
+        created = datetime.now(UTC)
+
+        def timestamp(ordinal: int) -> str:
+            return (created + timedelta(microseconds=ordinal)).isoformat()
+
+        chat_created_at = timestamp(0)
+        assistant_created_at = timestamp(len(lineage) + 1)
+        chat_id = str(uuid.uuid4())
+        run_id = str(run.get("id") or uuid.uuid4())
+        assistant_message_id = str(uuid.uuid4())
+        cloned_message_ids: list[str] = []
+        cloned_run_ids: dict[str, str] = {}
+        cloned_run_parents: list[tuple[str, str | None]] = []
+        previous_message_id: str | None = None
+        run_record = {**run, "message_id": assistant_message_id}
+
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                "INSERT INTO chats(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (chat_id, title.strip()[:200] or "New chat", chat_created_at, assistant_created_at),
+            )
+            for ordinal, source_message in enumerate(lineage, start=1):
+                message_id = str(uuid.uuid4())
+                cloned_message_ids.append(message_id)
+                metadata = {
+                    **dict(source_message.get("metadata") or {}),
+                    "cloned_from_message_id": str(source_message["id"]),
+                }
+                source_run = None
+                if source_message["role"] == "assistant":
+                    source_run_cursor = await connection.execute(
+                        """
+                        SELECT id, parent_run_id FROM inference_runs
+                        WHERE message_id = ? AND kind = 'generation'
+                        ORDER BY created_at DESC, id DESC LIMIT 1
+                        """,
+                        (source_message["id"],),
+                    )
+                    source_run = await source_run_cursor.fetchone()
+                if source_run is not None:
+                    metadata["cloned_from_run_id"] = str(source_run["id"])
+                await connection.execute(
+                    """
+                    INSERT INTO messages(
+                        id, chat_id, parent_id, role, content, status, branch_index,
+                        metadata_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                    """,
+                    (
+                        message_id,
+                        chat_id,
+                        previous_message_id,
+                        source_message["role"],
+                        source_message["content"],
+                        source_message["status"],
+                        _json(metadata),
+                        timestamp(ordinal),
+                        timestamp(ordinal),
+                    ),
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO message_attachments(message_id, attachment_id, ordinal)
+                    SELECT ?, attachment_id, ordinal
+                    FROM message_attachments WHERE message_id = ?
+                    """,
+                    (message_id, source_message["id"]),
+                )
+                if source_run is not None:
+                    source_run_id = str(source_run["id"])
+                    cloned_run_id = str(uuid.uuid4())
+                    cloned_run_ids[source_run_id] = cloned_run_id
+                    cloned_run_parents.append(
+                        (
+                            cloned_run_id,
+                            str(source_run["parent_run_id"])
+                            if source_run["parent_run_id"] is not None
+                            else None,
+                        )
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO inference_runs(
+                            id, message_id, model_id, parent_run_id, kind, status,
+                            requested_seed, effective_seed, rng_algorithm, generator_device,
+                            settings_json, effective_config_json, reproducibility_json,
+                            model_fingerprint, tokenizer_fingerprint, rendered_prompt,
+                            prompt_token_count, generated_token_count, finish_reason,
+                            error_code, error_message, received_at, queue_entered_at,
+                            queue_exited_at, started_at, first_token_at, completed_at,
+                            created_at, updated_at
+                        )
+                        SELECT ?, ?, model_id, NULL, kind, status,
+                               requested_seed, effective_seed, rng_algorithm, generator_device,
+                               settings_json, effective_config_json, reproducibility_json,
+                               model_fingerprint, tokenizer_fingerprint, rendered_prompt,
+                               prompt_token_count, generated_token_count, finish_reason,
+                               error_code, error_message, received_at, queue_entered_at,
+                               queue_exited_at, started_at, first_token_at, completed_at,
+                               created_at, updated_at
+                        FROM inference_runs WHERE id = ?
+                        """,
+                        (cloned_run_id, message_id, source_run_id),
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO environment_snapshots(
+                            run_id, hardware_json, software_json, backend_json, captured_at
+                        )
+                        SELECT ?, hardware_json, software_json, backend_json, captured_at
+                        FROM environment_snapshots WHERE run_id = ?
+                        """,
+                        (cloned_run_id, source_run_id),
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO phase_metrics(
+                            run_id, phase, started_ns, ended_ns, duration_ms, details_json
+                        )
+                        SELECT ?, phase, started_ns, ended_ns, duration_ms, details_json
+                        FROM phase_metrics WHERE run_id = ?
+                        """,
+                        (cloned_run_id, source_run_id),
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO token_events(
+                            run_id, token_index, token_id, piece, escaped_bytes, display_text,
+                            span_start, span_end, raw_logit, raw_logprob, raw_probability,
+                            raw_rank, processed_logit, sample_logprob, sample_probability,
+                            entropy, surprise, cumulative_logprob, running_perplexity,
+                            decode_ms, sample_ms, emit_ms, inter_token_ms, cumulative_ms,
+                            instantaneous_tps, rolling_tps, segment, selected_experts_json,
+                            created_at, reasoning_slices_json
+                        )
+                        SELECT ?, token_index, token_id, piece, escaped_bytes, display_text,
+                               span_start, span_end, raw_logit, raw_logprob, raw_probability,
+                               raw_rank, processed_logit, sample_logprob, sample_probability,
+                               entropy, surprise, cumulative_logprob, running_perplexity,
+                               decode_ms, sample_ms, emit_ms, inter_token_ms, cumulative_ms,
+                               instantaneous_tps, rolling_tps, segment, selected_experts_json,
+                               created_at, reasoning_slices_json
+                        FROM token_events WHERE run_id = ?
+                        """,
+                        (cloned_run_id, source_run_id),
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO token_alternatives(
+                            run_id, token_index, distribution, rank, token_id, piece,
+                            logit, log_probability, probability, survived_filter
+                        )
+                        SELECT ?, token_index, distribution, rank, token_id, piece,
+                               logit, log_probability, probability, survived_filter
+                        FROM token_alternatives WHERE run_id = ?
+                        """,
+                        (cloned_run_id, source_run_id),
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO router_events(
+                            run_id, token_index, layer_index, selected_json, executed_json,
+                            router_entropy, dropped_assignments
+                        )
+                        SELECT ?, token_index, layer_index, selected_json, executed_json,
+                               router_entropy, dropped_assignments
+                        FROM router_events WHERE run_id = ?
+                        """,
+                        (cloned_run_id, source_run_id),
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO router_aggregates(
+                            run_id, layer_index, expert_id, activation_count,
+                            average_weight, load_fraction
+                        )
+                        SELECT ?, layer_index, expert_id, activation_count,
+                               average_weight, load_fraction
+                        FROM router_aggregates WHERE run_id = ?
+                        """,
+                        (cloned_run_id, source_run_id),
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO raw_events(
+                            run_id, sequence, event_type, protocol_version, monotonic_ns,
+                            payload_json, created_at
+                        )
+                        SELECT ?, sequence, event_type, protocol_version, monotonic_ns,
+                               payload_json, created_at
+                        FROM raw_events WHERE run_id = ?
+                        """,
+                        (cloned_run_id, source_run_id),
+                    )
+                previous_message_id = message_id
+
+            for cloned_run_id, source_parent_run_id in cloned_run_parents:
+                cloned_parent_run_id = cloned_run_ids.get(source_parent_run_id or "")
+                if cloned_parent_run_id is not None:
+                    await connection.execute(
+                        "UPDATE inference_runs SET parent_run_id = ? WHERE id = ?",
+                        (cloned_parent_run_id, cloned_run_id),
+                    )
+
+            await connection.execute(
+                """
+                INSERT INTO messages(
+                    id, chat_id, parent_id, role, content, status, branch_index,
+                    metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 'assistant', '', 'pending', 0, ?, ?, ?)
+                """,
+                (
+                    assistant_message_id,
+                    chat_id,
+                    previous_message_id,
+                    _json(assistant_metadata),
+                    assistant_created_at,
+                    assistant_created_at,
+                ),
+            )
+            await connection.execute(
+                _INSERT_RUN_SQL, _run_values(run_record, run_id, assistant_created_at)
+            )
+            await connection.execute(
+                """
+                INSERT INTO environment_snapshots(
+                    run_id, hardware_json, software_json, backend_json, captured_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (run_id, _json(hardware), _json(software), _json(backend), assistant_created_at),
+            )
+
+            chat_cursor = await connection.execute("SELECT * FROM chats WHERE id = ?", (chat_id,))
+            assistant_cursor = await connection.execute(
+                "SELECT * FROM messages WHERE id = ?", (assistant_message_id,)
+            )
+            run_cursor = await connection.execute(
+                "SELECT * FROM inference_runs WHERE id = ?", (run_id,)
+            )
+            chat_row = await chat_cursor.fetchone()
+            assistant_row = await assistant_cursor.fetchone()
+            run_row = await run_cursor.fetchone()
+            assert chat_row is not None and assistant_row is not None and run_row is not None
+
+        return {
+            "chat": dict(chat_row),
+            "cloned_message_ids": cloned_message_ids,
+            "assistant_message": _decode_json_columns(dict(assistant_row)),
+            "run": _decode_json_columns(dict(run_row)),
+        }
+
     async def import_chat_workspace(
         self,
         *,
@@ -670,9 +938,9 @@ class WorkspaceRepository:
                             raw_rank, processed_logit, sample_logprob, sample_probability,
                             entropy, surprise, cumulative_logprob, running_perplexity,
                             decode_ms, sample_ms, emit_ms, inter_token_ms, cumulative_ms,
-                            instantaneous_tps, rolling_tps, segment, selected_experts_json,
-                            created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            instantaneous_tps, rolling_tps, segment, reasoning_slices_json,
+                            selected_experts_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             run["id"],
@@ -702,6 +970,7 @@ class WorkspaceRepository:
                             token.get("instantaneous_tps"),
                             token.get("rolling_tps"),
                             token.get("segment", "unknown"),
+                            _json(token.get("reasoning_slices", [])),
                             _json(token.get("selected_experts")),
                             now,
                         ),
@@ -927,9 +1196,12 @@ class WorkspaceRepository:
         return _decode_json_columns(row) if row else None
 
     async def list_run_tokens(self, run_id: str) -> list[dict[str, Any]]:
-        rows = await self.database.fetch_all(
-            "SELECT * FROM token_events WHERE run_id = ? ORDER BY token_index", (run_id,)
-        )
+        rows = [
+            _decode_json_columns(row)
+            for row in await self.database.fetch_all(
+                "SELECT * FROM token_events WHERE run_id = ? ORDER BY token_index", (run_id,)
+            )
+        ]
         alternatives = await self.database.fetch_all(
             """
             SELECT * FROM token_alternatives
@@ -975,7 +1247,47 @@ class WorkspaceRepository:
             """,
             (run_id, max(0, after_sequence)),
         )
-        return [_decode_json_columns(row) for row in rows]
+        events = [_decode_json_columns(row) for row in rows]
+        for event in events:
+            event.pop("payload_json", None)
+        return events
+
+    async def get_latest_terminal_event(self, run_id: str) -> dict[str, Any] | None:
+        row = await self.database.fetch_one(
+            """
+            SELECT run_id, sequence, event_type AS type, protocol_version AS version,
+                   monotonic_ns, payload_json, created_at
+            FROM raw_events
+            WHERE run_id = ? AND event_type IN ('completed', 'cancelled', 'error')
+            ORDER BY sequence DESC LIMIT 1
+            """,
+            (run_id,),
+        )
+        if row is None:
+            return None
+        event = _decode_json_columns(row)
+        event.pop("payload_json", None)
+        return event
+
+    async def get_run_warnings(self, run_id: str) -> list[str]:
+        rows = await self.database.fetch_all(
+            """
+            SELECT payload_json FROM raw_events
+            WHERE run_id = ? AND event_type = 'warning'
+            ORDER BY sequence
+            """,
+            (run_id,),
+        )
+        warnings: list[str] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            message = payload.get("message") if isinstance(payload, dict) else None
+            if isinstance(message, str):
+                warnings.append(message)
+        return warnings
 
     async def database_stats(self) -> dict[str, Any]:
         counts: dict[str, int] = {}

@@ -151,6 +151,13 @@ export interface TokenTiming {
   clientReceivedAt?: number;
 }
 
+export interface ReasoningSlice {
+  start: number;
+  end: number;
+  classification: "reasoning" | "answer" | "unknown";
+  delimiter: boolean;
+}
+
 export interface TokenEvent {
   index: number;
   tokenId: number;
@@ -171,6 +178,7 @@ export interface TokenEvent {
   cumulativeLogProbability?: number;
   runningPerplexity?: number;
   reasoningSegment: "reasoning" | "answer" | "unknown";
+  reasoningSlices?: ReasoningSlice[];
   rawAlternatives?: TokenAlternative[];
   samplingAlternatives?: TokenAlternative[];
   timing?: TokenTiming;
@@ -251,6 +259,7 @@ export interface RunDetails {
   createdAt: string;
   completedAt?: string;
   tokens: TokenEvent[];
+  branchableThroughTokenIndex?: number;
   metrics?: RunMetrics;
   reproducibility?: ReproducibilitySnapshot;
   effectiveSettings?: Record<string, unknown>;
@@ -288,16 +297,30 @@ export interface GenerateRequest {
 }
 
 export interface GenerateResponse {
+  chatId?: string;
   runId: string;
   messageId?: string;
   userMessageId?: string;
   modelId?: string;
   parentRunId?: string;
+  sourceRunId?: string;
   websocketUrl?: string;
   run?: RunDetails;
 }
 
-export type RunStreamEvent =
+export type AlternativeDistribution = "raw" | "sampling";
+
+export interface BranchRunRequest {
+  tokenIndex: number;
+  distribution: AlternativeDistribution;
+  rank: number;
+  tokenId: number;
+}
+
+/** The untouched JSON object received from the run-event API or websocket. */
+export type RawRunEventEnvelope = Readonly<Record<string, unknown>>;
+
+type NormalizedRunStreamEvent =
   | { version: 1; sequence: number; type: "run.created"; run: Partial<RunDetails> }
   | { version: 1; sequence: number; type: "stage.changed"; stage: RunDetails["status"]; detail?: string; metrics?: Partial<RunMetrics> }
   | { version: 1; sequence: number; type: "token"; token: TokenEvent }
@@ -306,6 +329,11 @@ export type RunStreamEvent =
   | { version: 1; sequence: number; type: "completed"; run?: Partial<RunDetails> }
   | { version: 1; sequence: number; type: "cancelled"; reason?: string; metrics?: Partial<RunMetrics> }
   | { version: 1; sequence: number; type: "error"; code?: string; message: string };
+
+export type RunStreamEvent = NormalizedRunStreamEvent & {
+  /** Complete server envelope retained for lossless raw-event inspection. */
+  raw?: RawRunEventEnvelope;
+};
 
 export interface EmbeddingInput {
   id: string;

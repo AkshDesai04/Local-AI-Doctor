@@ -110,7 +110,8 @@ test("mobile chat cleans protocol text and wraps the run summary", async ({ page
   test.skip(testInfo.project.name !== "mobile-chromium", "mobile-only assertion");
 
   await expect(page.getByRole("heading", { name: "Final answer" })).toBeVisible();
-  await expect(page.getByText("hidden trace")).toHaveCount(0);
+  await expect(page.getByText("Thinking…")).toBeVisible();
+  await expect(page.getByText("hidden trace")).not.toBeVisible();
   await expect(page.getByRole("textbox", { name: "Message" })).toBeEnabled();
   await page.getByRole("button", { name: "Open response details" }).click();
   await expect(page.getByText("cuda:0 / bfloat16")).toBeVisible();

@@ -109,6 +109,7 @@ def test_terminal_subscriber_observes_final_run_message_and_token_state(
             role="assistant",
             content="",
             status="pending",
+            metadata={"token_branch": {"source_run_id": "source"}},
         )
         await repository.create_run(
             {
@@ -175,7 +176,10 @@ def test_terminal_subscriber_observes_final_run_message_and_token_state(
     assert run["completed_at"] is not None
     assert message["status"] == "complete"
     assert message["content"] == "done"
-    assert message["metadata"] == {"reasoning_primed": True}
+    assert message["metadata"] == {
+        "reasoning_primed": True,
+        "token_branch": {"source_run_id": "source"},
+    }
     assert [(token["token_index"], token["token_id"]) for token in tokens] == [(0, 42)]
 
 
@@ -190,6 +194,9 @@ def test_generation_persists_and_publishes_error_when_telemetry_has_failed(
     private_failure = RuntimeError(
         r"telemetry failed for C:\Users\alice\private-model\weights.safetensors"
     )
+    terminal_order: list[str] = []
+    original_update_message = services.repository.update_message
+    original_update_run = services.repository.update_run
 
     async def fake_load_reserved(
         _reservation: object,
@@ -212,15 +219,40 @@ def test_generation_persists_and_publishes_error_when_telemetry_has_failed(
         }
 
     async def failed_submit(_sql: str, _rows: object) -> None:
+        terminal_order.append("telemetry_submit_failed")
         raise private_failure
 
     async def failed_flush() -> None:
+        terminal_order.append("telemetry_flush_attempted")
         raise private_failure
+
+    async def track_update_message(
+        message_id: str,
+        *,
+        content: str,
+        status: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        if status == "failed":
+            terminal_order.append("message_failed")
+        await original_update_message(
+            message_id,
+            content=content,
+            status=status,
+            metadata=metadata,
+        )
+
+    async def track_update_run(run_id: str, **changes: Any) -> None:
+        if changes.get("status") == "failed":
+            terminal_order.append("run_failed")
+        await original_update_run(run_id, **changes)
 
     monkeypatch.setattr(services.registry, "load_reserved", fake_load_reserved)
     monkeypatch.setattr(services.worker, "generate", fake_generate)
     monkeypatch.setattr(services.telemetry, "submit", failed_submit)
     monkeypatch.setattr(services.telemetry, "flush", failed_flush)
+    monkeypatch.setattr(services.repository, "update_message", track_update_message)
+    monkeypatch.setattr(services.repository, "update_run", track_update_run)
 
     async def scenario() -> tuple[RunEvent, dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
         repository = services.repository
@@ -285,5 +317,9 @@ def test_generation_persists_and_publishes_error_when_telemetry_has_failed(
     assert [event["type"] for event in raw_events if event["type"] in {"error", "completed"}] == [
         "error"
     ]
+    assert terminal_order.index("telemetry_flush_attempted") < terminal_order.index(
+        "message_failed"
+    )
+    assert terminal_order.index("telemetry_flush_attempted") < terminal_order.index("run_failed")
     assert "alice" not in caplog.text.lower()
     assert "weights.safetensors" not in caplog.text

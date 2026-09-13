@@ -130,6 +130,42 @@ describe("API boundary normalization", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/runs/run-source/replay", expect.objectContaining({ method: "POST" }));
   });
 
+  it("branches a run from an explicitly selected alternative token", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      chatId: "chat-branch",
+      runId: "run-branch",
+      messageId: "assistant-branch",
+      sourceRunId: "run-source",
+      websocketUrl: "/ws/v1/runs/run-branch",
+      run: {
+        id: "run-branch",
+        chat_id: "chat-branch",
+        model_id: "model-1",
+        status: "queued",
+        created_at: "2026-09-12T00:00:00Z",
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.branchRun("run-source", {
+      tokenIndex: 12,
+      distribution: "sampling",
+      rank: 3,
+      tokenId: 456,
+    });
+
+    expect(result).toMatchObject({
+      chatId: "chat-branch",
+      runId: "run-branch",
+      messageId: "assistant-branch",
+      sourceRunId: "run-source",
+    });
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/runs/run-source/branch", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ token_index: 12, distribution: "sampling", rank: 3, token_id: 456 }),
+    }));
+  });
+
   it("adds the tab-scoped bearer token to REST requests", async () => {
     saveSessionAuthToken("local-secret");
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ status: "ok" }));
@@ -201,6 +237,7 @@ describe("API boundary normalization", () => {
       first_token_at: "2026-09-12T00:00:00.900Z",
       prompt_token_count: 14,
       generated_token_count: 1,
+      branchable_through_token_index: 0,
       model_fingerprint: "abc123",
       effective_config: { instrumentation: "full", inference: { reserved_output_tokens: 384 } },
       settings: { sampling: { temperature: 0.7 } },
@@ -230,6 +267,7 @@ describe("API boundary normalization", () => {
         token_id: 7,
         piece: "A",
         running_perplexity: 1.5,
+        reasoning_slices: [{ start: 0, end: 1, classification: "answer", delimiter: false }],
         alternatives: [{ distribution: "raw", rank: 1, token_id: 7, piece: "A", survived_filter: 1 }],
       }],
     }));
@@ -261,7 +299,37 @@ describe("API boundary normalization", () => {
       deterministicKernels: true,
     });
     expect(run.tokens[0]?.rawAlternatives?.[0]?.survivedFiltering).toBe(true);
+    expect(run.tokens[0]?.reasoningSlices).toEqual([{ start: 0, end: 1, classification: "answer", delimiter: false }]);
+    expect(run.branchableThroughTokenIndex).toBe(0);
     expect(run.effectiveSettings).toMatchObject({ instrumentation: "full", sampling: { temperature: 0.7 } });
+  });
+
+  it("loads persisted raw events separately from the core run snapshot", async () => {
+    const persistedEnvelope = {
+      version: 1,
+      run_id: "run-1",
+      sequence: 4,
+      type: "completed",
+      monotonic_ns: 98_765_432,
+      created_at: "2026-09-12T00:00:04Z",
+      payload: {
+        finish_reason: "eos",
+        metadata: { sampler: "multinomial", stop_token_id: 2 },
+      },
+    };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      events: [persistedEnvelope],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events = await api.runEvents("run-1");
+
+    expect(events).toEqual([expect.objectContaining({ sequence: 4, type: "completed" })]);
+    const completed = events[0];
+    expect(completed?.type === "completed" ? completed.run?.metrics?.finishReason : undefined).toBe("eos");
+    expect(completed?.raw).toEqual(persistedEnvelope);
+    expect(JSON.parse(JSON.stringify(completed?.raw))).toEqual(persistedEnvelope);
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/runs/run-1/events", expect.any(Object));
   });
 
   it("retains compatibility with a boolean deterministic-kernel snapshot", async () => {

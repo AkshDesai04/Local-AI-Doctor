@@ -9,6 +9,7 @@ import {
   FileJson,
   Fingerprint,
   Gauge,
+  GitBranch,
   Info,
   Layers3,
   Network,
@@ -18,7 +19,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { CapabilityKey, ConfigurationSnapshot, HealthStatus, ModelSummary, RunDetails, TokenAlternative, TokenEvent } from "../api/types";
+import type { AlternativeDistribution, CapabilityKey, ConfigurationSnapshot, HealthStatus, ModelSummary, RunDetails, TokenAlternative, TokenEvent } from "../api/types";
 import { fetchRunExport } from "../api/client";
 import { capabilityOf, supportsGeneration } from "../domain/capabilities";
 import { downloadBlob, escapeToken, formatBytes, formatDuration, formatNumber, formatPercent, shortFingerprint } from "../utils/format";
@@ -55,6 +56,9 @@ interface InspectorProps {
   configuration: ConfigurationSnapshot | null;
   activeTab: InspectorTab;
   selectedToken: number | null;
+  nerdMode: boolean;
+  branching: boolean;
+  onBranchAlternative: (tokenIndex: number, distribution: AlternativeDistribution, alternative: TokenAlternative) => Promise<void>;
   onTabChange: (tab: InspectorTab) => void;
   onSelectToken: (index: number) => void;
   onClose: () => void;
@@ -68,26 +72,70 @@ function EmptyInspector({ icon: Icon = Info, title, body }: { icon?: LucideIcon;
   return <div className="inspector-empty"><div><Icon size={19} /></div><strong>{title}</strong><p>{body}</p></div>;
 }
 
-function Alternatives({ title, alternatives }: { title: string; alternatives: TokenAlternative[] | undefined }): React.ReactNode {
+interface SelectedAlternative {
+  distribution: AlternativeDistribution;
+  alternative: TokenAlternative;
+}
+
+function Alternatives({ title, distribution, alternatives, currentTokenId, nerdMode, selected, onSelect }: {
+  title: string;
+  distribution: AlternativeDistribution;
+  alternatives: TokenAlternative[] | undefined;
+  currentTokenId: number;
+  nerdMode: boolean;
+  selected: SelectedAlternative | null;
+  onSelect: (selection: SelectedAlternative) => void;
+}): React.ReactNode {
   return (
     <section className="alternatives-section">
       <h4>{title}</h4>
       {!alternatives?.length ? <p className="muted">Not captured at this instrumentation level.</p> : (
         <div className="alternatives-table">
           <div className="alternatives-head"><span>Rank</span><span>Piece</span><span>Probability</span><span>Log p</span><span>Filter</span></div>
-          {alternatives.map((item) => (
-            <div className="alternatives-row" key={`${String(item.rank)}-${String(item.tokenId)}`}>
+          {alternatives.map((item) => {
+            const isCurrent = item.tokenId === currentTokenId;
+            const isSelected = selected?.distribution === distribution
+              && selected.alternative.tokenId === item.tokenId
+              && selected.alternative.rank === item.rank;
+            return (
+            <button
+              aria-label={`${isCurrent ? "Current" : "Select"} token ${escapeToken(item.piece) || "empty token"} from the ${distribution} distribution`}
+              aria-pressed={isSelected}
+              className={`alternatives-row ${nerdMode && !isCurrent ? "selectable" : ""} ${isSelected ? "selected" : ""}`}
+              disabled={!nerdMode || isCurrent}
+              key={`${String(item.rank)}-${String(item.tokenId)}`}
+              onClick={() => onSelect({ distribution, alternative: item })}
+              title={isCurrent ? "This is the token the model originally selected." : nerdMode ? "Select this token to branch the response." : "Enable Nerd Mode to branch from an alternative token."}
+              type="button"
+            >
               <span>#{String(item.rank)}</span><code title={item.piece}>{escapeToken(item.piece) || "∅"}</code><span>{formatPercent(item.probability, 3)}</span><span>{formatNumber(item.logProbability, 4)}</span><span>{item.survivedFiltering === undefined ? "—" : item.survivedFiltering ? "kept" : "removed"}</span>
-            </div>
-          ))}
+            </button>
+          );})}
         </div>
       )}
     </section>
   );
 }
 
-function TokenDetail({ token }: { token: TokenEvent | undefined }): React.ReactNode {
+function TokenDetail({ token, nerdMode, branching, canBranch, branchUnavailableReason, onBranchAlternative }: {
+  token: TokenEvent | undefined;
+  nerdMode: boolean;
+  branching: boolean;
+  canBranch: boolean;
+  branchUnavailableReason: string;
+  onBranchAlternative: (tokenIndex: number, distribution: AlternativeDistribution, alternative: TokenAlternative) => Promise<void>;
+}): React.ReactNode {
+  const [selectedAlternative, setSelectedAlternative] = useState<SelectedAlternative | null>(null);
+
+  useEffect(() => {
+    setSelectedAlternative(null);
+  }, [nerdMode, token?.index]);
+
   if (!token) return <EmptyInspector body="Select a token in the response, graph, or table to lock its exact details here." title="No token selected" />;
+  const branch = async (): Promise<void> => {
+    if (!selectedAlternative || branching || !canBranch) return;
+    await onBranchAlternative(token.index, selectedAlternative.distribution, selectedAlternative.alternative);
+  };
   return (
     <div className="token-detail">
       <div className="token-detail-hero"><span className={`segment-badge ${token.reasoningSegment}`}>{token.reasoningSegment}</span><code>{escapeToken(token.piece) || "∅"}</code><span>token #{String(token.index)}</span></div>
@@ -111,8 +159,14 @@ function TokenDetail({ token }: { token: TokenEvent | undefined }): React.ReactN
         <div><dt>Inter-token</dt><dd>{formatDuration(token.timing?.interTokenMs)}</dd></div>
         <div><dt>Rolling throughput</dt><dd>{formatNumber(token.timing?.rollingTps, 2)} tok/s</dd></div>
       </dl>
-      <Alternatives alternatives={token.rawAlternatives} title="Top alternatives · raw model distribution" />
-      <Alternatives alternatives={token.samplingAlternatives} title="Top alternatives · sampler distribution" />
+      <Alternatives alternatives={token.rawAlternatives} currentTokenId={token.tokenId} distribution="raw" nerdMode={nerdMode} onSelect={setSelectedAlternative} selected={selectedAlternative} title="Top alternatives · raw model distribution" />
+      <Alternatives alternatives={token.samplingAlternatives} currentTokenId={token.tokenId} distribution="sampling" nerdMode={nerdMode} onSelect={setSelectedAlternative} selected={selectedAlternative} title="Top alternatives · sampler distribution" />
+      {nerdMode && selectedAlternative && (
+        <div className="branch-token-action">
+          <span>Continue from token <code>{escapeToken(selectedAlternative.alternative.piece) || "∅"}</code> in a new chat.</span>
+          <button disabled={branching || !canBranch} onClick={() => void branch()} title={!canBranch ? branchUnavailableReason : undefined} type="button"><GitBranch size={14} />{branching ? "Creating branch…" : canBranch ? "Branch out with selected token" : branchUnavailableReason}</button>
+        </div>
+      )}
       <div className="metric-note"><Info size={14} /><span>Alternatives are tokens with high probability under a distribution—not model thoughts or hidden reasoning.</span></div>
     </div>
   );
@@ -155,11 +209,11 @@ function OverviewPanel({ run, model }: { run: RunDetails | null; model: ModelSum
 }
 
 const probabilityMetrics: ChartMetric[] = [
-  { key: "raw-p", label: "Raw model probability", color: "#74d8b6", value: (token) => token.rawProbability },
+  { key: "raw-p", label: "Raw model probability", color: "#60a5fa", value: (token) => token.rawProbability },
   { key: "sample-p", label: "Sampler probability", color: "#b49cff", value: (token) => token.samplingProbability },
 ];
 const logProbabilityMetrics: ChartMetric[] = [
-  { key: "raw-log-p", label: "Raw model log probability", color: "#74d8b6", value: (token) => token.rawLogProbability },
+  { key: "raw-log-p", label: "Raw model log probability", color: "#60a5fa", value: (token) => token.rawLogProbability },
   { key: "sample-log-p", label: "Sampler log probability", color: "#b49cff", value: (token) => token.samplingLogProbability },
 ];
 const uncertaintyMetrics: ChartMetric[] = [
@@ -173,7 +227,7 @@ const perplexityMetrics: ChartMetric[] = [
   { key: "perplexity", label: "Running response perplexity", color: "#b49cff", value: (token) => token.runningPerplexity },
 ];
 const timingMetrics: ChartMetric[] = [
-  { key: "decode", label: "Decode forward", unit: "ms", color: "#74d8b6", value: (token) => token.timing?.decodeMs },
+  { key: "decode", label: "Decode forward", unit: "ms", color: "#60a5fa", value: (token) => token.timing?.decodeMs },
   { key: "sampling", label: "Sampling", unit: "ms", color: "#b49cff", value: (token) => token.timing?.samplingMs },
 ];
 const arrivalMetrics: ChartMetric[] = [
@@ -181,7 +235,7 @@ const arrivalMetrics: ChartMetric[] = [
   { key: "client-arrival", label: "Client inter-arrival", unit: "ms", color: "#68bce8", value: (token) => token.timing?.clientInterArrivalMs },
 ];
 const cumulativeTimingMetrics: ChartMetric[] = [
-  { key: "cumulative", label: "Cumulative time", unit: "ms", color: "#74d8b6", value: (token) => token.timing?.cumulativeMs },
+  { key: "cumulative", label: "Cumulative time", unit: "ms", color: "#60a5fa", value: (token) => token.timing?.cumulativeMs },
 ];
 const throughputMetrics: ChartMetric[] = [
   { key: "instant", label: "Instantaneous", unit: "tok/s", color: "#5bb8ef", value: (token) => token.timing?.instantaneousTps },
@@ -190,15 +244,15 @@ const throughputMetrics: ChartMetric[] = [
 
 const expertSelectionMetrics: ChartMetric[] = [
   { key: "expert-id", label: "First selected expert ID", color: "#b49cff", value: (token) => token.expertRoutes?.[0]?.selectedExpertIds[0] },
-  { key: "expert-weight", label: "First expert weight", color: "#74d8b6", value: (token) => token.expertRoutes?.[0]?.gateWeights[0] },
+  { key: "expert-weight", label: "First expert weight", color: "#60a5fa", value: (token) => token.expertRoutes?.[0]?.gateWeights[0] },
 ];
 
-function ExpertsPanel({ run, selectedToken, onSelectToken }: { run: RunDetails | null; selectedToken: number | null; onSelectToken: (index: number) => void }): React.ReactNode {
+function ExpertsPanel({ run, selectedToken, nerdMode, onSelectToken }: { run: RunDetails | null; selectedToken: number | null; nerdMode: boolean; onSelectToken: (index: number) => void }): React.ReactNode {
   const routed = run?.tokens.filter((token) => token.expertRoutes?.length) ?? [];
   if (!routed.length) return <EmptyInspector body="The selected adapter supports routing, but this run did not expose per-token routes at its instrumentation level." icon={Network} title="No expert route events" />;
   return (
     <div className="inspector-stack">
-      <TraceChart metrics={expertSelectionMetrics} onSelectToken={onSelectToken} selectedToken={selectedToken} title="Expert selection and weight" tokens={run?.tokens ?? []} />
+      <TraceChart metrics={expertSelectionMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Expert selection and weight" tokens={run?.tokens ?? []} />
       <section className="inspector-section">
         <div className="section-title"><Network size={15} /><h3>Selected vs. executed experts</h3></div>
         <div className="expert-route-table"><div><strong>Token</strong><strong>Layer</strong><strong>Selected</strong><strong>Executed</strong><strong>Weights</strong></div>{routed.flatMap((token) => token.expertRoutes?.map((route) => <button key={`${String(token.index)}-${String(route.layer)}`} onClick={() => onSelectToken(token.index)} type="button"><span>#{String(token.index)}</span><span>{String(route.layer)}</span><span>{route.selectedExpertIds.join(", ")}</span><span>{route.executedExpertIds.join(", ")}</span><span>{route.gateWeights.map((weight) => formatNumber(weight, 3)).join(", ")}</span></button>) ?? [])}</div>
@@ -253,7 +307,7 @@ function HardwarePanel({ run, health }: { run: RunDetails | null; health: Health
   );
 }
 
-export function Inspector({ open, model, run, health, configuration, activeTab, selectedToken, onTabChange, onSelectToken, onClose }: InspectorProps): React.ReactNode {
+export function Inspector({ open, model, run, health, configuration, activeTab, selectedToken, nerdMode, branching, onBranchAlternative, onTabChange, onSelectToken, onClose }: InspectorProps): React.ReactNode {
   const selected = run?.tokens.find((token) => token.index === selectedToken);
   const [mobileTabsOpen, setMobileTabsOpen] = useState(false);
   const [exporting, setExporting] = useState<"json" | "jsonl" | "csv" | null>(null);
@@ -287,17 +341,30 @@ export function Inspector({ open, model, run, health, configuration, activeTab, 
   const panel = useMemo((): React.ReactNode => {
     switch (activeTab) {
       case "overview": return <OverviewPanel model={model} run={run} />;
-      case "tokens": return <div className="inspector-stack"><TokenDetail token={selected} /><section className="inspector-section"><div className="section-title"><Binary size={15} /><h3>All generated tokens</h3></div><VirtualTokenTable onSelectToken={onSelectToken} selectedToken={selectedToken} tokens={run?.tokens ?? []} /></section></div>;
-      case "probability": return <div className="inspector-stack"><TraceChart metrics={probabilityMetrics} onSelectToken={onSelectToken} selectedToken={selectedToken} title="Chosen-token probability" tokens={run?.tokens ?? []} /><TraceChart metrics={logProbabilityMetrics} onSelectToken={onSelectToken} selectedToken={selectedToken} title="Chosen-token log probability" tokens={run?.tokens ?? []} /><TraceChart metrics={uncertaintyMetrics} onSelectToken={onSelectToken} selectedToken={selectedToken} title="Uncertainty" tokens={run?.tokens ?? []} /><TraceChart metrics={rankMetrics} onSelectToken={onSelectToken} selectedToken={selectedToken} title="Exact model rank" tokens={run?.tokens ?? []} /><TraceChart metrics={perplexityMetrics} onSelectToken={onSelectToken} selectedToken={selectedToken} title="Running perplexity" tokens={run?.tokens ?? []} /></div>;
-      case "timing": return <div className="inspector-stack">{run?.tokens[0] && <div className="metric-note"><Info size={14} /><span>The first token includes prefill and is not treated as steady-state decode.</span></div>}<TraceChart metrics={timingMetrics} onSelectToken={onSelectToken} selectedToken={selectedToken} title="Token compute" tokens={run?.tokens ?? []} /><TraceChart metrics={arrivalMetrics} onSelectToken={onSelectToken} selectedToken={selectedToken} title="Inter-token arrival" tokens={run?.tokens ?? []} /><TraceChart metrics={throughputMetrics} onSelectToken={onSelectToken} selectedToken={selectedToken} title="Decode throughput" tokens={run?.tokens ?? []} /><TraceChart metrics={cumulativeTimingMetrics} onSelectToken={onSelectToken} selectedToken={selectedToken} title="Cumulative generation time" tokens={run?.tokens ?? []} /><div className="data-grid"><DataCard label="Queue" value={formatDuration(run?.metrics?.timing?.queueMs)} /><DataCard label="Tokenization" value={formatDuration(run?.metrics?.timing?.tokenizationMs)} /><DataCard label="Prefill" value={formatDuration(run?.metrics?.timing?.prefillMs)} /><DataCard label="Client TTFT" value={formatDuration(run?.metrics?.timing?.clientTtftMs)} /></div></div>;
-      case "experts": return <ExpertsPanel onSelectToken={onSelectToken} run={run} selectedToken={selectedToken} />;
+      case "tokens": {
+        const runComplete = run?.status === "complete";
+        const tokenPersisted = selected !== undefined
+          && run?.branchableThroughTokenIndex !== undefined
+          && selected.index <= run.branchableThroughTokenIndex;
+        const branchUnavailableReason = !runComplete
+          ? "Available when run completes"
+          : "Selected token was not retained in persisted telemetry";
+        return nerdMode
+          ? <div className="inspector-stack"><TokenDetail branchUnavailableReason={branchUnavailableReason} branching={branching} canBranch={runComplete && tokenPersisted} nerdMode onBranchAlternative={onBranchAlternative} token={selected} /><section className="inspector-section"><div className="section-title"><Binary size={15} /><h3>All generated tokens</h3></div><VirtualTokenTable onSelectToken={onSelectToken} selectedToken={selectedToken} tokens={run?.tokens ?? []} /></section></div>
+          : <EmptyInspector body="Enable Nerd Mode to inspect raw token boundaries, protocol markers, and alternative distributions." icon={Binary} title="Token details are hidden" />;
+      }
+      case "probability": return <div className="inspector-stack"><TraceChart metrics={probabilityMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Chosen-token probability" tokens={run?.tokens ?? []} /><TraceChart metrics={logProbabilityMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Chosen-token log probability" tokens={run?.tokens ?? []} /><TraceChart metrics={uncertaintyMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Uncertainty" tokens={run?.tokens ?? []} /><TraceChart metrics={rankMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Exact model rank" tokens={run?.tokens ?? []} /><TraceChart metrics={perplexityMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Running perplexity" tokens={run?.tokens ?? []} /></div>;
+      case "timing": return <div className="inspector-stack">{run?.tokens[0] && <div className="metric-note"><Info size={14} /><span>The first token includes prefill and is not treated as steady-state decode.</span></div>}<TraceChart metrics={timingMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Token compute" tokens={run?.tokens ?? []} /><TraceChart metrics={arrivalMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Inter-token arrival" tokens={run?.tokens ?? []} /><TraceChart metrics={throughputMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Decode throughput" tokens={run?.tokens ?? []} /><TraceChart metrics={cumulativeTimingMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Cumulative generation time" tokens={run?.tokens ?? []} /><div className="data-grid"><DataCard label="Queue" value={formatDuration(run?.metrics?.timing?.queueMs)} /><DataCard label="Tokenization" value={formatDuration(run?.metrics?.timing?.tokenizationMs)} /><DataCard label="Prefill" value={formatDuration(run?.metrics?.timing?.prefillMs)} /><DataCard label="Client TTFT" value={formatDuration(run?.metrics?.timing?.clientTtftMs)} /></div></div>;
+      case "experts": return <ExpertsPanel nerdMode={nerdMode} onSelectToken={onSelectToken} run={run} selectedToken={selectedToken} />;
       case "context": return <ContextPanel model={model} run={run} />;
       case "embeddings": return <EmptyInspector body="Create or select an embedding run in the Embeddings workspace to inspect vectors, similarity, and projections." icon={Box} title="No embedding run selected" />;
       case "hardware": return <HardwarePanel health={health} run={run} />;
       case "configuration": return <div className="inspector-stack"><section className="json-section"><div className="section-title"><Braces size={15} /><h3>{run?.effectiveSettings ? "Effective run settings" : "Effective application configuration"}</h3></div>{run?.effectiveSettings || configuration?.effective ? <pre>{JSON.stringify(run?.effectiveSettings ?? configuration?.effective, null, 2)}</pre> : <p className="muted">No redacted effective configuration has been returned.</p>}</section><section className="json-section"><div className="section-title"><Activity size={15} /><h3>{run ? "Sampling operation order" : "Configuration precedence"}</h3></div>{(run?.samplingPipeline ?? configuration?.precedence)?.length ? <ol>{(run?.samplingPipeline ?? configuration?.precedence ?? []).map((step) => <li key={step}>{step}</li>)}</ol> : <p className="muted">The configuration order was not reported.</p>}</section></div>;
-      case "events": return <div className="inspector-stack"><div className="raw-events-heading"><span>{String(run?.rawEvents?.length ?? 0)} live events</span>{run && <div className="server-export-actions"><button disabled={exporting !== null} onClick={() => void exportRun("json")} type="button">{exporting === "json" ? "Exporting…" : "JSON"}</button><button disabled={exporting !== null} onClick={() => void exportRun("jsonl")} type="button">{exporting === "jsonl" ? "Exporting…" : "JSONL"}</button><button disabled={exporting !== null} onClick={() => void exportRun("csv")} type="button">{exporting === "csv" ? "Exporting…" : "Token CSV"}</button></div>}</div>{exportError && <p className="inline-error" role="alert">{exportError}</p>}{run?.rawEvents?.length ? <pre className="event-log">{run.rawEvents.map((event) => JSON.stringify(event)).join("\n")}</pre> : <EmptyInspector body="Raw protocol events appear here as they arrive. Use the server export above for the complete persisted trace." title="No live events captured" />}</div>;
+      case "events": return nerdMode
+        ? <div className="inspector-stack"><div className="raw-events-heading"><span>{String(run?.rawEvents?.length ?? 0)} live events</span>{run && <div className="server-export-actions"><button disabled={exporting !== null} onClick={() => void exportRun("json")} type="button">{exporting === "json" ? "Exporting…" : "JSON"}</button><button disabled={exporting !== null} onClick={() => void exportRun("jsonl")} type="button">{exporting === "jsonl" ? "Exporting…" : "JSONL"}</button><button disabled={exporting !== null} onClick={() => void exportRun("csv")} type="button">{exporting === "csv" ? "Exporting…" : "Token CSV"}</button></div>}</div>{exportError && <p className="inline-error" role="alert">{exportError}</p>}{run?.rawEvents?.length ? <pre className="event-log">{run.rawEvents.map((event) => JSON.stringify(event)).join("\n")}</pre> : <EmptyInspector body="Raw protocol events appear here as they arrive. Use the server export above for the complete persisted trace." title="No live events captured" />}</div>
+        : <EmptyInspector body="Enable Nerd Mode to inspect raw protocol events and export token-level traces." icon={FileJson} title="Raw events are hidden" />;
     }
-  }, [activeTab, configuration, exportError, exportRun, exporting, health, model, onSelectToken, run, selected, selectedToken]);
+  }, [activeTab, branching, configuration, exportError, exportRun, exporting, health, model, nerdMode, onBranchAlternative, onSelectToken, run, selected, selectedToken]);
 
   return (
     <aside className={`inspector ${open ? "open" : ""}`} aria-label="Run inspector">

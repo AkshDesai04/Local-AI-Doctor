@@ -32,7 +32,10 @@ async def test_existing_database_is_backed_up_migrated_once_and_uses_wal(tmp_pat
 
     assert journal == {"journal_mode": "wal"}
     assert foreign_keys == {"foreign_keys": 1}
-    assert migrations == [{"version": "0001_initial"}]
+    assert migrations == [
+        {"version": "0001_initial"},
+        {"version": "0002_token_reasoning_slices"},
+    ]
     assert legacy_row == {"value": "preserved"}
 
     backup_paths = list(backups.glob("*.sqlite3"))

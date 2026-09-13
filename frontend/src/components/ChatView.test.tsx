@@ -2,7 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { api } from "../api/client";
-import type { Message } from "../api/types";
+import type { Message, RunDetails } from "../api/types";
 import { ChatView } from "./ChatView";
 
 const raw = "<think>hidden reasoning</think>## Final answer\n\nDone.<｜end▁of▁sentence｜>";
@@ -26,6 +26,7 @@ function conversation(
     nerdMode?: boolean;
     onBranch?: (content: string, parentMessageId: string | null) => void;
     onRetry?: (message: Message) => void;
+    run?: RunDetails | null;
   } = {},
 ): React.ReactElement {
   return (
@@ -44,7 +45,7 @@ function conversation(
       onOpenInspector={vi.fn()}
       onRetry={options.onRetry ?? vi.fn()}
       onSelectToken={vi.fn()}
-      run={null}
+      run={options.run ?? null}
       runningRunId={null}
       selectedToken={null}
       streamConnected={false}
@@ -53,14 +54,213 @@ function conversation(
 }
 
 describe("chat response rendering", () => {
-  it("shows cleaned Markdown normally and preserves raw protocol text in Nerd Mode", () => {
+  it("shows reasoning in a disclosure and reserves protocol tokens for Nerd Mode", () => {
     const { rerender } = render(view(false));
     expect(screen.getByRole("heading", { name: "Final answer" })).toBeInTheDocument();
-    expect(screen.queryByText(/hidden reasoning/i)).not.toBeInTheDocument();
+    expect(screen.getByText("Thinking…").closest("details")).not.toHaveAttribute("open");
+    expect(screen.getByText(/hidden reasoning/i)).toBeInTheDocument();
     expect(screen.queryByText(/end▁of▁sentence/i)).not.toBeInTheDocument();
 
     rerender(view(true));
-    expect(document.querySelector(".nerd-raw-fallback")?.textContent).toBe(raw);
+    expect(screen.getByLabelText("Start reasoning token")).toHaveTextContent("<think>");
+    expect(screen.getByLabelText("End reasoning token")).toHaveTextContent("</think>");
+    expect(screen.getByLabelText("Termination tokens")).toHaveTextContent("<｜end▁of▁sentence｜>");
+  });
+
+  it("groups clickable reasoning tokens and exposes explicit boundaries in Nerd Mode", () => {
+    const run: RunDetails = {
+      id: "run-1",
+      messageId: "assistant-1",
+      modelId: "model-1",
+      status: "complete",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [
+        { index: 0, tokenId: 10, piece: "<think>", displayText: "<think>", reasoningSegment: "reasoning" },
+        { index: 1, tokenId: 11, piece: "consider", displayText: "consider", reasoningSegment: "reasoning" },
+        { index: 2, tokenId: 12, piece: "</think>", displayText: "</think>", reasoningSegment: "reasoning" },
+        { index: 3, tokenId: 13, piece: "Done.", displayText: "Done.", reasoningSegment: "answer" },
+        { index: 4, tokenId: 14, piece: "<|eot_id|>", displayText: "<|eot_id|>", reasoningSegment: "answer" },
+      ],
+    };
+    render(conversation([message], { nerdMode: true, run }));
+
+    const reasoning = screen.getByText(/Thinking…/i).closest("details");
+    expect(reasoning).not.toHaveAttribute("open");
+    expect(screen.getAllByRole("button", { name: /Start reasoning token 0/i })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: /End reasoning token 2/i })).toHaveLength(1);
+    expect(screen.getByRole("button", { name: /Termination token 4/i })).toBeInTheDocument();
+  });
+
+  it("renders token telemetry for a cloned message linked to its source run", () => {
+    const clonedMessage = { ...message, id: "assistant-clone", runId: "run-1" };
+    const run: RunDetails = {
+      id: "run-1",
+      messageId: "assistant-original",
+      modelId: "model-1",
+      status: "complete",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [{ index: 0, tokenId: 13, piece: "Done.", displayText: "Done.", reasoningSegment: "answer" }],
+    };
+
+    render(conversation([clonedMessage], { nerdMode: true, run }));
+
+    expect(screen.getByRole("button", { name: /Token 0 Done/i })).toBeInTheDocument();
+  });
+
+  it("uses exact reasoning slices so a mixed closing token does not hide answer text", () => {
+    const mixedMessage = { ...message, content: "<think>plan</think>Answer<|end|>" };
+    const run: RunDetails = {
+      id: "run-1",
+      messageId: "assistant-1",
+      modelId: "model-1",
+      status: "complete",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [
+        {
+          index: 0,
+          tokenId: 10,
+          piece: "<think>plan",
+          displayText: "<think>plan",
+          reasoningSegment: "reasoning",
+          reasoningSlices: [
+            { start: 0, end: 7, classification: "reasoning", delimiter: true },
+            { start: 7, end: 11, classification: "reasoning", delimiter: false },
+          ],
+        },
+        {
+          index: 1,
+          tokenId: 11,
+          piece: "</think>Answer",
+          displayText: "</think>Answer",
+          reasoningSegment: "unknown",
+          reasoningSlices: [
+            { start: 0, end: 8, classification: "reasoning", delimiter: true },
+            { start: 8, end: 14, classification: "answer", delimiter: false },
+          ],
+        },
+        { index: 2, tokenId: 12, piece: "<|end|>", displayText: "<|end|>", reasoningSegment: "answer" },
+      ],
+    };
+    render(conversation([mixedMessage], { nerdMode: true, run }));
+
+    const disclosure = screen.getByText(/Thinking…/i).closest("details");
+    expect(screen.getAllByRole("button", { name: /Start reasoning token 0/i })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: /End reasoning token 1/i })).toHaveLength(1);
+    expect(screen.getByRole("button", { name: /Token 1 Answer/i })).not.toBe(disclosure);
+    expect(screen.getByRole("button", { name: /Token 1 Answer/i }).closest("details")).toBeNull();
+    expect(screen.getByRole("button", { name: /Termination token 2/i })).toBeInTheDocument();
+  });
+
+  it("recognizes legacy reasoning delimiters split across token pieces", () => {
+    const splitMessage = { ...message, content: "<think>plan</think>Answer" };
+    const run: RunDetails = {
+      id: "run-split-delimiters",
+      messageId: "assistant-1",
+      modelId: "model-1",
+      status: "complete",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [
+        { index: 0, tokenId: 10, piece: "<thi", displayText: "<thi", reasoningSegment: "unknown" },
+        { index: 1, tokenId: 11, piece: "nk>plan</th", displayText: "nk>plan</th", reasoningSegment: "unknown" },
+        { index: 2, tokenId: 12, piece: "ink>Answer", displayText: "ink>Answer", reasoningSegment: "unknown" },
+      ],
+    };
+    render(conversation([splitMessage], { nerdMode: true, run }));
+
+    const startParts = screen.getAllByRole("button", { name: /Start reasoning token/u });
+    const endParts = screen.getAllByRole("button", { name: /End reasoning token/u });
+    expect(startParts).toHaveLength(2);
+    expect(startParts[0]).toHaveTextContent("<thi");
+    expect(startParts[1]).toHaveTextContent("nk>");
+    expect(endParts).toHaveLength(2);
+    expect(endParts[0]).toHaveTextContent("</th");
+    expect(endParts[1]).toHaveTextContent("ink>");
+    expect(screen.getByRole("button", { name: /Token 1 plan/u }).closest("details")).not.toBeNull();
+    expect(screen.getByRole("button", { name: /Token 2 Answer/u }).closest("details")).toBeNull();
+  });
+
+  it("keeps adjacent start and end delimiters distinct for empty reasoning", () => {
+    const emptyReasoningMessage = { ...message, content: "<think></think>Answer" };
+    const run: RunDetails = {
+      id: "run-empty-reasoning",
+      messageId: "assistant-1",
+      modelId: "model-1",
+      status: "complete",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [{
+        index: 0,
+        tokenId: 10,
+        piece: "<think></think>Answer",
+        displayText: "<think></think>Answer",
+        reasoningSegment: "unknown",
+        reasoningSlices: [
+          { start: 0, end: 7, classification: "reasoning", delimiter: true },
+          { start: 7, end: 15, classification: "reasoning", delimiter: true },
+          { start: 15, end: 21, classification: "answer", delimiter: false },
+        ],
+      }],
+    };
+    render(conversation([emptyReasoningMessage], { nerdMode: true, run }));
+
+    expect(screen.getByRole("button", { name: /Start reasoning token 0/u })).toHaveTextContent("<think>");
+    expect(screen.getByRole("button", { name: /End reasoning token 0/u })).toHaveTextContent("</think>");
+    expect(screen.getByRole("button", { name: /Token 0 Answer/u }).closest("details")).toBeNull();
+  });
+
+  it("applies backend code-point offsets without splitting non-BMP characters", () => {
+    const unicodeMessage = { ...message, content: "<think>😀</think>Answer" };
+    const run: RunDetails = {
+      id: "run-unicode",
+      messageId: "assistant-1",
+      modelId: "model-1",
+      status: "complete",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [
+        {
+          index: 0,
+          tokenId: 10,
+          piece: "<think>",
+          displayText: "<think>",
+          reasoningSegment: "reasoning",
+          reasoningSlices: [{ start: 0, end: 7, classification: "reasoning", delimiter: true }],
+        },
+        {
+          index: 1,
+          tokenId: 11,
+          piece: "😀</think>Answer",
+          displayText: "😀</think>Answer",
+          reasoningSegment: "unknown",
+          reasoningSlices: [
+            { start: 0, end: 1, classification: "reasoning", delimiter: false },
+            { start: 1, end: 9, classification: "reasoning", delimiter: true },
+            { start: 9, end: 15, classification: "answer", delimiter: false },
+          ],
+        },
+      ],
+    };
+    const { container } = render(conversation([unicodeMessage], { nerdMode: true, run }));
+
+    expect(screen.getByRole("button", { name: /Token 1 😀/u })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /End reasoning token 1/u })).toHaveTextContent("</think>");
+    expect(screen.getByRole("button", { name: /Token 1 Answer/u }).closest("details")).toBeNull();
+    expect(container.textContent).not.toContain("�");
+  });
+
+  it("labels prompt-primed reasoning honestly without inventing an end token", () => {
+    const primedMessage = { ...message, content: "private reasoning", reasoningPrimed: true };
+    const run: RunDetails = {
+      id: "run-1",
+      messageId: "assistant-1",
+      modelId: "model-1",
+      status: "running",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [{ index: 0, tokenId: 10, piece: "private reasoning", displayText: "private reasoning", reasoningSegment: "reasoning" }],
+    };
+    render(conversation([primedMessage], { nerdMode: true, run }));
+
+    expect(screen.getByLabelText("Prompt-primed reasoning start")).toHaveTextContent("no opening token emitted");
+    expect(screen.queryByRole("button", { name: /End reasoning token/i })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("End reasoning token")).not.toBeInTheDocument();
   });
 
   it("branches an edited user message from that message's parent", async () => {

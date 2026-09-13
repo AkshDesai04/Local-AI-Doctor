@@ -23,7 +23,7 @@ import { api } from "../api/client";
 import type { Message, ModelSummary, RunDetails, TokenEvent } from "../api/types";
 import { isUsable, supportsGeneration } from "../domain/capabilities";
 import { escapeToken, formatDuration, formatNumber, formatPercent } from "../utils/format";
-import { cleanAssistantOutput } from "../utils/markdown";
+import { cleanAssistantOutput, isTerminationToken, splitAssistantOutput } from "../utils/markdown";
 import { MarkdownMessage } from "./MarkdownMessage";
 
 export type NerdMetric = "rawProbability" | "samplingProbability" | "surprise" | "latency" | "reasoning";
@@ -49,54 +49,279 @@ interface ChatViewProps {
   onNavigate: (view: "embeddings" | "models") => void;
 }
 
-function nerdValue(token: TokenEvent, metric: NerdMetric): number | undefined {
+function nerdValue(token: TokenEvent, metric: NerdMetric, classification: TokenEvent["reasoningSegment"] = token.reasoningSegment): number | undefined {
   if (metric === "rawProbability") return token.rawProbability;
   if (metric === "samplingProbability") return token.samplingProbability;
   if (metric === "surprise") return token.surprise;
   if (metric === "latency") return token.timing?.decodeMs;
-  return token.reasoningSegment === "reasoning" ? 1 : token.reasoningSegment === "answer" ? 0.35 : 0;
+  return classification === "reasoning" ? 1 : classification === "answer" ? 0.35 : 0;
+}
+
+type ReasoningClass = TokenEvent["reasoningSegment"];
+type ReasoningDelimiter = "start" | "end";
+
+interface PositionedTokenPart {
+  position: number;
+  token: TokenEvent;
+  text: string;
+  start: number;
+  end: number;
+  classification: ReasoningClass;
+  delimiter: boolean;
+  delimiterKind?: ReasoningDelimiter;
+  reasoning: boolean;
+}
+
+interface NerdTokenGroup {
+  reasoning: boolean;
+  parts: PositionedTokenPart[];
+}
+
+type UnclassifiedTokenPart = Omit<PositionedTokenPart, "reasoning">;
+
+const reasoningDelimiterPattern = /<think(?:\s[^>]*)?>|<\/think\s*>/giu;
+
+function fallbackTokenParts(token: TokenEvent, position: number): UnclassifiedTokenPart[] {
+  const text = token.displayText || token.piece;
+  return [{ position, token, text, start: 0, end: Array.from(text).length, classification: token.reasoningSegment, delimiter: false }];
+}
+
+function exactTokenParts(token: TokenEvent, position: number): UnclassifiedTokenPart[] {
+  const text = token.displayText || token.piece;
+  if (!token.reasoningSlices?.length) return fallbackTokenParts(token, position);
+  const codePoints = Array.from(text);
+  const parts: UnclassifiedTokenPart[] = [];
+  let cursor = 0;
+  const slices = [...token.reasoningSlices].sort((left, right) => left.start - right.start);
+  for (const slice of slices) {
+    const start = Math.max(cursor, Math.min(codePoints.length, slice.start));
+    const end = Math.max(start, Math.min(codePoints.length, slice.end));
+    if (start > cursor) parts.push({ position, token, text: codePoints.slice(cursor, start).join(""), start: cursor, end: start, classification: token.reasoningSegment, delimiter: false });
+    if (end > start) parts.push({ position, token, text: codePoints.slice(start, end).join(""), start, end, classification: slice.classification, delimiter: slice.delimiter });
+    cursor = end;
+  }
+  if (cursor < codePoints.length) parts.push({ position, token, text: codePoints.slice(cursor).join(""), start: cursor, end: codePoints.length, classification: token.reasoningSegment, delimiter: false });
+  return parts.length > 0 ? parts : fallbackTokenParts(token, position);
+}
+
+interface ReasoningDelimiterSpan {
+  start: number;
+  end: number;
+  kind: ReasoningDelimiter;
+}
+
+function streamDelimiterSpans(text: string): ReasoningDelimiterSpan[] {
+  const spans: ReasoningDelimiterSpan[] = [];
+  for (const match of text.matchAll(reasoningDelimiterPattern)) {
+    const utf16Start = match.index ?? 0;
+    const start = Array.from(text.slice(0, utf16Start)).length;
+    spans.push({
+      start,
+      end: start + Array.from(match[0]).length,
+      kind: match[0].startsWith("</") ? "end" : "start",
+    });
+  }
+  return spans;
+}
+
+function markStreamDelimiters(parts: UnclassifiedTokenPart[], parseProtocol: boolean): UnclassifiedTokenPart[] {
+  if (!parseProtocol && !parts.some((part) => part.delimiter)) return parts;
+  const explicitRanges: Array<{ start: number; end: number }> = [];
+  let explicitCursor = 0;
+  for (const part of parts) {
+    const partEnd = explicitCursor + Array.from(part.text).length;
+    if (part.delimiter) explicitRanges.push({ start: explicitCursor, end: partEnd });
+    explicitCursor = partEnd;
+  }
+  const explicitlyDelimited = (span: ReasoningDelimiterSpan): boolean => {
+    let coveredThrough = span.start;
+    for (const range of explicitRanges) {
+      if (range.end <= coveredThrough) continue;
+      if (range.start > coveredThrough) return false;
+      coveredThrough = Math.max(coveredThrough, range.end);
+      if (coveredThrough >= span.end) return true;
+    }
+    return false;
+  };
+  const spans = streamDelimiterSpans(parts.map((part) => part.text).join(""))
+    .filter((span) => parseProtocol || explicitlyDelimited(span));
+  if (!spans.length) return parts;
+
+  const marked: UnclassifiedTokenPart[] = [];
+  let streamCursor = 0;
+  for (const part of parts) {
+    const characters = Array.from(part.text);
+    const streamEnd = streamCursor + characters.length;
+    const overlapping = spans.filter((span) => span.start < streamEnd && span.end > streamCursor);
+    const boundaries = new Set([streamCursor, streamEnd]);
+    for (const span of overlapping) {
+      boundaries.add(Math.max(streamCursor, span.start));
+      boundaries.add(Math.min(streamEnd, span.end));
+    }
+    const ordered = [...boundaries].sort((left, right) => left - right);
+    for (let index = 0; index < ordered.length - 1; index += 1) {
+      const start = ordered[index];
+      const end = ordered[index + 1];
+      if (start === undefined || end === undefined || end <= start) continue;
+      const delimiterSpan = overlapping.find((span) => start >= span.start && end <= span.end);
+      const localStart = start - streamCursor;
+      const localEnd = end - streamCursor;
+      marked.push({
+        ...part,
+        text: characters.slice(localStart, localEnd).join(""),
+        start: part.start + localStart,
+        end: part.start + localEnd,
+        classification: delimiterSpan ? "reasoning" : part.classification,
+        delimiter: delimiterSpan ? true : part.delimiter,
+        delimiterKind: delimiterSpan?.kind,
+      });
+    }
+    streamCursor = streamEnd;
+  }
+  return marked;
+}
+
+function positionedTokenParts(tokens: TokenEvent[], reasoningPrimed: boolean): PositionedTokenPart[] {
+  const streamText = tokens.map((token) => token.displayText || token.piece).join("");
+  const parseFallbackProtocol = reasoningPrimed || /^\s*<think(?:\s[^>]*)?>/iu.test(streamText);
+  const rawParts = markStreamDelimiters(
+    tokens.flatMap((token, position) => exactTokenParts(token, position)),
+    parseFallbackProtocol,
+  );
+  const parts: PositionedTokenPart[] = [];
+  let insideReasoning = reasoningPrimed;
+  for (let index = 0; index < rawParts.length;) {
+    const part = rawParts[index];
+    if (!part) break;
+    if (part.delimiter) {
+      if (part.delimiterKind) {
+        parts.push({ ...part, delimiterKind: part.delimiterKind, reasoning: true });
+        insideReasoning = part.delimiterKind === "start";
+        index += 1;
+        continue;
+      }
+      let delimiterEnd = index + 1;
+      while (rawParts[delimiterEnd]?.delimiter && !rawParts[delimiterEnd]?.delimiterKind) delimiterEnd += 1;
+      const delimiterParts = rawParts.slice(index, delimiterEnd);
+      const delimiterText = delimiterParts.map((item) => item.text).join("");
+      const delimiterKind: ReasoningDelimiter = /<\/think\s*>/iu.test(delimiterText)
+        ? "end"
+        : /<think(?:\s[^>]*)?>/iu.test(delimiterText)
+          ? "start"
+          : insideReasoning ? "end" : "start";
+      for (const item of delimiterParts) parts.push({ ...item, delimiterKind, reasoning: true });
+      insideReasoning = delimiterKind === "start";
+      index = delimiterEnd;
+      continue;
+    }
+    const reasoning = part.classification === "reasoning" || (part.classification === "unknown" && insideReasoning);
+    parts.push({ ...part, reasoning });
+    if (part.classification === "reasoning") insideReasoning = true;
+    else if (part.classification === "answer") insideReasoning = false;
+    index += 1;
+  }
+  return parts;
+}
+
+function groupNerdTokens(tokens: TokenEvent[], reasoningPrimed: boolean): NerdTokenGroup[] {
+  const groups: NerdTokenGroup[] = [];
+  for (const part of positionedTokenParts(tokens, reasoningPrimed)) {
+    const current = groups.at(-1);
+    if (!current || current.reasoning !== part.reasoning) groups.push({ reasoning: part.reasoning, parts: [part] });
+    else current.parts.push(part);
+  }
+  return groups;
+}
+
+function nerdTokenLabel(part: PositionedTokenPart): string {
+  const escaped = escapeToken(part.text || part.token.piece);
+  if (part.delimiterKind === "end") return `End reasoning token ${String(part.token.index)} ${escaped}`;
+  if (part.delimiterKind === "start") return `Start reasoning token ${String(part.token.index)} ${escaped}`;
+  if (isTerminationToken(part.text)) return `Termination token ${String(part.token.index)} ${escaped}`;
+  return `Token ${String(part.token.index)} ${escaped}`;
 }
 
 function NerdResponse({
   tokens,
   metric,
+  reasoningPrimed,
   selectedToken,
   onSelectToken,
   onOpenInspector,
 }: {
   tokens: TokenEvent[];
   metric: NerdMetric;
+  reasoningPrimed: boolean;
   selectedToken: number | null;
   onSelectToken: (index: number) => void;
   onOpenInspector: () => void;
 }): React.ReactNode {
   const visibleStart = Math.max(0, tokens.length - 1200);
-  const collapsedPrefix = visibleStart > 0 ? tokens.slice(0, visibleStart).map((token) => token.displayText).join("") : "";
-  const visibleTokens = tokens.slice(visibleStart);
-  const values = tokens.map((token) => nerdValue(token, metric)).filter((value): value is number => value !== undefined && Number.isFinite(value));
+  const groups = groupNerdTokens(tokens, reasoningPrimed);
+  const values = groups.flatMap((group) => group.parts.map((part) => nerdValue(part.token, metric, part.classification))).filter((value): value is number => value !== undefined && Number.isFinite(value));
   const minimum = values.length ? Math.min(...values) : 0;
   const maximum = values.length ? Math.max(...values) : 1;
   const range = maximum - minimum || 1;
   if (!tokens.length) return <span className="stream-caret" aria-label="Waiting for first token" />;
+  const hasEmittedStart = groups.some((group) => group.parts.some((part) => part.delimiterKind === "start"));
+  const promptMarkerGroup = reasoningPrimed && !hasEmittedStart ? groups.findIndex((group) => group.reasoning) : -1;
+  const renderTokens = (items: PositionedTokenPart[]): React.ReactNode => {
+    const collapsed = items.filter(({ position }) => position < visibleStart);
+    const visible = items.filter(({ position }) => position >= visibleStart);
+    return (
+      <>
+        {collapsed.length > 0 && <span className="nerd-collapsed-prefix" title="Older tokens remain individually available in the virtualized token table.">{collapsed.map((part) => part.text).join("")}<small>{String(new Set(collapsed.map((part) => part.token.index)).size)} earlier token boundaries collapsed for display performance</small></span>}
+        {visible.map((part) => {
+          const { token } = part;
+          const value = nerdValue(token, metric, part.classification);
+          const normalized = value === undefined ? 0 : (value - minimum) / range;
+          return (
+            <button
+              aria-label={nerdTokenLabel(part)}
+              aria-pressed={selectedToken === token.index}
+              className={`nerd-token ${selectedToken === token.index ? "selected" : ""} segment-${part.classification}`}
+              key={`${String(token.index)}:${String(part.start)}:${String(part.end)}`}
+              onClick={() => { onSelectToken(token.index); onOpenInspector(); }}
+              style={{ "--metric": String(normalized) } as React.CSSProperties}
+              title={`#${String(token.index)} ${escapeToken(token.piece)}\nID ${String(token.tokenId)} · raw p ${formatPercent(token.rawProbability, 3)} · sampler p ${formatPercent(token.samplingProbability, 3)}\n${formatDuration(token.timing?.decodeMs)} decode · ${token.reasoningSegment}`}
+              type="button"
+            >{part.text || "∅"}<span className="token-index">{String(token.index)}</span></button>
+          );
+        })}
+      </>
+    );
+  };
   return (
     <div className="nerd-response" aria-label={`Tokenized response colored by ${metric}`}>
-      {collapsedPrefix && <span className="nerd-collapsed-prefix" title="Older tokens remain individually available in the virtualized token table.">{collapsedPrefix}<small>{String(visibleStart)} earlier token boundaries collapsed for display performance</small></span>}
-      {visibleTokens.map((token) => {
-        const value = nerdValue(token, metric);
-        const normalized = value === undefined ? 0 : (value - minimum) / range;
-        return (
-          <button
-            aria-label={`Token ${String(token.index)} ${escapeToken(token.piece)}`}
-            aria-pressed={selectedToken === token.index}
-            className={`nerd-token ${selectedToken === token.index ? "selected" : ""} segment-${token.reasoningSegment}`}
-            key={token.index}
-            onClick={() => { onSelectToken(token.index); onOpenInspector(); }}
-            style={{ "--metric": String(normalized) } as React.CSSProperties}
-            title={`#${String(token.index)} ${escapeToken(token.piece)}\nID ${String(token.tokenId)} · raw p ${formatPercent(token.rawProbability, 3)} · sampler p ${formatPercent(token.samplingProbability, 3)}\n${formatDuration(token.timing?.decodeMs)} decode · ${token.reasoningSegment}`}
-            type="button"
-          >{token.displayText || token.piece || "∅"}<span className="token-index">{String(token.index)}</span></button>
-        );
-      })}
+      {groups.map((group, groupIndex) => group.reasoning ? (
+        <details className="reasoning-disclosure nerd-reasoning-disclosure" key={`reasoning-${String(groupIndex)}`}>
+          <summary className="reasoning-summary">Thinking… <small>{String(new Set(group.parts.map((part) => part.token.index)).size)} tokens</small></summary>
+          <div className="reasoning-content nerd-reasoning-content">
+            {groupIndex === promptMarkerGroup && <code aria-label="Prompt-primed reasoning start" className="nerd-boundary-token start">Reasoning started by the prompt · no opening token emitted</code>}
+            <div>{renderTokens(group.parts)}</div>
+          </div>
+        </details>
+      ) : <div className="nerd-answer-segment" key={`answer-${String(groupIndex)}`}>{renderTokens(group.parts)}</div>)}
+    </div>
+  );
+}
+
+function NerdRawResponse({ content, reasoningPrimed }: { content: string; reasoningPrimed: boolean }): React.ReactNode {
+  const output = splitAssistantOutput(content, reasoningPrimed);
+  return (
+    <div className="nerd-raw-response">
+      {output.hasReasoning && <details className="reasoning-disclosure nerd-reasoning-disclosure">
+        <summary className="reasoning-summary">Thinking…</summary>
+        <div className="reasoning-content nerd-reasoning-content">
+          {output.openingReasoningToken
+            ? <code aria-label="Start reasoning token" className="nerd-boundary-token start">{output.openingReasoningToken}</code>
+            : reasoningPrimed && <code aria-label="Prompt-primed reasoning start" className="nerd-boundary-token start">Reasoning started by the prompt · no opening token emitted</code>}
+          <pre className="nerd-raw-fallback">{output.reasoning}</pre>
+          {output.closingReasoningToken && <code aria-label="End reasoning token" className="nerd-boundary-token end">{output.closingReasoningToken}</code>}
+        </div>
+      </details>}
+      {output.answer && <pre className="nerd-raw-fallback">{output.answer}</pre>}
+      {output.terminationTokens.length > 0 && <div className="nerd-termination-tokens" aria-label="Termination tokens">{output.terminationTokens.map((token, index) => <code key={`${token}:${String(index)}`}>{token}</code>)}</div>}
     </div>
   );
 }
@@ -244,12 +469,12 @@ function MessageRow({
   const [copied, setCopied] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.content);
-  const tokenized = nerdMode && message.role === "assistant" && run?.messageId === message.id;
+  const tokenized = nerdMode && message.role === "assistant" && (run?.id === message.runId || run?.messageId === message.id);
   const rawNerdFallback = nerdMode && message.role === "assistant" && !tokenized;
-  const reasoningPrimed = message.reasoningPrimed === true || (
+  const reasoningPrimed = message.reasoningPrimed === true || Boolean(
     message.role === "assistant"
-    && run?.messageId === message.id
-    && run.tokens.some((token) => token.reasoningSegment === "reasoning")
+    && (run?.id === message.runId || run?.messageId === message.id)
+    && run?.tokens.some((token) => token.reasoningSegment === "reasoning")
   );
   const copy = (): void => {
     const copyValue = message.role === "assistant" && !nerdMode ? cleanAssistantOutput(message.content, reasoningPrimed) : message.content;
@@ -267,9 +492,9 @@ function MessageRow({
         {editing ? (
           <div className="edit-message"><textarea autoFocus onChange={(event) => setDraft(event.target.value)} value={draft} /><div><button className="button secondary compact" onClick={() => { setEditing(false); setDraft(message.content); }} type="button"><X size={13} /> Cancel</button><button className="button primary compact" onClick={() => { if (draft.trim()) onBranch(draft.trim()); setEditing(false); }} type="button"><GitBranch size={13} /> Send as branch</button></div></div>
         ) : tokenized ? (
-          <NerdResponse metric={nerdMetric} onOpenInspector={onOpenInspector} onSelectToken={onSelectToken} selectedToken={selectedToken} tokens={run.tokens} />
+          <NerdResponse metric={nerdMetric} onOpenInspector={onOpenInspector} onSelectToken={onSelectToken} reasoningPrimed={reasoningPrimed} selectedToken={selectedToken} tokens={run?.tokens ?? []} />
         ) : rawNerdFallback ? (
-          <pre className="nerd-raw-fallback">{message.content}</pre>
+          <NerdRawResponse content={message.content} reasoningPrimed={reasoningPrimed} />
         ) : (
           <div className="message-content"><MarkdownMessage assistant={message.role === "assistant"} content={message.content} reasoningPrimed={reasoningPrimed} />{message.status === "streaming" && <span className="stream-caret" />}</div>
         )}
@@ -344,7 +569,7 @@ export function ChatView({
 
   const runSummary = useMemo(() => {
     if (!run || !run.tokens.length) return null;
-    if (run.messageId && !lineage.some(({ message }) => message.id === run.messageId)) return null;
+    if (!lineage.some(({ message }) => message.runId === run.id || message.id === run.messageId)) return null;
     return {
       tokens: run.tokens.length,
       tps: run.metrics?.timing?.decodeTokensPerSecond,

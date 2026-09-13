@@ -125,6 +125,15 @@ class GenerationRunCreate(StrictRequest):
         return data
 
 
+class TokenBranchCreate(StrictRequest):
+    """Select one persisted alternative and continue generation from that token."""
+
+    token_index: int = Field(alias="tokenIndex", ge=0, le=100_000)
+    distribution: Literal["raw", "sampling"]
+    rank: int = Field(ge=1)
+    token_id: int = Field(alias="tokenId", ge=0)
+
+
 class EmbeddingItemRequest(StrictRequest):
     id: str | None = Field(default=None, max_length=200)
     modality: Literal["text", "image", "video", "audio", "mixed"]
@@ -248,6 +257,7 @@ class ChatExportToken(StrictRequest):
     instantaneous_tps: float | None = Field(default=None, ge=0)
     rolling_tps: float | None = Field(default=None, ge=0)
     segment: Literal["reasoning", "answer", "unknown"] = "unknown"
+    reasoning_slices: list[dict[str, Any]] = Field(default_factory=list, max_length=1_000)
     selected_experts: Any = None
     alternatives: list[ChatExportAlternative] = Field(default_factory=list, max_length=2_000)
 
