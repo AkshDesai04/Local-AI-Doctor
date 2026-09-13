@@ -53,6 +53,9 @@ export function GenerationControls({ open, model, settings, defaultSettings, aut
     onChange((current) => ({ ...current, [key]: value }));
   };
   const profiling = settings.instrumentation === "full" || settings.instrumentation === "expert";
+  const cudaCapability = model?.capabilities.cuda;
+  const cudaUnavailable = cudaCapability?.state === "unavailable_on_backend";
+  const cudaUnavailableReason = cudaCapability?.reason ?? "No usable CUDA runtime was discovered on this backend.";
 
   return (
     <div className="controls-panel" aria-label="Generation settings">
@@ -78,7 +81,23 @@ export function GenerationControls({ open, model, settings, defaultSettings, aut
         <section className="control-section">
           <div className="control-section-title"><Gauge size={15} /><span>Runtime</span></div>
           <div className="control-grid two">
-            <label className="control-field"><span>Device</span><div className="select-wrap"><select onChange={(event) => update("device", event.target.value as GenerationSettings["device"])} value={settings.device}><option value="auto">Auto</option><option value="cpu">CPU</option><option value="cuda">CUDA</option></select><ChevronDown size={13} /></div></label>
+            <label className="control-field">
+              <span>Device{cudaUnavailable && <small>CUDA unavailable</small>}</span>
+              <div className="select-wrap">
+                <select
+                  aria-describedby={cudaUnavailable ? "cuda-unavailable-reason" : undefined}
+                  aria-label="Device"
+                  onChange={(event) => update("device", event.target.value as GenerationSettings["device"])}
+                  value={settings.device}
+                >
+                  <option value="auto">Auto</option>
+                  <option value="cpu">CPU</option>
+                  <option disabled={cudaUnavailable} value="cuda">{cudaUnavailable ? "CUDA (unavailable)" : "CUDA"}</option>
+                </select>
+                <ChevronDown size={13} />
+              </div>
+              {cudaUnavailable && <small id="cuda-unavailable-reason" role="status">{cudaUnavailableReason}</small>}
+            </label>
             <label className="control-field"><span>Data type</span><div className="select-wrap"><select onChange={(event) => update("dtype", event.target.value as GenerationSettings["dtype"])} value={settings.dtype}><option value="auto">Auto</option><option value="float32">FP32</option><option value="float16">FP16</option><option value="bfloat16">BF16</option></select><ChevronDown size={13} /></div></label>
             <label className="control-field"><span>Instrumentation</span><div className="select-wrap"><select onChange={(event) => update("instrumentation", event.target.value as GenerationSettings["instrumentation"])} value={settings.instrumentation}><option value="off">Off</option><option value="basic">Basic</option><option value="token">Token</option><option value="full">Full</option><option value="expert">Expert</option></select><ChevronDown size={13} /></div></label>
             <label className="control-field"><span>Seed <small>blank = generated</small></span><input inputMode="numeric" onChange={(event) => update("seed", event.target.value)} placeholder="Unsigned 64-bit" value={settings.seed} /></label>

@@ -87,6 +87,9 @@ describe("API boundary normalization", () => {
       model_id: "model-1",
       prompt: "Hello",
       parent_message_id: "parent-1",
+      device: "cpu",
+      dtype: "float32",
+      instrumentation: "token",
       seed: "18446744073709551615",
       deterministic_reference_mode: true,
     });

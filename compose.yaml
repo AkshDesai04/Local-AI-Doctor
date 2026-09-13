@@ -199,7 +199,9 @@ services:
       <<: *app-environment
       LAD_PROFILE: container-cpu
       LAD_RUNTIME__DEVICE: cpu
-      LAD_RUNTIME__ALLOW_CPU_FALLBACK: "true"
+      # Never turn an explicit CUDA request into an unnoticed CPU run. The
+      # CPU profile remains CPU by default, while CUDA requests fail clearly.
+      LAD_RUNTIME__ALLOW_CPU_FALLBACK: "false"
     networks:
       default:
         aliases:

@@ -195,12 +195,25 @@ switch ($Action) {
     "BuildNvidia" { Invoke-Compose -Arguments @("--profile", "nvidia", "build", "--pull", "app-nvidia", "frontend-nvidia") }
     "UpCpu" {
         Ensure-WslKeepAlive
-        Invoke-Compose -Arguments @("--profile", "cpu", "up", "--build", "--detach", "--wait", "frontend-cpu")
+        # Finish the build before taking the currently active GPU profile offline.
+        Invoke-Compose -Arguments @("--profile", "cpu", "build", "app-cpu", "frontend-cpu")
+        Invoke-Compose -Arguments @("--profile", "nvidia", "stop", "frontend-nvidia", "app-nvidia")
+        Invoke-Compose -Arguments @("--profile", "cpu", "up", "--detach", "--wait", "frontend-cpu")
     }
     "UpNvidia" {
         Ensure-WslKeepAlive
         Invoke-Wsl -Command @("nvidia-smi")
-        Invoke-Compose -Arguments @("--profile", "nvidia", "up", "--build", "--detach", "--wait", "frontend-nvidia")
+        # Prove that the built image can reach CUDA before interrupting a working CPU profile.
+        Invoke-Compose -Arguments @("--profile", "nvidia", "build", "app-nvidia", "frontend-nvidia")
+        Invoke-Compose -Arguments @(
+            "--profile", "nvidia", "run", "--rm", "--no-deps", "--entrypoint", "python",
+            "app-nvidia", "-c", $nvidiaProbe
+        )
+        Invoke-Compose -Arguments @("--profile", "cpu", "stop", "frontend-cpu", "app-cpu")
+        Invoke-Compose -Arguments @("--profile", "nvidia", "up", "--detach", "--wait", "frontend-nvidia")
+        Invoke-Compose -Arguments @("--profile", "nvidia", "exec", "-T", "app-nvidia", "python", "-c", $nvidiaProbe)
+        Invoke-Compose -Arguments @("--profile", "nvidia", "exec", "-T", "app-nvidia", "python", "-c", $healthProbe)
+        Invoke-Compose -Arguments (@("--profile", "nvidia", "exec", "-T", "frontend-nvidia") + $frontendHealthProbe)
     }
     "HealthCpu" {
         Invoke-Compose -Arguments @("--profile", "cpu", "exec", "-T", "app-cpu", "python", "-c", $healthProbe)

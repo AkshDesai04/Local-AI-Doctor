@@ -116,8 +116,6 @@ Before startup, confirm WSL can see the GPU and that Docker's NVIDIA runtime wor
 .\scripts\wsl-docker.ps1 -Action CheckNvidia -Distribution $Distro -WslUser $WslUser
 .\scripts\wsl-docker.ps1 -Action BuildNvidia -Distribution $Distro -WslUser $WslUser
 .\scripts\wsl-docker.ps1 -Action UpNvidia -Distribution $Distro -WslUser $WslUser
-.\scripts\wsl-docker.ps1 -Action NvidiaSmoke -Distribution $Distro -WslUser $WslUser
-.\scripts\wsl-docker.ps1 -Action HealthNvidia -Distribution $Distro -WslUser $WslUser
 ```
 
 The NVIDIA profile is structurally valid without a GPU, but startup requires all of:
@@ -126,11 +124,16 @@ The NVIDIA profile is structurally valid without a GPU, but startup requires all
 - `nvidia-smi` working inside the selected WSL2 distribution; and
 - NVIDIA Container Toolkit configured for that distribution's Docker daemon.
 
-`NvidiaSmoke` verifies `torch.cuda.is_available()` and prints the selected device. It does not load a
-model. GPU selection can be narrowed with `NVIDIA_VISIBLE_DEVICES` in the ignored `.env`.
+`UpNvidia` builds the images and runs a one-off container that verifies `torch.cuda.is_available()`
+before it stops an active CPU profile. It then starts the NVIDIA profile, repeats that CUDA check in
+the backend container, and verifies both health endpoints. A missing or misconfigured container runtime
+therefore leaves the working CPU profile untouched. `NvidiaSmoke` and `HealthNvidia` expose the same
+checks as standalone diagnostics; the smoke check does not load a model. GPU selection can be narrowed
+with `NVIDIA_VISIBLE_DEVICES` in the ignored `.env`.
 
-Do not run the CPU and NVIDIA service pairs simultaneously because both profiles reserve the permanent
-host ports 6969 and 6767. Stop one profile before starting the other.
+The CPU container rejects explicit CUDA requests instead of silently running them on the CPU. Use
+`UpNvidia` for CUDA. `UpCpu` and `UpNvidia` automatically stop the opposite service pair before startup
+because both profiles reserve the permanent host ports 6969 and 6767.
 
 ## Development loop
 

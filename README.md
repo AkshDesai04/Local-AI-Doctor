@@ -127,7 +127,10 @@ The container ports are permanent and loopback-only: open the frontend at
 backend use [http://127.0.0.1:6767/api/v1](http://127.0.0.1:6767/api/v1). Compose
 waits for backend health, holds for 16 seconds, and only then starts serving the UI.
 
-NVIDIA startup uses `UpNvidia` followed by `NvidiaSmoke` and `HealthNvidia`. The complete setup, backup, restore, update, and troubleshooting procedures are in [WSL2 container deployment](docs/deployment.md).
+`UpCpu` and `UpNvidia` switch profiles automatically, so only one pair can own the fixed ports. `UpNvidia`
+proves Docker-level CUDA access before stopping a working CPU profile, then verifies CUDA and both health
+endpoints after startup. `NvidiaSmoke` and `HealthNvidia` remain available as standalone diagnostics. The
+complete setup, backup, restore, update, and troubleshooting procedures are in [WSL2 container deployment](docs/deployment.md).
 
 ## Command line
 
