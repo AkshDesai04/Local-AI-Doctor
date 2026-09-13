@@ -126,11 +126,14 @@ jobs:
           $tag = "v$version"
           $title = "Local AI Doctor $version"
 
-          $matchingTag = (git tag --list $tag).Trim()
+          $matchingTagOutput = git tag --list $tag
           if ($LASTEXITCODE -ne 0) { throw "Could not inspect release tags." }
+          $matchingTag = (@($matchingTagOutput) -join "`n").Trim()
           $tagExists = $matchingTag -eq $tag
           if ($tagExists) {
-            $tagCommit = (git rev-list -n 1 $tag).Trim()
+            $tagCommitOutput = git rev-list -n 1 $tag
+            if ($LASTEXITCODE -ne 0) { throw "Could not resolve release tag $tag." }
+            $tagCommit = (@($tagCommitOutput) -join "`n").Trim()
             if ($tagCommit -ne "${{ github.sha }}") {
               throw "Release tag $tag already points to $tagCommit; bump VERSION before publishing this commit."
             }
