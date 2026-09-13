@@ -186,3 +186,31 @@ def test_model_root_update_tolerates_unsupported_bind_mount_chmod(
         environ={},
     )
     assert saved.paths.model_roots == (model_root.resolve(),)
+
+
+def test_model_root_update_tolerates_combined_bind_mount_denials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root = tmp_path / "models"
+    model_root.mkdir()
+    user = tmp_path / "local.yaml"
+    user.write_text("schema_version: 1\n", encoding="utf-8")
+
+    def deny_chmod(path: Path, _mode: int) -> None:
+        raise PermissionError(errno.EPERM, "bind mount does not support chmod", str(path))
+
+    def deny_replace(_source: Path, target: Path) -> None:
+        raise PermissionError(errno.EACCES, "bind mount denied replacement", str(target))
+
+    monkeypatch.setattr(config_module.os, "chmod", deny_chmod)
+    monkeypatch.setattr(config_module.os, "replace", deny_replace)
+
+    persist_user_model_roots(user, ProfileName.NATIVE_WINDOWS, (model_root,))
+
+    saved = SettingsLoader().load(
+        user_path=user,
+        profile=ProfileName.NATIVE_WINDOWS,
+        environ={},
+    )
+    assert saved.paths.model_roots == (model_root.resolve(),)

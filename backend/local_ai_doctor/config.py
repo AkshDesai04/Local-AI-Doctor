@@ -687,7 +687,7 @@ def persist_user_model_roots(
             os.chmod(temporary, existing_mode)
         except OSError as exc:
             chmod_unsupported = exc.errno in {errno.EACCES, errno.EPERM, errno.EROFS}
-            if not chmod_unsupported or not os.access(temporary, os.W_OK):
+            if not chmod_unsupported:
                 raise
             # Windows-backed Docker bind mounts can permit file creation and
             # replacement while rejecting chmod. Their host-side permission
@@ -697,7 +697,7 @@ def persist_user_model_roots(
             temporary = None
         except OSError as exc:
             replacement_denied = exc.errno in {errno.EBUSY, errno.EACCES, errno.EPERM}
-            if not replacement_denied or not target.is_file() or not os.access(target, os.W_OK):
+            if not replacement_denied or not target.is_file():
                 raise
             # Docker Desktop bind mounts backed by Windows/WSL can reject
             # rename-over-existing even when both the file and directory are
