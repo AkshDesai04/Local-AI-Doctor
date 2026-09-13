@@ -324,7 +324,9 @@ describe("API boundary normalization", () => {
 
     const content = await api.attachmentContent("attachment/one");
 
-    expect(content).toBeInstanceOf(Blob);
+    // Response.blob() can return a Blob from the fetch implementation's realm
+    // rather than jsdom's realm, so instanceof is not portable across runners.
+    expect(Object.prototype.toString.call(content)).toBe("[object Blob]");
     expect(content.size).toBe(11);
     expect(content.type).toBe("image/png");
     expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/attachments/attachment%2Fone/content");

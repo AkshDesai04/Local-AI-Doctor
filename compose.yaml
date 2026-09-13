@@ -16,6 +16,12 @@ x-nvidia-image: &nvidia-image
     <<: *build-common
     target: nvidia
 
+x-frontend-image: &frontend-image
+  image: ${FRONTEND_IMAGE_NAME:-local-ai-doctor-frontend}:${IMAGE_TAG:-dev}
+  build:
+    <<: *build-common
+    target: frontend
+
 x-persistent-mounts: &persistent-mounts
   - type: bind
     source: ${MODEL_PATH:?Set MODEL_PATH in the ignored .env file to a WSL-visible model directory}
@@ -101,13 +107,6 @@ x-app: &app
   stop_grace_period: ${STOP_GRACE_PERIOD:-30s}
   volumes: *persistent-mounts
   ports:
-    - name: frontend
-      target: 6767
-      published: "6969"
-      host_ip: 127.0.0.1
-      protocol: tcp
-      app_protocol: http
-      mode: host
     - name: backend
       target: 6767
       published: "6767"
@@ -126,14 +125,51 @@ x-app: &app
       - python
       - -c
       - >-
-        import os,urllib.request;
+        import json,os,urllib.request;
         u='http://127.0.0.1:'+os.environ.get('CONTAINER_LISTEN_PORT','6767')+'/api/v1/health';
         r=urllib.request.urlopen(u,timeout=3);
-        raise SystemExit(0 if r.status==200 else 1)
+        p=json.load(r);
+        raise SystemExit(0 if r.status==200 and p.get('status')=='ok' else 1)
     interval: 15s
     timeout: 5s
     start_period: 30s
     retries: 5
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+x-frontend: &frontend
+  <<: *security
+  restart: unless-stopped
+  init: true
+  stop_signal: SIGTERM
+  stop_grace_period: 10s
+  ports:
+    - name: frontend
+      target: 6969
+      published: "6969"
+      host_ip: 127.0.0.1
+      protocol: tcp
+      app_protocol: http
+      mode: host
+  cpus: "1.0"
+  mem_limit: 256m
+  mem_reservation: 64m
+  pids_limit: 128
+  healthcheck:
+    test:
+      - CMD
+      - wget
+      - --quiet
+      - --tries=1
+      - --output-document=/dev/null
+      - http://127.0.0.1:6969/healthz
+    interval: 5s
+    timeout: 3s
+    start_period: 20s
+    retries: 6
   logging:
     driver: json-file
     options:
@@ -164,6 +200,25 @@ services:
       LAD_PROFILE: container-cpu
       LAD_RUNTIME__DEVICE: cpu
       LAD_RUNTIME__ALLOW_CPU_FALLBACK: "true"
+    networks:
+      default:
+        aliases:
+          - backend
+
+  frontend-cpu:
+    <<:
+      - *frontend
+      - *frontend-image
+    container_name: ${CPU_FRONTEND_CONTAINER_NAME:-local-ai-doctor-frontend-cpu}
+    profiles:
+      - cpu
+    depends_on:
+      app-cpu:
+        condition: service_healthy
+        restart: true
+    environment:
+      BACKEND_HEALTH_URL: http://backend:6767/api/v1/health
+      BACKEND_WAIT_TIMEOUT_SECONDS: 180
 
   preflight-nvidia:
     <<:
@@ -191,6 +246,25 @@ services:
       LAD_RUNTIME__ALLOW_CPU_FALLBACK: "false"
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+    networks:
+      default:
+        aliases:
+          - backend
+
+  frontend-nvidia:
+    <<:
+      - *frontend
+      - *frontend-image
+    container_name: ${NVIDIA_FRONTEND_CONTAINER_NAME:-local-ai-doctor-frontend-nvidia}
+    profiles:
+      - nvidia
+    depends_on:
+      app-nvidia:
+        condition: service_healthy
+        restart: true
+    environment:
+      BACKEND_HEALTH_URL: http://backend:6767/api/v1/health
+      BACKEND_WAIT_TIMEOUT_SECONDS: 180
 
   database-maintenance:
     <<:

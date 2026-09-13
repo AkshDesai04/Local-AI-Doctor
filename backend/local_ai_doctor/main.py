@@ -385,7 +385,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; "
             "form-action 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
-            "style-src 'self' 'unsafe-inline'; script-src 'self'; "
+            "font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
             f"connect-src 'self' {websocket_sources}"
         )
         response.headers["X-Content-Type-Options"] = "nosniff"

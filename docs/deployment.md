@@ -5,11 +5,11 @@ WSL2 distribution when there is one unambiguous choice, resolves a Linux user, v
 Engine connectivity, and then invokes Linux `docker compose`. It never calls Windows `docker.exe`,
 uses `sudo`, or accepts a password.
 
-The CPU and NVIDIA images share the same application and frontend build. The CPU target installs a
-PyTorch CPU wheel and verifies that no NVIDIA Python packages entered the final image. The NVIDIA
-target installs the CUDA PyTorch and Torchvision wheels pinned by `requirements-cuda.lock`; the host
-driver is provided by WSL GPU passthrough and NVIDIA Container Toolkit. Both final images run as
-UID/GID `10001`, drop all Linux
+The CPU and NVIDIA backend images share the same application build, while a separate minimal image
+serves the compiled frontend. The CPU target installs a PyTorch CPU wheel and verifies that no NVIDIA
+Python packages entered the final image. The NVIDIA target installs the CUDA PyTorch and Torchvision
+wheels pinned by `requirements-cuda.lock`; the host driver is provided by WSL GPU passthrough and
+NVIDIA Container Toolkit. All final images run as UID/GID `10001`, drop all Linux
 capabilities, use a read-only root filesystem, and receive `SIGTERM` with a bounded graceful-shutdown
 period.
 
@@ -84,19 +84,29 @@ Validate interpolated Compose configuration before building:
 .\scripts\wsl-docker.ps1 -Action HealthCpu -Distribution $Distro -WslUser $WslUser
 ```
 
+The `UpCpu` and `UpNvidia` wrapper actions also start one named, idle Linux process so WSL keeps the
+distribution resident after PowerShell exits. This is necessary because WSL does not treat systemd
+services alone as an active session; without it, the Docker daemon and published localhost ports can
+disappear as soon as the launcher finishes. The process is reused on later starts and ends when the
+distribution is shut down.
+
 The equivalent raw commands, when PowerShell is already in the repository root, are:
 
 ```powershell
-wsl.exe --distribution $Distro --user $WslUser -- docker compose --profile cpu build --pull app-cpu
-wsl.exe --distribution $Distro --user $WslUser -- docker compose --profile cpu up --detach --wait app-cpu
+wsl.exe --distribution $Distro --user $WslUser -- docker compose --profile cpu build --pull app-cpu frontend-cpu
+wsl.exe --distribution $Distro --user $WslUser -- docker compose --profile cpu up --detach --wait frontend-cpu
 wsl.exe --distribution $Distro --user $WslUser -- docker compose --profile cpu exec -T app-cpu python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:6767/api/v1/health').read().decode())"
+wsl.exe --distribution $Distro --user $WslUser -- docker compose --profile cpu exec -T frontend-cpu wget --quiet --output-document=- http://127.0.0.1:6969/healthz
 ```
 
 Open the frontend at `http://127.0.0.1:6969`. The REST API and WebSocket backend are fixed at
-`http://127.0.0.1:6767`; its health endpoint is `http://127.0.0.1:6767/api/v1/health`. The production
-frontend is baked into the ASGI image, and both loopback publications reach its internal port 6767.
-The browser bundle uses port 6767 for API and WebSocket traffic. External access requires a separately
-reviewed, authenticated configuration and is not enabled by this deployment.
+`http://127.0.0.1:6767`; its health endpoint is `http://127.0.0.1:6767/api/v1/health`. Compose does not
+start the frontend container until the backend is healthy. On every frontend container start, including
+Docker daemon restarts, its entrypoint independently waits for a healthy backend and then holds for 16
+seconds before starting Nginx on port 6969. The frontend proxy carries same-origin API and WebSocket
+traffic to the private backend service, which remains directly available on port 6767 for local
+diagnostics and API clients. External access requires a separately reviewed, authenticated configuration
+and is not enabled by this deployment.
 
 ## NVIDIA build and startup
 
@@ -119,7 +129,7 @@ The NVIDIA profile is structurally valid without a GPU, but startup requires all
 `NvidiaSmoke` verifies `torch.cuda.is_available()` and prints the selected device. It does not load a
 model. GPU selection can be narrowed with `NVIDIA_VISIBLE_DEVICES` in the ignored `.env`.
 
-Do not run the CPU and NVIDIA services simultaneously because both profiles reserve the permanent
+Do not run the CPU and NVIDIA service pairs simultaneously because both profiles reserve the permanent
 host ports 6969 and 6767. Stop one profile before starting the other.
 
 ## Development loop

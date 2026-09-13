@@ -2,16 +2,27 @@
 
 ARG PYTHON_IMAGE=python:3.12.10-slim-bookworm
 ARG NODE_IMAGE=node:22.14.0-bookworm-slim
+ARG NGINX_IMAGE=nginx:1.28.0-alpine
 
 FROM ${NODE_IMAGE} AS frontend-builder
-ARG VITE_API_BASE=http://127.0.0.1:6767/api/v1
-ARG VITE_WS_BASE=ws://127.0.0.1:6767
 WORKDIR /build/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm \
     npm ci --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
+
+FROM ${NGINX_IMAGE} AS frontend
+COPY --from=frontend-builder --chown=10001:10001 /build/frontend/dist/ /usr/share/nginx/html/
+COPY --chown=10001:10001 docker/nginx.conf /etc/nginx/nginx.conf
+COPY --chown=10001:10001 docker/frontend-entrypoint.sh /usr/local/bin/local-ai-doctor-frontend
+RUN chmod 0555 /usr/local/bin/local-ai-doctor-frontend
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/local-ai-doctor-frontend"]
+EXPOSE 6969
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=5s --timeout=3s --start-period=20s --retries=6 \
+    CMD ["wget", "--quiet", "--tries=1", "--output-document=/dev/null", "http://127.0.0.1:6969/healthz"]
 
 FROM ${PYTHON_IMAGE} AS dependency-wheels
 WORKDIR /build
@@ -114,7 +125,6 @@ ENV PYTHONUNBUFFERED=1 \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     TOKENIZERS_PARALLELISM=false \
-    FRONTEND_DIR=/app/frontend/dist \
     CONTAINER_LISTEN_HOST=0.0.0.0 \
     CONTAINER_LISTEN_PORT=6767 \
     UVICORN_WORKERS=1 \
@@ -127,7 +137,6 @@ RUN apt-get update \
     && install -d -o app -g app -m 0750 \
         /app \
         /app/config \
-        /app/frontend/dist \
         /data/database \
         /data/uploads \
         /data/cache \
@@ -135,10 +144,13 @@ RUN apt-get update \
         /data/backups \
     && install -d -o root -g root -m 0555 /models
 WORKDIR /app
-COPY --from=frontend-builder --chown=app:app /build/frontend/dist/ /app/frontend/dist/
 COPY --chown=app:app config/default.yaml /app/config/default.yaml
 COPY --chown=app:app config/local.example.yaml /app/config/local.yaml
-COPY --chown=app:app docker/ /app/docker/
+COPY --chown=app:app \
+    docker/entrypoint.sh \
+    docker/preflight.py \
+    docker/sqlite_backup.py \
+    /app/docker/
 COPY requirements.lock requirements-ml.lock requirements-cuda.lock /app/
 RUN chmod 0555 /app/docker/entrypoint.sh \
     && chmod 0444 /app/docker/*.py /app/config/*.yaml
@@ -148,7 +160,7 @@ CMD ["serve"]
 EXPOSE 6767
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
-    CMD ["python", "-c", "import os,urllib.request; u='http://127.0.0.1:'+os.environ.get('CONTAINER_LISTEN_PORT','6767')+'/api/v1/health'; r=urllib.request.urlopen(u,timeout=3); raise SystemExit(0 if r.status==200 else 1)"]
+    CMD ["python", "-c", "import json,os,urllib.request; u='http://127.0.0.1:'+os.environ.get('CONTAINER_LISTEN_PORT','6767')+'/api/v1/health'; r=urllib.request.urlopen(u,timeout=3); p=json.load(r); raise SystemExit(0 if r.status==200 and p.get('status')=='ok' else 1)"]
 
 FROM runtime-base AS cpu
 COPY --from=cpu-python /usr/local/ /usr/local/

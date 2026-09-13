@@ -10,9 +10,12 @@ The current release optimizes for one local user, one isolated model worker, one
 
 ```text
 Browser
-  |  REST /api/v1                 WebSocket /ws/v1/runs/{id}
+  |  UI assets + same-origin REST /api/v1 + WebSocket /ws/v1             :6969
   v
-FastAPI application
+Frontend reverse proxy
+  |  private REST/WebSocket traffic
+  v
+FastAPI application                                                            :6767
   |-- typed settings + security middleware
   |-- model registry and read-only discovery
   |-- FIFO inference admission, run orchestration, and replayable event broker
@@ -30,6 +33,12 @@ FastAPI application
 Configured model roots (read-only)       Application data (read/write)
 config/tokenizer/processor/SafeTensors   SQLite/uploads/cache/exports/backups
 ```
+
+In the container deployment, Compose waits for the FastAPI health check before starting the separate
+frontend reverse proxy. Its entrypoint independently rechecks backend health and enforces a 16-second
+stabilization interval before Nginx begins listening, including after Docker daemon restarts. The browser
+uses that proxy for same-origin API and WebSocket traffic. Native profiles continue to let FastAPI serve
+the built static assets directly.
 
 Only serializable commands and events cross the worker boundary. PyTorch modules, tokenizer instances, CUDA state, and raw logits stay inside the spawned child process. A Python exception or process exit is translated into a structured worker failure; it does not intentionally expose a traceback through the API.
 

@@ -36,6 +36,7 @@ def test_health_configuration_redaction_and_model_scan(
     assert health.headers["x-content-type-options"] == "nosniff"
     assert "default-src 'self'" in health.headers["content-security-policy"]
     assert "frame-ancestors 'none'" in health.headers["content-security-policy"]
+    assert "font-src 'self' data:" in health.headers["content-security-policy"]
     assert (
         "connect-src 'self' ws://127.0.0.1 wss://127.0.0.1"
         in health.headers["content-security-policy"]

@@ -126,6 +126,13 @@ function Invoke-Compose {
     Invoke-Wsl -Command ($script:ComposeCommand + $Arguments)
 }
 
+function Ensure-WslKeepAlive {
+    # WSL does not count systemd services when deciding whether a distribution is idle.
+    # Keep the distribution resident so its Docker-published localhost ports stay reachable.
+    $command = "if ! pgrep -f '[l]ocal-ai-doctor-wsl-keepalive' >/dev/null; then nohup bash -c 'exec -a local-ai-doctor-wsl-keepalive sleep infinity' >/dev/null 2>&1 & fi"
+    Invoke-Wsl -Command @("bash", "-lc", $command)
+}
+
 if (-not $Distribution) {
     $Distribution = Get-DotEnvValue -Path $EnvironmentFile -Name "WSL_DISTRIBUTION"
 }
@@ -177,26 +184,37 @@ $script:ComposeCommand = @(
     "--env-file", $EnvironmentWsl, "--file", $ComposeWsl
 )
 
-$healthProbe = "import os,urllib.request;u='http://127.0.0.1:'+os.environ.get('CONTAINER_LISTEN_PORT','6767')+'/api/v1/health';r=urllib.request.urlopen(u,timeout=3);print(r.read().decode())"
+$healthProbe = "import json,os,urllib.request;u='http://127.0.0.1:'+os.environ.get('CONTAINER_LISTEN_PORT','6767')+'/api/v1/health';r=urllib.request.urlopen(u,timeout=3);p=json.load(r);print(p);raise SystemExit(0 if r.status==200 and p.get('status')=='ok' else 1)"
+$frontendHealthProbe = @("wget", "--quiet", "--tries=1", "--output-document=-", "http://127.0.0.1:6969/healthz")
 $nvidiaProbe = "import torch;print({'torch':torch.__version__,'cuda_available':torch.cuda.is_available(),'device':torch.cuda.get_device_name(0) if torch.cuda.is_available() else None});raise SystemExit(0 if torch.cuda.is_available() else 1)"
 
 switch ($Action) {
     "ConfigCpu" { Invoke-Compose -Arguments @("--profile", "cpu", "config") }
     "ConfigNvidia" { Invoke-Compose -Arguments @("--profile", "nvidia", "config") }
-    "BuildCpu" { Invoke-Compose -Arguments @("--profile", "cpu", "build", "--pull", "app-cpu") }
-    "BuildNvidia" { Invoke-Compose -Arguments @("--profile", "nvidia", "build", "--pull", "app-nvidia") }
-    "UpCpu" { Invoke-Compose -Arguments @("--profile", "cpu", "up", "--build", "--detach", "--wait", "app-cpu") }
-    "UpNvidia" {
-        Invoke-Wsl -Command @("nvidia-smi")
-        Invoke-Compose -Arguments @("--profile", "nvidia", "up", "--build", "--detach", "--wait", "app-nvidia")
+    "BuildCpu" { Invoke-Compose -Arguments @("--profile", "cpu", "build", "--pull", "app-cpu", "frontend-cpu") }
+    "BuildNvidia" { Invoke-Compose -Arguments @("--profile", "nvidia", "build", "--pull", "app-nvidia", "frontend-nvidia") }
+    "UpCpu" {
+        Ensure-WslKeepAlive
+        Invoke-Compose -Arguments @("--profile", "cpu", "up", "--build", "--detach", "--wait", "frontend-cpu")
     }
-    "HealthCpu" { Invoke-Compose -Arguments @("--profile", "cpu", "exec", "-T", "app-cpu", "python", "-c", $healthProbe) }
-    "HealthNvidia" { Invoke-Compose -Arguments @("--profile", "nvidia", "exec", "-T", "app-nvidia", "python", "-c", $healthProbe) }
+    "UpNvidia" {
+        Ensure-WslKeepAlive
+        Invoke-Wsl -Command @("nvidia-smi")
+        Invoke-Compose -Arguments @("--profile", "nvidia", "up", "--build", "--detach", "--wait", "frontend-nvidia")
+    }
+    "HealthCpu" {
+        Invoke-Compose -Arguments @("--profile", "cpu", "exec", "-T", "app-cpu", "python", "-c", $healthProbe)
+        Invoke-Compose -Arguments (@("--profile", "cpu", "exec", "-T", "frontend-cpu") + $frontendHealthProbe)
+    }
+    "HealthNvidia" {
+        Invoke-Compose -Arguments @("--profile", "nvidia", "exec", "-T", "app-nvidia", "python", "-c", $healthProbe)
+        Invoke-Compose -Arguments (@("--profile", "nvidia", "exec", "-T", "frontend-nvidia") + $frontendHealthProbe)
+    }
     "NvidiaSmoke" { Invoke-Compose -Arguments @("--profile", "nvidia", "exec", "-T", "app-nvidia", "python", "-c", $nvidiaProbe) }
-    "LogsCpu" { Invoke-Compose -Arguments @("--profile", "cpu", "logs", "--follow", "--tail", "200", "app-cpu") }
-    "LogsNvidia" { Invoke-Compose -Arguments @("--profile", "nvidia", "logs", "--follow", "--tail", "200", "app-nvidia") }
-    "StopCpu" { Invoke-Compose -Arguments @("--profile", "cpu", "stop", "app-cpu") }
-    "StopNvidia" { Invoke-Compose -Arguments @("--profile", "nvidia", "stop", "app-nvidia") }
+    "LogsCpu" { Invoke-Compose -Arguments @("--profile", "cpu", "logs", "--follow", "--tail", "200", "app-cpu", "frontend-cpu") }
+    "LogsNvidia" { Invoke-Compose -Arguments @("--profile", "nvidia", "logs", "--follow", "--tail", "200", "app-nvidia", "frontend-nvidia") }
+    "StopCpu" { Invoke-Compose -Arguments @("--profile", "cpu", "stop", "frontend-cpu", "app-cpu") }
+    "StopNvidia" { Invoke-Compose -Arguments @("--profile", "nvidia", "stop", "frontend-nvidia", "app-nvidia") }
     "Down" { Invoke-Compose -Arguments @("--profile", "cpu", "--profile", "nvidia", "down", "--remove-orphans") }
     "Ps" { Invoke-Compose -Arguments @("--profile", "cpu", "--profile", "nvidia", "ps", "--all") }
     "Backup" { Invoke-Compose -Arguments @("--profile", "maintenance", "run", "--rm", "database-maintenance", "backup") }

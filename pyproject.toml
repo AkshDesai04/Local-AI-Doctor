@@ -80,5 +80,11 @@ warn_unused_configs = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["safetensors.*", "transformers.*", "torch.*", "sentence_transformers.*"]
+module = [
+  "PIL",
+  "av",
+  "transformers.*",
+  "torch.*",
+  "sentence_transformers.*",
+]
 ignore_missing_imports = true
