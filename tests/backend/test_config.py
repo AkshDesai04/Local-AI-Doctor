@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import json
 from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
 
+import local_ai_doctor.config as config_module
 from local_ai_doctor.config import (
     AppSettings,
     PathSettings,
@@ -132,3 +134,55 @@ def test_model_root_update_persists_in_selected_user_profile(tmp_path: Path) -> 
     )
     assert saved.paths.model_roots == (model_root.resolve(),)
     assert saved.runtime.cpu_threads == 3
+
+
+@pytest.mark.parametrize("replacement_errno", [errno.EACCES, errno.EPERM, errno.EBUSY])
+def test_model_root_update_falls_back_when_bind_mount_replacement_is_denied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_errno: int,
+) -> None:
+    model_root = tmp_path / "models"
+    model_root.mkdir()
+    user = tmp_path / "local.yaml"
+    user.write_text("schema_version: 1\n", encoding="utf-8")
+
+    def deny_replace(_source: Path, target: Path) -> None:
+        raise PermissionError(replacement_errno, "bind mount denied replacement", str(target))
+
+    monkeypatch.setattr(config_module.os, "replace", deny_replace)
+
+    persist_user_model_roots(user, ProfileName.NATIVE_WINDOWS, (model_root,))
+
+    saved = SettingsLoader().load(
+        user_path=user,
+        profile=ProfileName.NATIVE_WINDOWS,
+        environ={},
+    )
+    assert saved.paths.model_roots == (model_root.resolve(),)
+
+
+@pytest.mark.parametrize("chmod_errno", [errno.EACCES, errno.EPERM, errno.EROFS])
+def test_model_root_update_tolerates_unsupported_bind_mount_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    chmod_errno: int,
+) -> None:
+    model_root = tmp_path / "models"
+    model_root.mkdir()
+    user = tmp_path / "local.yaml"
+    user.write_text("schema_version: 1\n", encoding="utf-8")
+
+    def deny_chmod(path: Path, _mode: int) -> None:
+        raise PermissionError(chmod_errno, "bind mount does not support chmod", str(path))
+
+    monkeypatch.setattr(config_module.os, "chmod", deny_chmod)
+
+    persist_user_model_roots(user, ProfileName.NATIVE_WINDOWS, (model_root,))
+
+    saved = SettingsLoader().load(
+        user_path=user,
+        profile=ProfileName.NATIVE_WINDOWS,
+        environ={},
+    )
+    assert saved.paths.model_roots == (model_root.resolve(),)
