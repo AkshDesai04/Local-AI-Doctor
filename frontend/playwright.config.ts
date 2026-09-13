@@ -3,6 +3,11 @@ import { defineConfig, devices } from "@playwright/test";
 export default defineConfig({
   testDir: "./tests",
   fullyParallel: true,
+  // Starting every desktop/mobile project at once can saturate the Vite
+  // transform server on Windows and make page.goto() time out before a test
+  // reaches its assertions. Two workers still exercise projects in parallel
+  // while keeping the release gate deterministic on local and hosted runners.
+  workers: 2,
   retries: 0,
   reporter: "list",
   use: {

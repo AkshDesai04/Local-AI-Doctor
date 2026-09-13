@@ -2,7 +2,7 @@ name: CPU CI
 
 on:
   push:
-    branches: [dev]
+    branches: [dev, main]
   pull_request:
 
 permissions:
@@ -25,8 +25,8 @@ jobs:
           python -m pip install --no-deps -e .
       - name: Lint and type-check
         run: |
-          python -m ruff format --check backend tests
-          python -m ruff check backend tests
+          python -m ruff format --check backend tests desktop/backend_launcher.py
+          python -m ruff check backend tests desktop/backend_launcher.py
           python -m mypy backend
       - name: Run deterministic CPU fixture suite
         env:
@@ -51,3 +51,330 @@ jobs:
       - run: npm run build
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
+
+  desktop:
+    name: Desktop shell validation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: node scripts/release-version.mjs check
+      - run: npm ci --prefix desktop
+      - run: npm --prefix desktop test
+      - run: npm audit --package-lock-only --prefix desktop --audit-level=high
+
+  desktop-release:
+    name: Windows desktop release
+    if: github.event_name == 'push'
+    needs: [backend, frontend, desktop]
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            requirements-ml.lock
+            requirements-desktop.lock
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      - name: Resolve release identity
+        id: release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $baseVersion = (node scripts/release-version.mjs check).Trim()
+          switch ("${{ github.ref_name }}") {
+            "dev" {
+              $version = "$baseVersion-beta.${{ github.run_number }}"
+              $channel = "beta"
+            }
+            "main" {
+              $version = $baseVersion
+              $channel = "stable"
+            }
+            default { throw "Unsupported release branch: ${{ github.ref_name }}" }
+          }
+          $tag = "v$version"
+          $title = "Local AI Doctor $version"
+
+          $matchingTag = (git tag --list $tag).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Could not inspect release tags." }
+          $tagExists = $matchingTag -eq $tag
+          if ($tagExists) {
+            $tagCommit = (git rev-list -n 1 $tag).Trim()
+            if ($tagCommit -ne "${{ github.sha }}") {
+              throw "Release tag $tag already points to $tagCommit; bump VERSION before publishing this commit."
+            }
+            $tagExists = $true
+          }
+
+          "base_version=$baseVersion" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "title=$title" >> $env:GITHUB_OUTPUT
+          "channel=$channel" >> $env:GITHUB_OUTPUT
+          "tag_exists=$($tagExists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: Install desktop build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install pip==26.2.1
+          python -m pip install -r requirements.lock
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch==2.8.0+cpu torchvision==0.23.0+cpu
+          python -m pip install -r requirements-ml.lock
+          python -m pip install -r requirements-desktop.lock
+          python -m pip install --no-deps .
+          python -c "import torch; assert torch.__version__.endswith('+cpu'), torch.__version__; assert torch.version.cuda is None; assert not torch.cuda.is_available(); print(f'CPU desktop runtime: torch {torch.__version__}')"
+          npm ci --prefix frontend
+          npm ci --prefix desktop
+
+      - name: Apply channel version
+        if: steps.release.outputs.channel == 'beta'
+        shell: pwsh
+        run: npm --prefix desktop version "${{ steps.release.outputs.version }}" --no-git-tag-version --ignore-scripts
+
+      - name: Test desktop shell
+        shell: pwsh
+        run: npm --prefix desktop test
+
+      - name: Build Windows executable
+        shell: pwsh
+        run: npm --prefix desktop run dist
+
+      - name: Smoke-test packaged backend
+        shell: pwsh
+        run: ./desktop/scripts/smoke-backend.ps1
+
+      - name: Smoke-test Electron startup ordering
+        shell: pwsh
+        run: ./desktop/scripts/smoke-desktop.ps1
+
+      - name: Verify executable payload
+        id: artifact
+        shell: pwsh
+        run: |
+          $executables = @(Get-ChildItem -LiteralPath release -File -Filter "*.exe")
+          if ($executables.Count -ne 1) {
+            throw "Expected exactly one release/*.exe artifact, found $($executables.Count)."
+          }
+
+          $expectedName = "Local-AI-Doctor-${{ steps.release.outputs.version }}.exe"
+          if ($executables[0].Name -ne $expectedName) {
+            throw "Expected $expectedName, found $($executables[0].Name)."
+          }
+          if ($executables[0].Length -ge 2GB) {
+            throw "The executable is larger than GitHub's 2 GiB release-asset limit."
+          }
+
+          $digest = (Get-FileHash -LiteralPath $executables[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "path=$($executables[0].FullName)" >> $env:GITHUB_OUTPUT
+          "name=$($executables[0].Name)" >> $env:GITHUB_OUTPUT
+          "sha256=$digest" >> $env:GITHUB_OUTPUT
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ steps.release.outputs.tag }}"
+          $artifact = "${{ steps.artifact.outputs.path }}"
+          $artifactName = "${{ steps.artifact.outputs.name }}"
+          $channel = "${{ steps.release.outputs.channel }}"
+          $releaseTitle = "${{ steps.release.outputs.title }}"
+          $expectedDigest = "sha256:${{ steps.artifact.outputs.sha256 }}"
+          $expectedPrerelease = $channel -eq "beta"
+          $currentSha = "${{ github.sha }}".ToLowerInvariant()
+          $apiRoot = "https://api.github.com/repos/${{ github.repository }}"
+          $apiHeaders = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $releaseQuery = @'
+          query ReleaseByTag($owner: String!, $name: String!, $tag: String!) {
+            repository(owner: $owner, name: $name) {
+              release(tagName: $tag) { databaseId }
+            }
+          }
+          '@
+
+          function Get-ReleaseByTag {
+            $identityJson = gh api graphql `
+              -f "query=$releaseQuery" `
+              -F "owner=${{ github.repository_owner }}" `
+              -F "name=${{ github.event.repository.name }}" `
+              -F "tag=$tag"
+            if ($LASTEXITCODE -ne 0) { throw "Could not query release identity for $tag." }
+            $releaseId = ($identityJson | ConvertFrom-Json).data.repository.release.databaseId
+            if ($null -eq $releaseId) { return $null }
+            return Invoke-RestMethod -Method Get -Uri "$apiRoot/releases/$releaseId" -Headers $apiHeaders
+          }
+
+          $integrityPattern = '(?m)^[ \t]*<!-- local-ai-doctor-release-integrity:v1 commit=(?<commit>[0-9a-f]{40,64}) asset=(?<asset>[^ \r\n]+) digest=(?<digest>sha256:[0-9a-f]{64}) -->[ \t]*\r?$'
+          $integrityRemovalPattern = '(?m)^[ \t]*<!-- local-ai-doctor-release-integrity:v1\b.*?-->[ \t]*(?:\r?\n|\z)'
+          $expectedMarker = "<!-- local-ai-doctor-release-integrity:v1 commit=$currentSha asset=$artifactName digest=$expectedDigest -->"
+
+          function Assert-ReleaseTarget {
+            param([object] $Release)
+
+            $target = ([string] $Release.target_commitish).ToLowerInvariant()
+            if ($target -ne $currentSha) {
+              throw "Release $tag targets $($Release.target_commitish), not $currentSha. Bump VERSION before publishing this commit."
+            }
+          }
+
+          function Get-ReleaseIntegrity {
+            param([object] $Release)
+
+            $matches = [regex]::Matches([string] $Release.body, $integrityPattern)
+            if ($matches.Count -ne 1) {
+              throw "Release $tag must contain exactly one valid integrity marker; found $($matches.Count)."
+            }
+            return [pscustomobject] @{
+              Commit = $matches[0].Groups['commit'].Value.ToLowerInvariant()
+              Asset = $matches[0].Groups['asset'].Value
+              Digest = $matches[0].Groups['digest'].Value.ToLowerInvariant()
+            }
+          }
+
+          function Set-ReleaseIntegrity {
+            param([object] $Release)
+
+            $cleanBody = [regex]::Replace([string] $Release.body, $integrityRemovalPattern, '').TrimEnd()
+            $updatedBody = if ([string]::IsNullOrWhiteSpace($cleanBody)) {
+              $expectedMarker
+            } else {
+              "$cleanBody`n`n$expectedMarker"
+            }
+            $payload = @{ body = $updatedBody } | ConvertTo-Json -Compress
+            $null = Invoke-RestMethod `
+              -Method Patch `
+              -Uri "$apiRoot/releases/$($Release.id)" `
+              -Headers $apiHeaders `
+              -ContentType "application/json; charset=utf-8" `
+              -Body $payload
+          }
+
+          function Assert-ReleaseIntegrity {
+            param(
+              [object] $Release,
+              [string] $RequiredDigest
+            )
+
+            Assert-ReleaseTarget $Release
+            $assets = @($Release.assets)
+            $asset = @($assets | Where-Object { $_.name -eq $artifactName })
+            if ($assets.Count -ne 1 -or $asset.Count -ne 1) {
+              throw "Release $tag must contain exactly the expected executable asset."
+            }
+            $integrity = Get-ReleaseIntegrity $Release
+            if ($integrity.Commit -ne $currentSha -or $integrity.Asset -ne $artifactName) {
+              throw "Release $tag integrity marker does not match commit $currentSha and asset $artifactName."
+            }
+            $assetDigest = ([string] $asset[0].digest).ToLowerInvariant()
+            if ($integrity.Digest -ne $assetDigest) {
+              throw "Release $tag asset digest does not match its immutable integrity marker."
+            }
+            if ($RequiredDigest -and $integrity.Digest -ne $RequiredDigest.ToLowerInvariant()) {
+              throw "Release $tag integrity marker does not match the expected build digest."
+            }
+            return $integrity
+          }
+
+          $release = Get-ReleaseByTag
+          $releaseExists = $null -ne $release
+          $publishedAlready = $releaseExists -and -not $release.draft
+
+          if ($publishedAlready) {
+            if ([bool]$release.prerelease -ne $expectedPrerelease) {
+              throw "Published release $tag exists but does not match this immutable build."
+            }
+            $null = Assert-ReleaseIntegrity $release
+          } else {
+            if ($releaseExists) {
+              Assert-ReleaseTarget $release
+              foreach ($existingAsset in @($release.assets)) {
+                gh api --method DELETE "repos/${{ github.repository }}/releases/assets/$($existingAsset.id)"
+                if ($LASTEXITCODE -ne 0) { throw "Could not remove an incomplete draft asset." }
+              }
+              gh release upload $tag $artifact --repo "${{ github.repository }}"
+              if ($LASTEXITCODE -ne 0) { throw "Could not upload the executable to draft release $tag." }
+            } else {
+              $createArguments = @(
+                "release", "create", $tag, $artifact,
+                "--repo", "${{ github.repository }}",
+                "--target", "${{ github.sha }}",
+                "--title", $releaseTitle,
+                "--generate-notes",
+                "--draft"
+              )
+              if ($channel -eq "beta") { $createArguments += "--prerelease" }
+              & gh @createArguments
+              if ($LASTEXITCODE -ne 0) { throw "GitHub draft release creation failed." }
+            }
+
+            $draft = Get-ReleaseByTag
+            if ($null -eq $draft) { throw "Draft release $tag could not be retrieved after creation." }
+            Assert-ReleaseTarget $draft
+            $draftAsset = @($draft.assets) | Where-Object { $_.name -eq $artifactName }
+            if (@($draft.assets).Count -ne 1 -or @($draftAsset).Count -ne 1 -or $draftAsset[0].digest -ne $expectedDigest) {
+              throw "Draft release verification failed; it was left unpublished for recovery."
+            }
+            Set-ReleaseIntegrity $draft
+            $draft = Get-ReleaseByTag
+            if ($null -eq $draft) { throw "Draft release $tag could not be retrieved after recording integrity metadata." }
+            $null = Assert-ReleaseIntegrity $draft $expectedDigest
+
+            $prereleaseValue = $expectedPrerelease.ToString().ToLowerInvariant()
+            $editArguments = @(
+              "release", "edit", $tag,
+              "--repo", "${{ github.repository }}",
+              "--title", $releaseTitle,
+              "--draft=false",
+              "--prerelease=$prereleaseValue"
+            )
+            if ($channel -eq "stable") { $editArguments += "--latest" }
+            & gh @editArguments
+            if ($LASTEXITCODE -ne 0) { throw "The verified draft could not be published." }
+          }
+
+          $release = Get-ReleaseByTag
+          if ($null -eq $release) { throw "Published release $tag could not be retrieved." }
+          if ($release.draft -or [bool]$release.prerelease -ne $expectedPrerelease) {
+            throw "The GitHub release does not contain exactly the expected executable asset."
+          }
+          $finalIntegrity = Assert-ReleaseIntegrity $release
+          $publishedSha256 = $finalIntegrity.Digest -replace '^sha256:', ''
+
+          @(
+            "### $releaseTitle",
+            "",
+            "- Channel: $channel",
+            "- Tag: $tag",
+            "- Asset: $artifactName",
+            "- SHA-256: $publishedSha256"
+          ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY

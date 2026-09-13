@@ -9,6 +9,7 @@ Despite the name, this is a model-diagnostics tool. It is not a medical product 
 - Read-only discovery of configured model roots, SafeTensors header inspection, deterministic fingerprints, component diagnostics, and a machine-readable capability matrix.
 - Local causal and generic encoder-decoder generation through explicit reference loops, with cache reuse, cancellation, and replayable WebSocket events. Both paths have deterministic fixture coverage; individual real checkpoints still require validation.
 - Tiered token instrumentation: lightweight selected-token/timing fields at `off` and `basic`, and exact raw full-vocabulary likelihood, rank, entropy, perplexity, and bounded alternatives at `token`, `full`, and `expert`.
+- Bounded causal self-attention inspection for decoder-only generation at `full` and `expert`: selecting a generated token shows the rendered prompt, conversation history, and earlier generated tokens shaded by their mean post-softmax attention weight. This is an attention-allocation view, not proof of causal influence, grounding, or hallucination.
 - Teacher-forced prompt scoring for causal generation models.
 - SentenceTransformers text, image, video, and mixed-input embeddings where the selected checkpoint exposes those modalities, with truncation and re-normalization only for reviewed model-specific dimension contracts.
 - Persistent chats, runs, partial output, telemetry, attachments, portable chat-workspace import/export, branch-aware run replay, and confirmed terminal-run retention in SQLite and content-addressed storage.
@@ -96,6 +97,23 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000). The first scan reads metada
 
 For a frontend development loop, keep the backend on port 8000 and run `npm run dev` in `frontend/`; Vite serves the UI at [http://127.0.0.1:5173](http://127.0.0.1:5173).
 
+### Portable Windows desktop release
+
+The Electron desktop build starts its packaged backend on `127.0.0.1:6767`,
+waits for it to become healthy, waits another 16 seconds, and then opens the
+frontend on `127.0.0.1:6969`. Models remain external and are selected through
+the model-directory setting. Configuration, chats, uploads, and cache persist
+in Electron's user-data directory.
+
+Successful `dev` pushes publish beta prereleases and successful `main` pushes
+publish stable releases. Each release has one uploaded asset,
+`Local-AI-Doctor-<version>.exe`; GitHub's automatic source-code links cannot be
+removed. The GitHub-built EXE contains the CPU runtime because the pinned CUDA
+wheel alone exceeds GitHub's 2 GiB asset limit. Use the native or Docker NVIDIA
+workflow for CUDA. See [desktop/README.md](desktop/README.md) for local build
+instructions. The current executable is unsigned, so Windows SmartScreen may
+show a warning.
+
 ## Native WSL quick start
 
 Use a Python 3.12 environment inside the selected WSL2 distribution. A Windows model directory is normally visible through `/mnt/<drive>/...`; put that Linux-visible path only in the ignored `config/local.yaml`.
@@ -158,7 +176,7 @@ Configuration also supports `LAD_` environment variables with `__` between neste
 
 1. Inspect the model registry and its diagnostics, context candidates, and capability states.
 2. Load only one model at a time. Auto selection prefers the first usable CUDA device and otherwise uses CPU when fallback is permitted.
-3. For generation, create or select a chat, set sampling and instrumentation controls, then stream the response. Nerd Mode links visible token boundaries to probability and timing views.
+3. For generation, create or select a chat, set sampling and instrumentation controls, then stream the response. Nerd Mode links visible token boundaries to probability and timing views. A new decoder-only run at `full` or `expert` also lets you select a token and inspect its bounded context-attention map.
 4. For an embedding model, open the Embeddings workspace, provide text or supported uploaded media, choose an advertised dimension, and compare normalized vectors.
 5. Export a generation run as JSON, replayable JSONL events, or token CSV. The API also exports/imports a path-free chat workspace and can replay a completed generation as a sibling assistant branch using its recorded settings.
 

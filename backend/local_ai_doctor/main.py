@@ -41,6 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import __version__
 from .api.body_limit import RequestBodyLimitMiddleware
 from .api.schemas import (
     ChatCreate,
@@ -455,7 +456,7 @@ def create_app(
 
     app = FastAPI(
         title="Local AI Doctor",
-        version="0.1.0",
+        version=__version__,
         docs_url="/api/docs"
         if effective_settings.active_profile is ProfileName.DEVELOPMENT
         else None,

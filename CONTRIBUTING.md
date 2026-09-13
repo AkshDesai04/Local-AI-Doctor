@@ -55,6 +55,19 @@ The checked-in [CPU CI workflow](.github/workflows/ci.yml) runs the backend chec
 
 Docker must be invoked through the selected WSL2 distribution, never through Windows Docker commands. Follow [docs/deployment.md](docs/deployment.md) for Compose validation and image checks.
 
+## Desktop release versions
+
+`VERSION` is the release-version source of truth. Keep it synchronized with the Python, frontend, and desktop manifests through the checked-in helper:
+
+```powershell
+node scripts/release-version.mjs check
+node scripts/release-version.mjs patch
+```
+
+Use a patch bump for an ordinary completed feature or fix. Use `minor` or `major` in place of `patch` only when the project owner explicitly requests that release level. Commit the version bump with the feature; do not edit one manifest independently.
+
+After backend, frontend, and desktop validation succeeds, every `dev` push produces a GitHub prerelease tagged `vX.Y.Z-beta.<workflow-run>`. Rerunning that workflow repairs or confirms the same release instead of creating another one. A `main` push produces the immutable stable `vX.Y.Z` release, so merging the tested `dev` revision promotes the same base version. The GitHub build deliberately bundles CPU PyTorch because a CUDA runtime exceeds GitHub's 2 GiB per-asset limit; users can still run the repository's CUDA Docker profile. The workflow uploads exactly one custom release asset: `Local-AI-Doctor-<version>.exe`. GitHub additionally displays its unavoidable auto-generated source-code links.
+
 ## Design rules
 
 - Keep configuration in `AppSettings`; do not read new `LAD_` variables from business logic.

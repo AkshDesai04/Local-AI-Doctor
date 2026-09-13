@@ -1,0 +1,2 @@
+# Install after requirements-ml.lock when building the Windows desktop executable.
+pyinstaller==6.22.3

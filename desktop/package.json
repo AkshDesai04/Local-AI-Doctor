@@ -1,0 +1,61 @@
+{
+  "name": "local-ai-doctor-desktop",
+  "version": "0.1.1",
+  "private": true,
+  "description": "Windows desktop distribution for Local AI Doctor",
+  "main": "main.cjs",
+  "author": "Aksh Desai",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.cjs",
+    "build:frontend": "npm --prefix ../frontend run build",
+    "build:backend": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-backend.ps1",
+    "build:payload": "npm run build:frontend && npm run build:backend",
+    "dist": "npm run build:payload && electron-builder --win portable --x64 --publish never && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-packaged-layout.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/finalize-release.ps1",
+    "dist:win": "npm run dist"
+  },
+  "devDependencies": {
+    "electron": "44.3.0",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "dev.localaidoctor.desktop",
+    "productName": "Local AI Doctor",
+    "asar": true,
+    "npmRebuild": false,
+    "directories": {
+      "output": "../release"
+    },
+    "files": [
+      "main.cjs",
+      "lib/**/*.cjs",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../frontend/dist",
+        "to": "frontend"
+      },
+      {
+        "from": "build/backend/local-ai-doctor-backend",
+        "to": "backend/local-ai-doctor-backend"
+      },
+      {
+        "from": "../config/default.yaml",
+        "to": "config/default.yaml"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "Local-AI-Doctor-${version}.exe"
+    }
+  }
+}

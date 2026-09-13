@@ -5,7 +5,13 @@ hardware, read configuration, open databases, or import heavyweight ML
 runtimes. Applications should compose those services explicitly.
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from .errors import ErrorCode, WorkbenchError
 
 __all__ = ["ErrorCode", "WorkbenchError"]
-__version__ = "0.1.0"
+
+try:
+    __version__ = version("local-ai-doctor")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
