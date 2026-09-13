@@ -4,6 +4,8 @@ ARG PYTHON_IMAGE=python:3.12.10-slim-bookworm
 ARG NODE_IMAGE=node:22.14.0-bookworm-slim
 
 FROM ${NODE_IMAGE} AS frontend-builder
+ARG VITE_API_BASE=http://127.0.0.1:6767/api/v1
+ARG VITE_WS_BASE=ws://127.0.0.1:6767
 WORKDIR /build/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm \
@@ -114,7 +116,7 @@ ENV PYTHONUNBUFFERED=1 \
     TOKENIZERS_PARALLELISM=false \
     FRONTEND_DIR=/app/frontend/dist \
     CONTAINER_LISTEN_HOST=0.0.0.0 \
-    CONTAINER_LISTEN_PORT=8000 \
+    CONTAINER_LISTEN_PORT=6767 \
     UVICORN_WORKERS=1 \
     SHUTDOWN_GRACE_SECONDS=20
 RUN apt-get update \
@@ -143,10 +145,10 @@ RUN chmod 0555 /app/docker/entrypoint.sh \
 
 ENTRYPOINT ["/app/docker/entrypoint.sh"]
 CMD ["serve"]
-EXPOSE 8000
+EXPOSE 6767
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
-    CMD ["python", "-c", "import os,urllib.request; u='http://127.0.0.1:'+os.environ.get('CONTAINER_LISTEN_PORT','8000')+'/api/v1/health'; r=urllib.request.urlopen(u,timeout=3); raise SystemExit(0 if r.status==200 else 1)"]
+    CMD ["python", "-c", "import os,urllib.request; u='http://127.0.0.1:'+os.environ.get('CONTAINER_LISTEN_PORT','6767')+'/api/v1/health'; r=urllib.request.urlopen(u,timeout=3); raise SystemExit(0 if r.status==200 else 1)"]
 
 FROM runtime-base AS cpu
 COPY --from=cpu-python /usr/local/ /usr/local/

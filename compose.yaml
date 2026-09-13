@@ -49,8 +49,8 @@ x-app-environment: &app-environment
   LAD_CONFIG: /app/config/default.yaml
   LAD_USER_CONFIG: /app/config/local.yaml
   LAD_SERVER__HOST: 127.0.0.1
-  LAD_SERVER__PORT: ${CONTAINER_PORT:-8000}
-  LAD_SERVER__ALLOWED_ORIGINS: '["http://127.0.0.1:${HOST_PORT:-8000}","http://localhost:${HOST_PORT:-8000}"]'
+  LAD_SERVER__PORT: 6767
+  LAD_SERVER__ALLOWED_ORIGINS: '["http://127.0.0.1:6969","http://localhost:6969","http://127.0.0.1:6767","http://localhost:6767"]'
   LAD_PATHS__MODEL_ROOTS: '["/models"]'
   LAD_PATHS__DATABASE: /data/database/workbench.sqlite3
   LAD_PATHS__UPLOADS: /data/uploads
@@ -62,7 +62,7 @@ x-app-environment: &app-environment
   LAD_RUNTIME__CPU_THREADS: ${CPU_THREADS:-8}
   LAD_WORKERS__COUNT: ${MODEL_WORKERS:-1}
   CONTAINER_LISTEN_HOST: 0.0.0.0
-  CONTAINER_LISTEN_PORT: ${CONTAINER_PORT:-8000}
+  CONTAINER_LISTEN_PORT: 6767
   UVICORN_WORKERS: ${UVICORN_WORKERS:-1}
   SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS:-20}
   HF_HOME: /data/cache/huggingface
@@ -101,9 +101,16 @@ x-app: &app
   stop_grace_period: ${STOP_GRACE_PERIOD:-30s}
   volumes: *persistent-mounts
   ports:
-    - name: http
-      target: ${CONTAINER_PORT:-8000}
-      published: "${HOST_PORT:-8000}"
+    - name: frontend
+      target: 6767
+      published: "6969"
+      host_ip: 127.0.0.1
+      protocol: tcp
+      app_protocol: http
+      mode: host
+    - name: backend
+      target: 6767
+      published: "6767"
       host_ip: 127.0.0.1
       protocol: tcp
       app_protocol: http
@@ -120,7 +127,7 @@ x-app: &app
       - -c
       - >-
         import os,urllib.request;
-        u='http://127.0.0.1:'+os.environ.get('CONTAINER_LISTEN_PORT','8000')+'/api/v1/health';
+        u='http://127.0.0.1:'+os.environ.get('CONTAINER_LISTEN_PORT','6767')+'/api/v1/health';
         r=urllib.request.urlopen(u,timeout=3);
         raise SystemExit(0 if r.status==200 else 1)
     interval: 15s

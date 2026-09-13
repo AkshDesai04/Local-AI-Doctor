@@ -122,6 +122,10 @@ Docker operations are intentionally routed through WSL2. Copy `.env.example` to 
 .\scripts\wsl-docker.ps1 -Action HealthCpu
 ```
 
+The container ports are permanent and loopback-only: open the frontend at
+[http://127.0.0.1:6969](http://127.0.0.1:6969), while the REST API and WebSocket
+backend use [http://127.0.0.1:6767/api/v1](http://127.0.0.1:6767/api/v1).
+
 NVIDIA startup uses `UpNvidia` followed by `NvidiaSmoke` and `HealthNvidia`. The complete setup, backup, restore, update, and troubleshooting procedures are in [WSL2 container deployment](docs/deployment.md).
 
 ## Command line

@@ -89,12 +89,14 @@ The equivalent raw commands, when PowerShell is already in the repository root, 
 ```powershell
 wsl.exe --distribution $Distro --user $WslUser -- docker compose --profile cpu build --pull app-cpu
 wsl.exe --distribution $Distro --user $WslUser -- docker compose --profile cpu up --detach --wait app-cpu
-wsl.exe --distribution $Distro --user $WslUser -- docker compose --profile cpu exec -T app-cpu python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health').read().decode())"
+wsl.exe --distribution $Distro --user $WslUser -- docker compose --profile cpu exec -T app-cpu python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:6767/api/v1/health').read().decode())"
 ```
 
-Open `http://127.0.0.1:<HOST_PORT>`. Compose always publishes to host loopback even though Uvicorn
-listens on the container's private network interface. External access requires a separately reviewed,
-authenticated configuration and is not enabled by this deployment.
+Open the frontend at `http://127.0.0.1:6969`. The REST API and WebSocket backend are fixed at
+`http://127.0.0.1:6767`; its health endpoint is `http://127.0.0.1:6767/api/v1/health`. The production
+frontend is baked into the ASGI image, and both loopback publications reach its internal port 6767.
+The browser bundle uses port 6767 for API and WebSocket traffic. External access requires a separately
+reviewed, authenticated configuration and is not enabled by this deployment.
 
 ## NVIDIA build and startup
 
@@ -117,8 +119,8 @@ The NVIDIA profile is structurally valid without a GPU, but startup requires all
 `NvidiaSmoke` verifies `torch.cuda.is_available()` and prints the selected device. It does not load a
 model. GPU selection can be narrowed with `NVIDIA_VISIBLE_DEVICES` in the ignored `.env`.
 
-Do not run CPU and NVIDIA services simultaneously with the same host port. Stop one profile before
-starting the other.
+Do not run the CPU and NVIDIA services simultaneously because both profiles reserve the permanent
+host ports 6969 and 6767. Stop one profile before starting the other.
 
 ## Development loop
 

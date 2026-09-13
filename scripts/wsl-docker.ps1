@@ -177,7 +177,7 @@ $script:ComposeCommand = @(
     "--env-file", $EnvironmentWsl, "--file", $ComposeWsl
 )
 
-$healthProbe = "import os,urllib.request;u='http://127.0.0.1:'+os.environ.get('CONTAINER_LISTEN_PORT','8000')+'/api/v1/health';r=urllib.request.urlopen(u,timeout=3);print(r.read().decode())"
+$healthProbe = "import os,urllib.request;u='http://127.0.0.1:'+os.environ.get('CONTAINER_LISTEN_PORT','6767')+'/api/v1/health';r=urllib.request.urlopen(u,timeout=3);print(r.read().decode())"
 $nvidiaProbe = "import torch;print({'torch':torch.__version__,'cuda_available':torch.cuda.is_available(),'device':torch.cuda.get_device_name(0) if torch.cuda.is_available() else None});raise SystemExit(0 if torch.cuda.is_available() else 1)"
 
 switch ($Action) {
