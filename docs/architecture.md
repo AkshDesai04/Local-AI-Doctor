@@ -90,8 +90,8 @@ A changed fingerprint represents a new model identity, but an unchanged quick fi
 2. Once admitted, it resolves the requested hardware selection, then creates user and pending assistant messages and persists a queued run with its reproducibility snapshot.
 3. A background task emits `run_created`, loads or reuses the selected model, and changes the run to `running`.
 4. The worker renders the complete branch with the tokenizer chat template and `add_generation_prompt=true`, or a deterministic plain-text fallback when no template is available, then tokenizes with `add_special_tokens=false`.
-5. For a causal model, one prompt prefill produces token-0 logits and a KV cache. For an encoder-decoder model, the source is encoded once, the decoder starts from a resolved decoder-start token, and both encoder outputs and decoder cache are reused. Each selected token produces the following distribution without an unnecessary final forward pass.
-6. The application sampler applies penalties, temperature, and filters in a fixed order. Every token event carries chosen-token/sampler fields, timing, and emitted reasoning classification; `token`, `full`, and `expert` additionally carry exact raw likelihood/rank, uncertainty/perplexity, and bounded distribution views.
+5. For a causal model, prompt prefill produces token-0 logits and a KV cache. During compatible `full`/`expert` attention capture, the worker prefills the prompt prefix and then runs its final token as the single eager query that predicts token 0, avoiding a quadratic full-prompt attention result. For an encoder-decoder model, the source is encoded once, the decoder starts from a resolved decoder-start token, and both encoder outputs and decoder cache are reused. Each selected token produces the following distribution without an unnecessary final forward pass.
+6. The application sampler applies penalties, temperature, and filters in a fixed order. Every token event carries chosen-token/sampler fields, timing, and emitted reasoning classification; `token`, `full`, and `expert` additionally carry exact raw likelihood/rank, uncertainty/perplexity, and bounded distribution views. On supported causal decoders, `full` and `expert` also reduce each generated token's post-softmax attention rows to a mean across captured layers/heads, retain the top 128 source positions with explicit omitted mass, and attach the complete rendered-prompt token catalogue to token 0.
 7. Subject to persistence settings and per-run event/byte limits, token rows go to the telemetry writer and raw protocol events are persisted before fan-out. Live delivery continues when token persistence is disabled or truncated. Partial message text is checkpointed every eight tokens and at the terminal event.
 8. Completion, cancellation, or failure finalizes both message and run state while preserving partial data.
 
@@ -101,7 +101,7 @@ Generation, embeddings, and prompt scoring share one FIFO execution lease. Capac
 
 `POST /runs/{run_id}/replay` accepts only a completed generation whose model is still registered with the recorded fingerprint. It reconstructs that message's branch lineage, creates a sibling assistant branch, links `parent_run_id`, and schedules a new forward pass with the recorded seed, sampling, instrumentation, and deterministic-mode settings. Replay is reproducibility assistance, not a promise of byte-identical output across changed software, device, dtype, kernels, tokenizer files, or environment.
 
-Chat workspace export is a strict, versioned, path-free JSON document. It contains chat metadata, branched messages, runs, token rows, and bounded token alternatives. Import validates identifiers and parent graphs, remaps all message/run IDs, and converts non-terminal snapshots to failed records. Attachments, upload bytes, raw protocol events, environment/phase rows, and embedding vectors are outside the version-1 portable document.
+Chat workspace export is a strict, versioned, path-free JSON document. It contains chat metadata, branched messages, runs, token rows, bounded token alternatives, and any persisted bounded attention attribution. Import validates identifiers and parent graphs, remaps all message/run IDs, and converts non-terminal snapshots to failed records. Attachments, upload bytes, raw protocol events, environment/phase rows, and embedding vectors are outside the version-1 portable document.
 
 ## Event ordering and recovery
 
@@ -117,7 +117,7 @@ Run metadata, input previews, norms, and value statistics are persisted. Full ve
 
 ## Persistence model
 
-SQLite tables cover model metadata/capabilities, chats and branched messages, content-addressed attachments, inference runs, environment and phase extension tables, token events and alternatives, router traces/aggregates, embedding runs/inputs, and raw protocol events. Foreign-key cascades remove dependent chat/run telemetry; model deletion uses `SET NULL` for historical runs. Uploaded files are not stored as database blobs.
+SQLite tables cover model metadata/capabilities, chats and branched messages, content-addressed attachments, inference runs, environment and phase extension tables, token events (including optional bounded attention attribution) and alternatives, router traces/aggregates, embedding runs/inputs, and raw protocol events. Foreign-key cascades remove dependent chat/run telemetry; model deletion uses `SET NULL` for historical runs. Uploaded files are not stored as database blobs.
 
 One WAL-mode connection and a write lock serialize transactions. Token events and alternatives enter a bounded async writer and are grouped by SQL statement. Terminal protocol persistence explicitly flushes that writer first. This prioritizes durable ordering over maximum write throughput.
 

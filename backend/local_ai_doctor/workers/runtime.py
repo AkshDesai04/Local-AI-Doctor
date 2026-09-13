@@ -29,6 +29,13 @@ from ..reasoning import (
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 
+# Persisting every attention weight for every generated token grows as
+# O(generated_tokens * context_tokens).  The complete prompt-token catalogue is
+# emitted once, while each generated token retains the highest-weight source
+# positions and the exact amount of attention mass omitted by this bound.
+_ATTENTION_SOURCE_LIMIT = 128
+
+
 def _send(output: Queue[Any], kind: str, **values: Any) -> None:
     output.put({"kind": kind, **values})
 
@@ -43,6 +50,149 @@ def _torch_dtype(torch: Any, name: str) -> Any:
 
 def _escaped_bytes(value: str) -> str:
     return "".join(f"\\x{byte:02x}" for byte in value.encode("utf-8", errors="surrogatepass"))
+
+
+def _token_source(
+    tokenizer: Any,
+    token_id: int,
+    context_index: int,
+    *,
+    source_kind: str,
+    generated_token_index: int | None = None,
+    display_text: str | None = None,
+) -> dict[str, Any]:
+    """Build a serializable context-position descriptor without guessing roles.
+
+    Arbitrary tokenizer chat templates can rewrite and inject text, so a token
+    in the rendered prompt cannot in general be mapped back to one message
+    without lying.  Absolute context positions remain exact and cover system,
+    history, current-prompt, and template/control tokens alike.
+    """
+
+    piece = str(tokenizer.convert_ids_to_tokens(token_id))
+    if display_text is None:
+        decoded = tokenizer.decode(
+            [token_id],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        display_text = str(decoded)
+    source = {
+        "context_index": context_index,
+        "token_id": token_id,
+        "piece": piece,
+        "display_text": display_text,
+        "source_kind": source_kind,
+    }
+    if generated_token_index is not None:
+        source["generated_token_index"] = generated_token_index
+    return source
+
+
+def _mean_causal_self_attention(
+    torch: Any,
+    attentions: Any,
+    context_tokens: Sequence[Mapping[str, Any]],
+    *,
+    source_limit: int = _ATTENTION_SOURCE_LIMIT,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Aggregate the model's exact attention rows for one next-token decision.
+
+    Each available layer/head contributes its post-softmax row at the final
+    query position.  Their arithmetic mean is normalized for floating-point
+    drift.  These values are model-internal attention allocations, *not* causal
+    effects or probabilities that a source token caused the sampled token.
+    """
+
+    if not isinstance(attentions, (list, tuple)) or not attentions:
+        return None, "the model did not return causal self-attention tensors"
+    if not context_tokens:
+        return None, "the attention query has no source-token catalogue"
+
+    context_count = len(context_tokens)
+    accumulated: Any | None = None
+    captured_layers: list[int] = []
+    heads_per_layer: list[int] = []
+    for layer_index, layer_attention in enumerate(attentions):
+        if layer_attention is None:
+            continue
+        shape = [int(dimension) for dimension in getattr(layer_attention, "shape", ())]
+        if len(shape) != 4 or shape[0] < 1 or shape[1] < 1 or shape[2] < 1:
+            continue
+        key_count = shape[3]
+        if key_count < 1 or key_count > context_count:
+            return (
+                None,
+                "a returned attention tensor could not be aligned to the causal context",
+            )
+        # Sliding-window layers may expose only a suffix of the full context.
+        # Left-padding with exact zeros aligns those keys to absolute positions.
+        rows = layer_attention[0, :, -1, :].float()
+        layer_sum = rows.sum(dim=0)
+        if key_count < context_count:
+            layer_sum = torch.cat(
+                [
+                    torch.zeros(
+                        context_count - key_count,
+                        device=layer_sum.device,
+                        dtype=layer_sum.dtype,
+                    ),
+                    layer_sum,
+                ],
+                dim=0,
+            )
+        accumulated = layer_sum if accumulated is None else accumulated + layer_sum
+        captured_layers.append(layer_index)
+        heads_per_layer.append(shape[1])
+
+    total_head_rows = sum(heads_per_layer)
+    if accumulated is None or total_head_rows == 0:
+        return None, "the model returned no usable causal self-attention rows"
+    weights = accumulated / total_head_rows
+    # Attention is non-negative by construction. Clamp only minute numerical
+    # underflow before normalizing the arithmetic mean back to unit mass.
+    weights = torch.clamp(weights, min=0.0)
+    total = float(weights.sum().item())
+    if not math.isfinite(total) or total <= 0.0:
+        return None, "the model returned non-finite or empty attention weights"
+    weights = weights / total
+    host_weights = [float(value) for value in weights.detach().cpu().tolist()]
+    retained_indices = sorted(
+        sorted(range(context_count), key=lambda index: (-host_weights[index], index))[
+            : min(source_limit, context_count)
+        ]
+    )
+    retained_weight = min(
+        1.0,
+        max(0.0, sum(host_weights[index] for index in retained_indices)),
+    )
+    sources = [
+        {**dict(context_tokens[index]), "weight": host_weights[index]} for index in retained_indices
+    ]
+    return (
+        {
+            "method": "mean_causal_self_attention",
+            "aggregation": "arithmetic_mean_over_layers_and_heads",
+            "semantics": "attention_weights_not_causal_contributions",
+            "scope": "decoder_step_context_attention_independent_of_sampled_candidate",
+            "query": "final_sequence_position_predicting_selected_token",
+            "attention_implementation": "eager",
+            "normalized": True,
+            "captured_layers": captured_layers,
+            "captured_heads": (
+                heads_per_layer[0] if len(set(heads_per_layer)) == 1 else max(heads_per_layer)
+            ),
+            "total_head_rows": total_head_rows,
+            "heads_per_layer": heads_per_layer,
+            "total_source_count": context_count,
+            "retained_source_count": len(sources),
+            "retained_weight": retained_weight,
+            "omitted_weight": max(0.0, 1.0 - retained_weight),
+            "source_limit": source_limit,
+            "source_tokens": sources,
+        },
+        None,
+    )
 
 
 def _safe_error(exc: BaseException) -> dict[str, Any]:
@@ -294,6 +444,7 @@ class WorkerRuntime:
         self.decoder_start_token_id: int | None = None
         self.decoder_start_token_source: str | None = None
         self.decoder_start_warning: str | None = None
+        self.loaded_attention_implementation: str | None = None
 
     def run(self) -> None:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -325,6 +476,10 @@ class WorkerRuntime:
                 else:
                     raise ValueError(f"unknown worker operation: {operation!r}")
             except BaseException as exc:  # worker boundary must report model/runtime crashes
+                # A full-instrumentation run may temporarily select eager
+                # attention so Transformers can return attention probabilities.
+                # Never let a failed request silently change later run kernels.
+                self._restore_attention_implementation()
                 error = _safe_error(exc)
                 if command.get("run_id"):
                     _send(
@@ -392,6 +547,10 @@ class WorkerRuntime:
             )
             self.model.eval()
             self.model.to(self.device)
+            configured_attention = getattr(self.model.config, "_attn_implementation", None)
+            self.loaded_attention_implementation = (
+                str(configured_attention) if configured_attention is not None else None
+            )
             if task == "encoder_decoder_generation":
                 try:
                     (
@@ -443,13 +602,14 @@ class WorkerRuntime:
         unloaded = self.model_info["id"] if self.model_info else None
         memory_before: dict[str, Any] = {}
         torch_module: Any | None = None
-        try:
-            import torch
+        if self.model is not None or self.sentence_model is not None or self.model_info is not None:
+            try:
+                import torch
 
-            torch_module = torch
-            memory_before = self._memory_snapshot(torch)
-        except ImportError:
-            pass
+                torch_module = torch
+                memory_before = self._memory_snapshot(torch)
+            except ImportError:
+                pass
         self.model = None
         self.tokenizer = None
         self.sentence_model = None
@@ -457,6 +617,7 @@ class WorkerRuntime:
         self.decoder_start_token_id = None
         self.decoder_start_token_source = None
         self.decoder_start_warning = None
+        self.loaded_attention_implementation = None
         gc.collect()
         try:
             if torch_module is not None and torch_module.cuda.is_available():
@@ -500,6 +661,28 @@ class WorkerRuntime:
             event_type=event_type,
             payload=dict(payload),
         )
+
+    def _select_attention_implementation(self, implementation: str) -> bool:
+        """Best-effort dynamic attention-kernel selection for instrumentation."""
+
+        if self.model is None:
+            return False
+        current = getattr(getattr(self.model, "config", None), "_attn_implementation", None)
+        if current == implementation:
+            return True
+        setter = getattr(self.model, "set_attn_implementation", None)
+        if not callable(setter):
+            return False
+        with contextlib.suppress(Exception):
+            setter(implementation)
+        return (
+            getattr(getattr(self.model, "config", None), "_attn_implementation", None)
+            == implementation
+        )
+
+    def _restore_attention_implementation(self) -> None:
+        if self.loaded_attention_implementation is not None:
+            self._select_attention_implementation(self.loaded_attention_implementation)
 
     @staticmethod
     def _apply_penalties(
@@ -574,13 +757,49 @@ class WorkerRuntime:
         input_ids: Any,
         attention_mask: Any,
         past_key_values: Any = None,
-    ) -> tuple[Any, Any]:
+        *,
+        capture_attention: bool = False,
+    ) -> tuple[Any, Any, Any]:
+        captured_attentions: list[Any | None] = []
+        hook_handles: list[Any] = []
+        if capture_attention:
+            # Transformers 4.57 no longer propagates per-layer attentions into
+            # BaseModelOutput for several decoder architectures (including
+            # Qwen2), even though each eager self-attention module still
+            # returns its exact post-softmax weights. Capture those module
+            # outputs directly and remove every hook before returning.
+            named_modules = getattr(self.model, "named_modules", None)
+            modules = (
+                [
+                    module
+                    for name, module in named_modules()
+                    if name.rsplit(".", 1)[-1] == "self_attn"
+                ]
+                if callable(named_modules)
+                else []
+            )
+            captured_attentions = [None] * len(modules)
+
+            def capture_layer(layer_index: int) -> Any:
+                def hook(_module: Any, _inputs: Any, output: Any) -> None:
+                    if isinstance(output, (list, tuple)) and len(output) > 1:
+                        candidate = output[1]
+                        if getattr(candidate, "shape", None) is not None:
+                            captured_attentions[layer_index] = candidate
+
+                return hook
+
+            hook_handles = [
+                module.register_forward_hook(capture_layer(layer_index))
+                for layer_index, module in enumerate(modules)
+            ]
         kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "past_key_values": past_key_values,
             "use_cache": True,
             "return_dict": True,
+            "output_attentions": capture_attention,
         }
         # Causal decoder models can avoid materializing prompt-length vocabulary
         # logits by applying the LM head only to the final hidden state.
@@ -591,14 +810,36 @@ class WorkerRuntime:
             and head is not None
             and not getattr(self.model.config, "is_encoder_decoder", False)
         ):
-            outputs = body(**kwargs)
-            logits = head(outputs.last_hidden_state[:, -1:, :])
-            return logits[:, -1, :], outputs.past_key_values
+            try:
+                outputs = body(**kwargs)
+                logits = head(outputs.last_hidden_state[:, -1:, :])
+                hook_attentions = tuple(captured_attentions)
+                attentions = (
+                    hook_attentions
+                    if any(item is not None for item in hook_attentions)
+                    else getattr(outputs, "attentions", None)
+                )
+                return logits[:, -1, :], outputs.past_key_values, attentions
+            finally:
+                for handle in hook_handles:
+                    handle.remove()
         try:
-            outputs = self.model(**kwargs, logits_to_keep=1)
-        except TypeError:
-            outputs = self.model(**kwargs)
-        return outputs.logits[:, -1, :], outputs.past_key_values
+            try:
+                outputs = self.model(**kwargs, logits_to_keep=1)
+            except TypeError:
+                captured_attentions[:] = [None] * len(captured_attentions)
+                outputs = self.model(**kwargs)
+            model_attentions = getattr(outputs, "attentions", None)
+            hook_attentions = tuple(captured_attentions)
+            attentions = (
+                hook_attentions
+                if any(item is not None for item in hook_attentions)
+                else model_attentions
+            )
+            return outputs.logits[:, -1, :], outputs.past_key_values, attentions
+        finally:
+            for handle in hook_handles:
+                handle.remove()
 
     def _encode_source(self, input_ids: Any, attention_mask: Any) -> Any:
         """Run an encoder exactly once for a cached encoder-decoder generation."""
@@ -620,7 +861,7 @@ class WorkerRuntime:
         encoder_outputs: Any,
         encoder_attention_mask: Any,
         past_key_values: Any = None,
-    ) -> tuple[Any, Any]:
+    ) -> tuple[Any, Any, Any]:
         """Run one decoder step while reusing encoder outputs and decoder cache."""
 
         outputs = self.model(
@@ -632,9 +873,15 @@ class WorkerRuntime:
             use_cache=True,
             return_dict=True,
         )
-        return outputs.logits[:, -1, :], outputs.past_key_values
+        return outputs.logits[:, -1, :], outputs.past_key_values, None
 
     def _generate(self, command: Mapping[str, Any]) -> None:
+        try:
+            self._generate_impl(command)
+        finally:
+            self._restore_attention_implementation()
+
+    def _generate_impl(self, command: Mapping[str, Any]) -> None:
         if self.model is None or self.tokenizer is None or self.model_info is None:
             raise RuntimeError("no generation model is loaded")
         import torch
@@ -646,6 +893,41 @@ class WorkerRuntime:
         detailed_metrics = instrumentation in {"token", "full", "expert"}
         synchronize = instrumentation in {"full", "expert"} and self.device.startswith("cuda")
         encoder_decoder = self.model_info.get("task") == "encoder_decoder_generation"
+        attention_capture_requested = instrumentation in {"full", "expert"}
+        attention_capture_active = False
+        attention_capture_warning_emitted = False
+        captured_attention_token_count = 0
+        if attention_capture_requested and not encoder_decoder:
+            attention_capture_active = self._select_attention_implementation("eager")
+            if not attention_capture_active:
+                self._emit_run(
+                    run_id,
+                    "warning",
+                    {
+                        "code": "attention_capture_unavailable",
+                        "message": (
+                            "This model cannot switch to an eager attention implementation, "
+                            "so exact attention weights are unavailable for this run."
+                        ),
+                    },
+                )
+                attention_capture_warning_emitted = True
+        elif attention_capture_requested:
+            self._emit_run(
+                run_id,
+                "warning",
+                {
+                    "code": "attention_capture_unavailable",
+                    "message": (
+                        "Encoder-decoder attention is split between decoder self-attention "
+                        "and encoder cross-attention; this causal attribution view does not "
+                        "combine those incomparable distributions."
+                    ),
+                },
+            )
+            attention_capture_warning_emitted = True
+        else:
+            self._restore_attention_implementation()
         deterministic_reference_mode = bool(command.get("deterministic_reference_mode"))
         # Set this on every request.  torch's switch is process-global, so merely
         # enabling it for reference runs would silently affect every later run.
@@ -747,6 +1029,22 @@ class WorkerRuntime:
         )
         if max_new_tokens <= 0:
             raise ValueError("rendered prompt consumes the effective context limit")
+        # Decode the prompt-token catalogue only after every bounded context
+        # check succeeds. Rejected oversized prompts must not trigger an
+        # unbounded device-to-CPU copy plus one tokenizer call per token.
+        prompt_context_tokens = (
+            [
+                _token_source(
+                    self.tokenizer,
+                    int(token_id),
+                    context_index,
+                    source_kind="prompt",
+                )
+                for context_index, token_id in enumerate(input_ids[0].tolist())
+            ]
+            if attention_capture_active
+            else []
+        )
 
         configured_delimiters = self.model_info.get("reasoning_delimiters")
         tagged_reasoning_enabled = (
@@ -775,6 +1073,7 @@ class WorkerRuntime:
         generator = torch.Generator(device=self.device)
         generator.manual_seed(int(command["effective_seed"]))
         generated: list[int] = []
+        context_tokens: list[dict[str, Any]] = list(prompt_context_tokens)
         full_ids = (
             [self.decoder_start_token_id]
             if encoder_decoder and self.decoder_start_token_id is not None
@@ -836,6 +1135,19 @@ class WorkerRuntime:
                 "configured_max_output_tokens": configured_max_output_tokens,
                 "generation_token_limit": generation_token_limit,
                 "reasoning_answer_allowance": reasoning_answer_allowance,
+                "attention_capture_requested": attention_capture_requested,
+                "attention_capture_active": attention_capture_active,
+                "attention_capture_method": (
+                    "mean_causal_self_attention" if attention_capture_active else None
+                ),
+                "attention_source_limit": (
+                    _ATTENTION_SOURCE_LIMIT if attention_capture_active else None
+                ),
+                "attention_implementation": (
+                    getattr(self.model.config, "_attn_implementation", None)
+                    if attention_capture_active
+                    else self.loaded_attention_implementation
+                ),
                 "template_ms": (template_ended - template_started) / 1e6,
                 "tokenization_ms": (tokenization_ended - tokenization_started) / 1e6,
             },
@@ -844,6 +1156,7 @@ class WorkerRuntime:
             torch.cuda.synchronize()
         encoder_outputs: Any | None = None
         decoder_attention_mask: Any | None = None
+        current_attentions: Any | None = None
         with torch.inference_mode():
             if encoder_decoder:
                 encoder_outputs = self._encode_source(input_ids, attention_mask)
@@ -853,14 +1166,52 @@ class WorkerRuntime:
                     dtype=torch.long,
                 )
                 decoder_attention_mask = torch.ones_like(decoder_input_ids)
-                logits, past = self._forward_encoder_decoder(
+                logits, past, current_attentions = self._forward_encoder_decoder(
                     decoder_input_ids,
                     decoder_attention_mask,
                     encoder_outputs,
                     attention_mask,
                 )
+            elif attention_capture_active and prompt_tokens > 1:
+                # A normal prompt prefill would materialize an O(context^2)
+                # attention matrix. Prefill all but the final prompt token into
+                # the KV cache with the configured efficient kernel, then ask
+                # eager attention for the single final query row that actually
+                # produces generated token zero.
+                self._restore_attention_implementation()
+                _, prefix_past, _ = self._forward_last(
+                    torch,
+                    input_ids[:, :-1],
+                    attention_mask[:, :-1],
+                )
+                attention_capture_active = self._select_attention_implementation("eager")
+                if not attention_capture_active and not attention_capture_warning_emitted:
+                    self._emit_run(
+                        run_id,
+                        "warning",
+                        {
+                            "code": "attention_capture_unavailable",
+                            "message": (
+                                "The model could not re-enable eager attention after prompt "
+                                "prefill, so exact attention weights are unavailable."
+                            ),
+                        },
+                    )
+                    attention_capture_warning_emitted = True
+                logits, past, current_attentions = self._forward_last(
+                    torch,
+                    input_ids[:, -1:],
+                    attention_mask,
+                    prefix_past,
+                    capture_attention=attention_capture_active,
+                )
             else:
-                logits, past = self._forward_last(torch, input_ids, attention_mask)
+                logits, past, current_attentions = self._forward_last(
+                    torch,
+                    input_ids,
+                    attention_mask,
+                    capture_attention=attention_capture_active,
+                )
         if synchronize:
             torch.cuda.synchronize()
         prefill_ended = time.monotonic_ns()
@@ -1003,6 +1354,36 @@ class WorkerRuntime:
                     break
                 common += 1
             display_text = current_text[common:]
+            attention_attribution: dict[str, Any] | None = None
+            if attention_capture_active:
+                attention_attribution, capture_error = _mean_causal_self_attention(
+                    torch,
+                    current_attentions,
+                    context_tokens,
+                )
+                if attention_attribution is None:
+                    attention_capture_active = False
+                    if not attention_capture_warning_emitted:
+                        self._emit_run(
+                            run_id,
+                            "warning",
+                            {
+                                "code": "attention_capture_unavailable",
+                                "message": (
+                                    "The model did not expose usable causal self-attention "
+                                    "weights for this run."
+                                ),
+                                "reason": capture_error,
+                            },
+                        )
+                        attention_capture_warning_emitted = True
+                elif token_index == 0:
+                    # The complete prompt catalogue is stored once. Subsequent
+                    # generated entries are reconstructed from the run's token
+                    # stream using prompt_token_count + generated_token_index.
+                    attention_attribution["context_tokens"] = prompt_context_tokens
+                if attention_attribution is not None:
+                    captured_attention_token_count += 1
             alternatives: dict[str, list[dict[str, Any]]] = {"raw": [], "sampling": []}
             alternative_count = int(settings.get("alternatives", 10))
             if detailed_metrics and alternative_count and raw_log_probs is not None:
@@ -1095,10 +1476,22 @@ class WorkerRuntime:
                 "rolling_tps": rolling_tps,
                 "filters": filters,
                 "expert_routing": None,
+                "attention_attribution": attention_attribution,
             }
             emit_segmented_tokens(reasoning_segmenter.feed(token_index, display_text))
             previous_emitted_ns = emitted_ns
             previous_text = current_text
+            if attention_capture_active:
+                context_tokens.append(
+                    _token_source(
+                        self.tokenizer,
+                        chosen_id,
+                        prompt_tokens + token_index,
+                        source_kind="generated",
+                        generated_token_index=token_index,
+                        display_text=display_text,
+                    )
+                )
             if chosen_id in eos_set:
                 finish_reason = "eos"
                 break
@@ -1175,7 +1568,7 @@ class WorkerRuntime:
             decode_started = time.monotonic_ns()
             with torch.inference_mode():
                 if encoder_decoder:
-                    logits, past = self._forward_encoder_decoder(
+                    logits, past, current_attentions = self._forward_encoder_decoder(
                         selected_tensor,
                         decoder_attention_mask,
                         encoder_outputs,
@@ -1183,11 +1576,12 @@ class WorkerRuntime:
                         past,
                     )
                 else:
-                    logits, past = self._forward_last(
+                    logits, past, current_attentions = self._forward_last(
                         torch,
                         selected_tensor,
                         attention_mask,
                         past,
+                        capture_attention=attention_capture_active,
                     )
             if synchronize:
                 torch.cuda.synchronize()
@@ -1238,6 +1632,7 @@ class WorkerRuntime:
                 else None,
             }
         status = "cancelled" if finish_reason == "cancelled" else "completed"
+        current_attentions = None
         payload = {
             "finish_reason": finish_reason,
             "generated_token_count": len(generated),
@@ -1260,6 +1655,13 @@ class WorkerRuntime:
             "end_to_end_tokens_per_second": len(generated) / total_generation_seconds,
             "memory": self._memory_snapshot(torch),
             "expert_routing": {"state": "not_applicable", "reason": "dense model"},
+            "attention_capture": {
+                "requested": attention_capture_requested,
+                "method": "mean_causal_self_attention" if captured_attention_token_count else None,
+                "captured_token_count": captured_attention_token_count,
+                "semantics": "attention_weights_not_causal_contributions",
+                "scope": "decoder_step_context_attention_independent_of_sampled_candidate",
+            },
         }
         self._emit_run(run_id, status, payload)
         _send(self.output, "reply", request_id=request_id, ok=True, payload=payload)

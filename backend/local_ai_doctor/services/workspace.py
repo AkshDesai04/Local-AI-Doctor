@@ -107,6 +107,7 @@ class WorkspaceService:
                     "rolling_tps",
                     "segment",
                     "reasoning_slices",
+                    "attention_attribution",
                 }
                 exported_tokens.append(
                     {

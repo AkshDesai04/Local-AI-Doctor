@@ -36,8 +36,8 @@ INSERT OR REPLACE INTO token_events(
     processed_logit, sample_logprob, sample_probability, entropy, surprise,
     cumulative_logprob, running_perplexity, decode_ms, sample_ms, emit_ms,
     inter_token_ms, cumulative_ms, instantaneous_tps, rolling_tps, segment,
-    reasoning_slices_json, selected_experts_json, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    reasoning_slices_json, selected_experts_json, attention_attribution_json, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 ALTERNATIVE_INSERT_SQL = """
@@ -336,6 +336,7 @@ class RunManager:
                     token.get("segment", "unknown"),
                     json.dumps(token.get("reasoning_slices", [])),
                     json.dumps(token.get("expert_routing")),
+                    json.dumps(token.get("attention_attribution")),
                     now,
                 )
             ],
@@ -441,6 +442,13 @@ class RunManager:
                         details={
                             "prompt_tokens": payload.get("prompt_tokens"),
                             "context_limit": payload.get("context_limit"),
+                            "attention_capture_requested": payload.get(
+                                "attention_capture_requested"
+                            ),
+                            "attention_capture_active": payload.get("attention_capture_active"),
+                            "attention_capture_method": payload.get("attention_capture_method"),
+                            "attention_source_limit": payload.get("attention_source_limit"),
+                            "attention_implementation": payload.get("attention_implementation"),
                         },
                     )
                 elif event_type == "metric" and payload.get("prefill_ms") is not None:
@@ -511,6 +519,7 @@ class RunManager:
                             "segment_metrics": payload.get("segment_metrics"),
                             "memory": payload.get("memory"),
                             "expert_routing": payload.get("expert_routing"),
+                            "attention_capture": payload.get("attention_capture"),
                         },
                     )
                     # A terminal run status promises that every accepted token and

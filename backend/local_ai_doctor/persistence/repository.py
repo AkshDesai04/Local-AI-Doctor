@@ -707,7 +707,7 @@ class WorkspaceRepository:
                             entropy, surprise, cumulative_logprob, running_perplexity,
                             decode_ms, sample_ms, emit_ms, inter_token_ms, cumulative_ms,
                             instantaneous_tps, rolling_tps, segment, selected_experts_json,
-                            created_at, reasoning_slices_json
+                            created_at, reasoning_slices_json, attention_attribution_json
                         )
                         SELECT ?, token_index, token_id, piece, escaped_bytes, display_text,
                                span_start, span_end, raw_logit, raw_logprob, raw_probability,
@@ -715,7 +715,7 @@ class WorkspaceRepository:
                                entropy, surprise, cumulative_logprob, running_perplexity,
                                decode_ms, sample_ms, emit_ms, inter_token_ms, cumulative_ms,
                                instantaneous_tps, rolling_tps, segment, selected_experts_json,
-                               created_at, reasoning_slices_json
+                               created_at, reasoning_slices_json, attention_attribution_json
                         FROM token_events WHERE run_id = ?
                         """,
                         (cloned_run_id, source_run_id),
@@ -939,8 +939,8 @@ class WorkspaceRepository:
                             entropy, surprise, cumulative_logprob, running_perplexity,
                             decode_ms, sample_ms, emit_ms, inter_token_ms, cumulative_ms,
                             instantaneous_tps, rolling_tps, segment, reasoning_slices_json,
-                            selected_experts_json, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            selected_experts_json, attention_attribution_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             run["id"],
@@ -972,6 +972,7 @@ class WorkspaceRepository:
                             token.get("segment", "unknown"),
                             _json(token.get("reasoning_slices", [])),
                             _json(token.get("selected_experts")),
+                            _json(token.get("attention_attribution")),
                             now,
                         ),
                     )

@@ -35,7 +35,7 @@ Neither checkpoint directory was modified. SafeTensors headers and payload layou
 | Generated-token likelihood/perplexity | `full` on the reference loop — exact detailed instrumentation and conditional response perplexity were runtime verified | `not_applicable` |
 | Teacher-forced prompt scoring | `full` for causal text — a real 17-token prompt was scored | `not_applicable` |
 | Sampler alternatives and processed likelihood | `partial` — application sampler and detailed telemetry are implemented; deterministic temperature/top-k/top-p sampling is runtime verified, but not every filter combination | `not_applicable` |
-| Attention/hidden-state capture | `unsupported` in the current reference adapter — framework support alone is not advertised as an implemented probe | `unsupported` as a trace feature — the pooled embedding uses the final hidden state internally, but the adapter does not expose hidden-state or attention traces |
+| Attention/hidden-state capture | `partial` for attention — bounded mean self-attention capture at `full`/`expert` is fixture verified and runtime verified on the supplied DeepSeek Qwen2 checkpoint; hidden-state capture remains unsupported | `unsupported` as a trace feature — the pooled embedding uses the final hidden state internally, but the adapter does not expose hidden-state or attention traces |
 | Streaming decode | `full` for the tested causal path — token events and terminal state were observed and persisted | `not_applicable` |
 | Batch execution | `partial` — supplied generation run used batch one | `partial` — text batch and two-item image/mixed execution are verified; larger batches and media stress are pending |
 | Deterministic seeding | `partial` — two same-environment sampled runs produced identical 32-token ID sequences; this is not a cross-device guarantee | `not_applicable` to token selection |
@@ -44,6 +44,8 @@ Neither checkpoint directory was modified. SafeTensors headers and payload layou
 | CUDA on this machine | `full` for the validated DeepSeek causal path | `full` for the tested text, image, mixed text/image, and short-video embedding paths |
 
 The workbench also has fixture-verified generic encoder-decoder generation, including one-time encoder execution, cached decoder steps, EOS handling, streaming, telemetry, and cancellation. Neither supplied checkpoint is encoder-decoder, so that implementation is not labeled real-checkpoint verified. Prompt scoring is intentionally causal-only because the current API has no separate encoder source and decoder target fields.
+
+The attention path is fixture verified with a small Qwen2 causal model and runtime verified with a short `full`-instrumentation run on the supplied DeepSeek checkpoint. That live run persisted attribution for both generated tokens over a 14-token rendered prompt and captured all 28 layers with 12 heads per layer. For each generated token the runtime captures the eager post-softmax causal self-attention row, averages across captured layers and heads, retains the 128 highest-weight source positions with explicit omitted mass, and persists the full rendered-prompt token catalogue once on token 0. These weights describe attention allocation, not causal contribution or hallucination evidence; the smoke run is not a performance benchmark.
 
 ## DeepSeek-R1-Distill-Qwen-1.5B
 
@@ -231,7 +233,7 @@ Remaining real-checkpoint work is intentionally bounded:
 
 1. Run Qwen on CPU and record load, execution, memory, and unload behavior.
 2. Stress increasing DeepSeek context, Qwen text/media sizes, and batches under explicit RAM/VRAM budgets before changing conservative defaults.
-3. Implement bounded attention/hidden-state probe adapters, then measure their overhead and trace limits before advertising support.
+3. Benchmark the eager-kernel, persistence, throughput, and memory overhead of bounded attention attribution on longer supplied-checkpoint runs; hidden-state probes remain unimplemented.
 4. Validate generic encoder-decoder generation against a real local checkpoint when one is available.
 5. Install/configure NVIDIA Container Toolkit and CDI in WSL before labeling the NVIDIA Compose profile available.
 

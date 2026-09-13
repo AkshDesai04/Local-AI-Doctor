@@ -20,10 +20,7 @@ def test_dense_generation_discovery_uses_metadata_not_gate_name(causal_model_dir
     assert model.effective_context_limit == 4096
     assert model.capabilities.support(Capability.MOE_ROUTING).state is CapabilityState.UNSUPPORTED
     assert model.capabilities.support(Capability.REASONING_CHANNEL).state is CapabilityState.FULL
-    assert (
-        model.capabilities.support(Capability.ATTENTION_CAPTURE).state
-        is CapabilityState.UNSUPPORTED
-    )
+    assert model.capabilities.support(Capability.ATTENTION_CAPTURE).state is CapabilityState.PARTIAL
     assert (
         model.capabilities.support(Capability.HIDDEN_STATE_CAPTURE).state
         is CapabilityState.UNSUPPORTED

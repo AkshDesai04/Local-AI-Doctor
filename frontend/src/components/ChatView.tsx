@@ -262,6 +262,16 @@ function NerdResponse({
   const minimum = values.length ? Math.min(...values) : 0;
   const maximum = values.length ? Math.max(...values) : 1;
   const range = maximum - minimum || 1;
+  const selectedAttribution = tokens.find((token) => token.index === selectedToken)?.attentionAttribution;
+  const generatedAttention = new Map(
+    selectedAttribution?.sourceTokens
+      .filter((source) => source.sourceKind === "generated" && source.generatedTokenIndex !== undefined)
+      .map((source) => [source.generatedTokenIndex as number, source.weight]) ?? [],
+  );
+  const peakAttention = selectedAttribution?.sourceTokens.length
+    ? Math.max(...selectedAttribution.sourceTokens.map((source) => source.weight))
+    : 0;
+  const attentionActive = selectedAttribution !== undefined;
   if (!tokens.length) return <span className="stream-caret" aria-label="Waiting for first token" />;
   const hasEmittedStart = groups.some((group) => group.parts.some((part) => part.delimiterKind === "start"));
   const promptMarkerGroup = reasoningPrimed && !hasEmittedStart ? groups.findIndex((group) => group.reasoning) : -1;
@@ -275,16 +285,33 @@ function NerdResponse({
           const { token } = part;
           const value = nerdValue(token, metric, part.classification);
           const normalized = value === undefined ? 0 : (value - minimum) / range;
+          const attentionWeight = generatedAttention.get(token.index);
+          const attentionStrength = attentionWeight === undefined || peakAttention <= 0 ? 0 : attentionWeight / peakAttention;
+          const attentionClass = !attentionActive
+            ? ""
+            : selectedToken === token.index
+              ? "attention-target"
+              : attentionWeight !== undefined
+                ? "attention-source"
+                : "attention-muted";
           const tokenLabel = displayTokenText(part.text || token.piece) || "∅";
+          const attentionHint = attentionWeight === undefined
+            ? ""
+            : `\nMean attention weight ${formatNumber(attentionWeight, 8)} (${formatPercent(attentionWeight, 5)} of the normalized row)\nAttention is not a causal contribution score.`;
           return (
             <button
-              aria-label={nerdTokenLabel(part)}
+              aria-label={`${nerdTokenLabel(part)}${attentionWeight === undefined ? "" : `, mean attention ${formatPercent(attentionWeight, 5)}`}`}
               aria-pressed={selectedToken === token.index}
-              className={`nerd-token ${selectedToken === token.index ? "selected" : ""} segment-${part.classification}`}
+              className={`nerd-token ${selectedToken === token.index ? "selected" : ""} ${attentionClass} segment-${part.classification}`}
               key={`${String(token.index)}:${String(part.start)}:${String(part.end)}`}
               onClick={() => { onSelectToken(token.index); onOpenInspector(); }}
-              style={{ "--metric": String(normalized) } as React.CSSProperties}
-              title={`Token #${String(token.index)}\n${tokenTextHint(token.piece, part.text || token.displayText)}\nID ${String(token.tokenId)} · raw p ${formatPercent(token.rawProbability, 3)} · sampler p ${formatPercent(token.samplingProbability, 3)}\n${formatDuration(token.timing?.decodeMs)} decode · ${token.reasoningSegment}\nClick to inspect this token.`}
+              style={{
+                "--metric": String(normalized),
+                "--attention-fill": `${String(16 + attentionStrength * 70)}%`,
+                "--attention-border": `${String(35 + attentionStrength * 65)}%`,
+                "--attention-text": `${String(55 + attentionStrength * 45)}%`,
+              } as React.CSSProperties}
+              title={`Token #${String(token.index)}\n${tokenTextHint(token.piece, part.text || token.displayText)}\nID ${String(token.tokenId)} · raw p ${formatPercent(token.rawProbability, 3)} · sampler p ${formatPercent(token.samplingProbability, 3)}\n${formatDuration(token.timing?.decodeMs)} decode · ${token.reasoningSegment}${attentionHint}\nClick to inspect this token.`}
               type="button"
             ><span className="token-text">{tokenLabel}</span><span className="token-index">{String(token.index)}</span></button>
           );
@@ -293,7 +320,8 @@ function NerdResponse({
     );
   };
   return (
-    <div className="nerd-response" aria-label={`Tokenized response colored by ${metric}`}>
+    <div className={`nerd-response ${attentionActive ? "attention-active" : ""}`} aria-label={`Tokenized response colored by ${attentionActive ? "context attention" : metric}`}>
+      {attentionActive && <div className="attention-mode-banner" role="status"><Activity size={14} /><span>Attention view for token #{String(selectedToken)}. Earlier generated tokens are shaded by mean attention weight; the exact prompt and history context map is in the inspector.</span></div>}
       {groups.map((group, groupIndex) => group.reasoning ? (
         <details className="reasoning-disclosure nerd-reasoning-disclosure" key={`reasoning-${String(groupIndex)}`}>
           <summary className="reasoning-summary">Thinking… <small>{String(new Set(group.parts.map((part) => part.token.index)).size)} tokens</small></summary>

@@ -28,6 +28,7 @@ function conversation(
     onRetry?: (message: Message) => void;
     run?: RunDetails | null;
     runningRunId?: string | null;
+    selectedToken?: number | null;
     streamConnected?: boolean;
   } = {},
 ): React.ReactElement {
@@ -49,7 +50,7 @@ function conversation(
       onSelectToken={vi.fn()}
       run={options.run ?? null}
       runningRunId={options.runningRunId ?? null}
-      selectedToken={null}
+      selectedToken={options.selectedToken ?? null}
       streamConnected={options.streamConnected ?? false}
     />
   );
@@ -237,6 +238,54 @@ describe("chat response rendering", () => {
     expect(screen.getByRole("button", { name: "Token 2 ." })).toHaveTextContent(".");
     expect(Array.from(container.querySelectorAll(".nerd-token")).every((token) => !token.textContent?.includes("\n"))).toBe(true);
     expect(container.textContent).not.toContain("Ġanswer");
+  });
+
+  it("dims unrelated tokens and heat-highlights generated sources for a selected token", () => {
+    const attributedMessage = { ...message, content: "First second answer" };
+    const run: RunDetails = {
+      id: "run-attention",
+      messageId: "assistant-1",
+      modelId: "model-1",
+      status: "complete",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [
+        { index: 0, tokenId: 20, piece: "First", displayText: "First", reasoningSegment: "answer" },
+        { index: 1, tokenId: 21, piece: " second", displayText: " second", reasoningSegment: "answer" },
+        {
+          index: 2,
+          tokenId: 22,
+          piece: " answer",
+          displayText: " answer",
+          reasoningSegment: "answer",
+          attentionAttribution: {
+            method: "mean_causal_self_attention",
+            aggregation: "arithmetic_mean_over_layers_and_heads",
+            semantics: "attention_weights_not_causal_contributions",
+            sourceTokens: [
+              { contextIndex: 0, tokenId: 9, piece: "Question", displayText: "Question", weight: 0.5, sourceKind: "prompt" },
+              { contextIndex: 3, tokenId: 20, piece: "First", displayText: "First", weight: 0.25, sourceKind: "generated", generatedTokenIndex: 0 },
+            ],
+            capturedLayers: [0, 1],
+            capturedHeads: 4,
+            normalized: true,
+            totalSourceCount: 5,
+            retainedSourceCount: 2,
+            retainedWeight: 0.75,
+            omittedWeight: 0.25,
+          },
+        },
+      ],
+    };
+
+    render(conversation([attributedMessage], { nerdMode: true, run, selectedToken: 2 }));
+
+    const source = screen.getByRole("button", { name: /Token 0 First, mean attention 25%/i });
+    expect(source).toHaveClass("attention-source");
+    expect(source.getAttribute("title")).toContain("Mean attention weight 0.25");
+    expect(source.style.getPropertyValue("--attention-fill")).toBe("51%");
+    expect(screen.getByRole("button", { name: "Token 1 second" })).toHaveClass("attention-muted");
+    expect(screen.getByRole("button", { name: "Token 2 answer" })).toHaveClass("attention-target");
+    expect(screen.getByRole("status")).toHaveTextContent("Attention view for token #2");
   });
 
   it("uses exact reasoning slices so a mixed closing token does not hide answer text", () => {

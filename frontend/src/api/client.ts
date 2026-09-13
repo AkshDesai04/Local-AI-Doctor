@@ -1,4 +1,7 @@
 import type {
+  AttentionAttribution,
+  AttentionContextToken,
+  AttentionSourceToken,
   ApiErrorPayload,
   Attachment,
   BranchRunRequest,
@@ -200,6 +203,66 @@ function normalizeReasoningSlice(value: unknown): ReasoningSlice | null {
   };
 }
 
+function normalizeAttentionContextToken(value: unknown): AttentionContextToken | null {
+  const raw = asRecord(value);
+  const contextIndex = asOptionalNumber(raw.contextIndex ?? raw.context_index);
+  const tokenId = asOptionalNumber(raw.tokenId ?? raw.token_id);
+  const sourceKindValue = raw.sourceKind ?? raw.source_kind;
+  if (contextIndex === undefined || tokenId === undefined) return null;
+  if (!Number.isInteger(contextIndex) || contextIndex < 0 || !Number.isInteger(tokenId)) return null;
+  if (sourceKindValue !== "prompt" && sourceKindValue !== "generated") return null;
+  return {
+    contextIndex,
+    tokenId,
+    piece: asString(raw.piece, ""),
+    displayText: asString(raw.displayText ?? raw.display_text ?? raw.piece, ""),
+    sourceKind: sourceKindValue,
+    generatedTokenIndex: asOptionalNumber(raw.generatedTokenIndex ?? raw.generated_token_index),
+  };
+}
+
+function normalizeAttentionSourceToken(value: unknown): AttentionSourceToken | null {
+  const contextToken = normalizeAttentionContextToken(value);
+  const weight = asOptionalNumber(asRecord(value).weight);
+  if (!contextToken || weight === undefined || weight < 0) return null;
+  return { ...contextToken, weight };
+}
+
+function normalizeAttentionAttribution(value: unknown): AttentionAttribution | undefined {
+  const raw = asRecord(value);
+  const sourceValue = raw.sourceTokens ?? raw.source_tokens;
+  const sourceTokens = Array.isArray(sourceValue)
+    ? sourceValue.map(normalizeAttentionSourceToken).filter((item): item is AttentionSourceToken => item !== null).sort((left, right) => left.contextIndex - right.contextIndex)
+    : [];
+  const contextValue = raw.contextTokens ?? raw.context_tokens;
+  const contextTokens = Array.isArray(contextValue)
+    ? contextValue.map(normalizeAttentionContextToken).filter((item): item is AttentionContextToken => item !== null).sort((left, right) => left.contextIndex - right.contextIndex)
+    : undefined;
+  const method = typeof raw.method === "string" ? raw.method : undefined;
+  if (!method && sourceTokens.length === 0) return undefined;
+  const capturedLayerValue = raw.capturedLayers ?? raw.captured_layers;
+  const capturedLayers = Array.isArray(capturedLayerValue)
+    ? capturedLayerValue.map(Number).filter((layer) => Number.isInteger(layer) && layer >= 0)
+    : [];
+  const retainedWeight = asOptionalNumber(raw.retainedWeight ?? raw.retained_weight)
+    ?? sourceTokens.reduce((sum, item) => sum + item.weight, 0);
+  const normalized = asOptionalBoolean(raw.normalized) ?? false;
+  return {
+    method: method ?? "attention",
+    aggregation: asString(raw.aggregation, "not reported"),
+    semantics: asString(raw.semantics, "attention_weights_not_causal_contributions"),
+    sourceTokens,
+    contextTokens,
+    capturedLayers,
+    capturedHeads: asOptionalNumber(raw.capturedHeads ?? raw.captured_heads) ?? 0,
+    normalized,
+    totalSourceCount: asOptionalNumber(raw.totalSourceCount ?? raw.total_source_count) ?? sourceTokens.length,
+    retainedSourceCount: asOptionalNumber(raw.retainedSourceCount ?? raw.retained_source_count) ?? sourceTokens.length,
+    retainedWeight,
+    omittedWeight: asOptionalNumber(raw.omittedWeight ?? raw.omitted_weight) ?? (normalized ? Math.max(0, 1 - retainedWeight) : 0),
+  };
+}
+
 function normalizeToken(value: unknown): TokenEvent {
   const raw = asRecord(value);
   const alternatives = asRecord(raw.alternatives);
@@ -250,6 +313,7 @@ function normalizeToken(value: unknown): TokenEvent {
     rawAlternatives: Array.isArray(raw.rawAlternatives) ? raw.rawAlternatives.map(normalizeAlternative) : Array.isArray(alternatives.raw) ? alternatives.raw.map(normalizeAlternative) : storedRawAlternatives.length ? storedRawAlternatives.map(normalizeAlternative) : undefined,
     samplingAlternatives: Array.isArray(raw.samplingAlternatives) ? raw.samplingAlternatives.map(normalizeAlternative) : Array.isArray(alternatives.sampling) ? alternatives.sampling.map(normalizeAlternative) : storedSamplingAlternatives.length ? storedSamplingAlternatives.map(normalizeAlternative) : undefined,
     expertRoutes,
+    attentionAttribution: normalizeAttentionAttribution(raw.attentionAttribution ?? raw.attention_attribution),
     timing: {
       decodeMs: asOptionalNumber(raw.decode_ms ?? asRecord(raw.timing).decodeMs),
       samplingMs: asOptionalNumber(raw.sample_ms ?? asRecord(raw.timing).samplingMs),

@@ -271,6 +271,20 @@ describe("API boundary normalization", () => {
         running_perplexity: 1.5,
         reasoning_slices: [{ start: 0, end: 1, classification: "answer", delimiter: false }],
         alternatives: [{ distribution: "raw", rank: 1, token_id: 7, piece: "A", survived_filter: 1 }],
+        attention_attribution: {
+          method: "mean_causal_self_attention",
+          aggregation: "arithmetic_mean_over_layers_and_heads",
+          semantics: "attention_weights_not_causal_contributions",
+          context_tokens: [{ context_index: 0, token_id: 1, piece: "Question", display_text: "Question", source_kind: "prompt" }],
+          source_tokens: [{ context_index: 0, token_id: 1, piece: "Question", display_text: "Question", source_kind: "prompt", weight: 0.75 }],
+          captured_layers: [0, 1],
+          captured_heads: 4,
+          normalized: true,
+          total_source_count: 1,
+          retained_source_count: 1,
+          retained_weight: 0.75,
+          omitted_weight: 0.25,
+        },
       }],
     }));
     vi.stubGlobal("fetch", fetchMock);
@@ -302,6 +316,17 @@ describe("API boundary normalization", () => {
     });
     expect(run.tokens[0]?.rawAlternatives?.[0]?.survivedFiltering).toBe(true);
     expect(run.tokens[0]?.reasoningSlices).toEqual([{ start: 0, end: 1, classification: "answer", delimiter: false }]);
+    expect(run.tokens[0]?.attentionAttribution).toEqual(expect.objectContaining({
+      method: "mean_causal_self_attention",
+      capturedLayers: [0, 1],
+      capturedHeads: 4,
+      totalSourceCount: 1,
+      retainedSourceCount: 1,
+      retainedWeight: 0.75,
+      omittedWeight: 0.25,
+      contextTokens: [expect.objectContaining({ contextIndex: 0, tokenId: 1, sourceKind: "prompt" })],
+      sourceTokens: [expect.objectContaining({ contextIndex: 0, tokenId: 1, sourceKind: "prompt", weight: 0.75 })],
+    }));
     expect(run.branchableThroughTokenIndex).toBe(0);
     expect(run.effectiveSettings).toMatchObject({ instrumentation: "full", sampling: { temperature: 0.7 } });
   });

@@ -215,8 +215,12 @@ def _nvidia_smi_devices() -> tuple[list[AcceleratorDevice], list[str]]:
 class SystemHardwareProbe:
     """Discover host resources without assuming that CUDA or PyTorch exists."""
 
-    def discover(self) -> HardwareInventory:
-        torch_devices, warnings = _torch_devices()
+    def discover(self, *, probe_runtime: bool = True) -> HardwareInventory:
+        if probe_runtime:
+            torch_devices, warnings = _torch_devices()
+        else:
+            torch_devices = []
+            warnings = ["accelerator runtime probing skipped because CPU execution is configured"]
         devices = torch_devices
         if not any(device.backend is BackendKind.CUDA for device in devices):
             smi_devices, smi_warnings = _nvidia_smi_devices()

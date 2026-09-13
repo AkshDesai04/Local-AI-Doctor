@@ -112,7 +112,7 @@ Non-loopback configuration is rejected unless external access and a token are bo
 | `device_placement` | `sequential` | Reserved for adapter placement policies. |
 | `dtype` | `auto` | `float32`, `float16`, or `bfloat16`; auto uses BF16 on CUDA capability 8+, FP16 on older CUDA, and FP32 on CPU. CPU FP16 is rejected. |
 | `quantization` | `none` | Any non-`none` value is rejected at model load because no compatible weight-quantization adapter is installed. |
-| `attention_backend` | `auto` | `eager`, `sdpa`, or `flash-attention-2` is passed to Transformers when selected. |
+| `attention_backend` | `auto` | `eager`, `sdpa`, or `flash-attention-2` is passed to Transformers when selected. A compatible decoder-only `full`/`expert` run temporarily selects eager attention so post-softmax rows can be returned, then restores this configured implementation. The run warns and continues without attribution when switching is unavailable. |
 | `load_one_model_at_a_time` | `true` | Requires `max_loaded_models=1`; the worker unloads before loading a different checkpoint. |
 | `max_loaded_models` | `1` | Values above one require disabling the policy, but the current single worker still holds one model. |
 | `max_batch_size` | `1` | Used as the maximum SentenceTransformers encode batch; generation remains batch one. |
@@ -171,7 +171,7 @@ Declared `Content-Length` and streamed bytes are both checked. Oversized request
 
 ### `features`
 
-`attention_probe`, `hidden_state_probe`, `activation_probe`, `logit_lens`, `full_router_traces`, and `multi_gpu` default to false. They are reserved capability gates and do not activate probes in the current worker.
+`attention_probe`, `hidden_state_probe`, `activation_probe`, `logit_lens`, `full_router_traces`, and `multi_gpu` default to false. These fields remain reserved compatibility gates. In particular, `attention_probe` does not control the implemented causal attention view: selecting `full` or `expert` instrumentation requests that capture automatically for a compatible decoder-only generation model. The other probe flags do not activate production probes in the current worker.
 
 ### `platform`
 
@@ -187,3 +187,8 @@ Declared `Content-Length` and streamed bytes are both checked. Oversized request
 - `production`: info/JSON-log intent and 30-day retention intent. Interactive docs are disabled.
 
 Compose supplies additional deployment controls such as port publication, CPU/memory/PID limits, volume names, and NVIDIA device visibility. Those are documented in [deployment.md](deployment.md), not parsed as application settings.
+
+The portable Electron release overrides `runtime.device=cpu`. This avoids
+probing or advertising a CUDA runtime that cannot fit in GitHub's single-asset
+limit; native and Docker launches continue to use their configured device
+selection.

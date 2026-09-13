@@ -19,10 +19,11 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { AlternativeDistribution, CapabilityKey, ConfigurationSnapshot, HealthStatus, ModelSummary, RunDetails, TokenAlternative, TokenEvent } from "../api/types";
+import type { AlternativeDistribution, AttentionContextToken, CapabilityKey, ConfigurationSnapshot, HealthStatus, ModelSummary, RunDetails, TokenAlternative, TokenEvent } from "../api/types";
 import { fetchRunExport } from "../api/client";
 import { capabilityOf, supportsGeneration } from "../domain/capabilities";
 import { displayTokenText, downloadBlob, formatBytes, formatDuration, formatNumber, formatPercent, shortFingerprint, tokenTextHint } from "../utils/format";
+import { AttentionAttributionView } from "./AttentionAttribution";
 import { type ChartMetric, TraceChart } from "./TraceChart";
 import { VirtualTokenTable } from "./VirtualTokenTable";
 
@@ -118,13 +119,15 @@ function Alternatives({ title, distribution, alternatives, currentTokenId, nerdM
   );
 }
 
-function TokenDetail({ token, nerdMode, branching, canBranch, branchUnavailableReason, onBranchAlternative }: {
+function TokenDetail({ token, contextTokens, nerdMode, branching, canBranch, branchUnavailableReason, onBranchAlternative, onSelectToken }: {
   token: TokenEvent | undefined;
+  contextTokens?: AttentionContextToken[];
   nerdMode: boolean;
   branching: boolean;
   canBranch: boolean;
   branchUnavailableReason: string;
   onBranchAlternative: (tokenIndex: number, distribution: AlternativeDistribution, alternative: TokenAlternative) => Promise<void>;
+  onSelectToken: (index: number) => void;
 }): React.ReactNode {
   const [selectedAlternative, setSelectedAlternative] = useState<SelectedAlternative | null>(null);
 
@@ -141,6 +144,7 @@ function TokenDetail({ token, nerdMode, branching, canBranch, branchUnavailableR
   return (
     <div className="token-detail">
       <div className="token-detail-hero" title={tokenTextHint(token.piece, token.displayText)}><span className={`segment-badge ${token.reasoningSegment}`}>{token.reasoningSegment}</span><code>{selectedTokenLabel}</code><span>token #{String(token.index)}</span></div>
+      <AttentionAttributionView attribution={token.attentionAttribution} contextTokens={contextTokens} onSelectGeneratedToken={onSelectToken} targetTokenIndex={token.index} />
       <dl className="definition-grid">
         <div><dt>Token ID</dt><dd>{String(token.tokenId)}</dd></div>
         <div><dt>Bytes</dt><dd className="mono">{token.bytes ?? "Not captured"}</dd></div>
@@ -351,8 +355,23 @@ export function Inspector({ open, model, run, health, configuration, activeTab, 
         const branchUnavailableReason = !runComplete
           ? "Available when run completes"
           : "Selected token was not retained in persisted telemetry";
+        const promptContextTokens = run?.tokens.find((token) => token.index === 0)?.attentionAttribution?.contextTokens ?? [];
+        const promptTokenCount = run?.metrics?.promptTokens ?? promptContextTokens.length;
+        const generatedContextTokens: AttentionContextToken[] = (run?.tokens ?? [])
+          .filter((token) => selected !== undefined && token.index < selected.index)
+          .map((token) => ({
+            contextIndex: promptTokenCount + token.index,
+            tokenId: token.tokenId,
+            piece: token.piece,
+            displayText: token.displayText,
+            sourceKind: "generated",
+            generatedTokenIndex: token.index,
+          }));
+        const attentionContextTokens = promptContextTokens.length > 0
+          ? [...promptContextTokens, ...generatedContextTokens]
+          : undefined;
         return nerdMode
-          ? <div className="inspector-stack"><TokenDetail branchUnavailableReason={branchUnavailableReason} branching={branching} canBranch={runComplete && tokenPersisted} nerdMode onBranchAlternative={onBranchAlternative} token={selected} /><section className="inspector-section"><div className="section-title"><Binary size={15} /><h3>All generated tokens</h3></div><VirtualTokenTable onSelectToken={onSelectToken} selectedToken={selectedToken} tokens={run?.tokens ?? []} /></section></div>
+          ? <div className="inspector-stack"><TokenDetail branchUnavailableReason={branchUnavailableReason} branching={branching} canBranch={runComplete && tokenPersisted} contextTokens={attentionContextTokens} nerdMode onBranchAlternative={onBranchAlternative} onSelectToken={onSelectToken} token={selected} /><section className="inspector-section"><div className="section-title"><Binary size={15} /><h3>All generated tokens</h3></div><VirtualTokenTable onSelectToken={onSelectToken} selectedToken={selectedToken} tokens={run?.tokens ?? []} /></section></div>
           : <EmptyInspector body="Enable Nerd Mode to inspect raw token boundaries, protocol markers, and alternative distributions." icon={Binary} title="Token details are hidden" />;
       }
       case "probability": return <div className="inspector-stack"><TraceChart metrics={probabilityMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Chosen-token probability" tokens={run?.tokens ?? []} /><TraceChart metrics={logProbabilityMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Chosen-token log probability" tokens={run?.tokens ?? []} /><TraceChart metrics={uncertaintyMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Uncertainty" tokens={run?.tokens ?? []} /><TraceChart metrics={rankMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Exact model rank" tokens={run?.tokens ?? []} /><TraceChart metrics={perplexityMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Running perplexity" tokens={run?.tokens ?? []} /></div>;

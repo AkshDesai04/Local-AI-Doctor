@@ -138,8 +138,16 @@ def build_capability_matrix(evidence: ModelEvidence) -> CapabilityMatrix:
             else "prompt scoring requires a tokenizer-backed generation model"
         )
     )
-    entries[Capability.ATTENTION_CAPTURE] = _unsupported(
-        "the reference adapter does not currently capture attention tensors"
+    entries[Capability.ATTENTION_CAPTURE] = (
+        _partial(
+            "full/expert instrumentation captures causal self-attention for supported decoder models",
+            "attention weights are model-internal allocations, not causal contribution scores",
+            "the retained top source positions are bounded and report omitted attention mass",
+        )
+        if evidence.task is ModelTask.TEXT_GENERATION
+        else _unsupported(
+            "causal self-attention capture is available only for decoder-only text generation"
+        )
     )
     entries[Capability.HIDDEN_STATE_CAPTURE] = _unsupported(
         "the reference adapter does not currently capture hidden-state traces"

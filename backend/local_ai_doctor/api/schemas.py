@@ -281,6 +281,7 @@ class ChatExportToken(StrictRequest):
     segment: Literal["reasoning", "answer", "unknown"] = "unknown"
     reasoning_slices: list[dict[str, Any]] = Field(default_factory=list, max_length=1_000)
     selected_experts: Any = None
+    attention_attribution: dict[str, Any] | None = None
     alternatives: list[ChatExportAlternative] = Field(default_factory=list, max_length=2_000)
 
 

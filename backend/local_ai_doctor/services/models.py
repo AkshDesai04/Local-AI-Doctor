@@ -38,8 +38,13 @@ class ModelRegistry:
         self._models: dict[str, ModelDescriptor] = {}
         self.admission = SingleWorkerAdmission(settings.runtime.queue_limit)
 
+    def _discover_hardware(self) -> HardwareInventory:
+        return SystemHardwareProbe().discover(
+            probe_runtime=self.settings.runtime.device is not DeviceMode.CPU
+        )
+
     async def refresh(self) -> ModelScanReport:
-        self.hardware = SystemHardwareProbe().discover()
+        self.hardware = self._discover_hardware()
         backends = {BackendKind.CPU}
         for device in self.hardware.accelerators:
             if device.runtime_available:
@@ -116,7 +121,7 @@ class ModelRegistry:
         dtype: DType | None = None,
     ) -> HardwareSelection:
         if self.hardware is None:
-            self.hardware = SystemHardwareProbe().discover()
+            self.hardware = self._discover_hardware()
         return select_hardware(
             self.hardware,
             device or self.settings.runtime.device,

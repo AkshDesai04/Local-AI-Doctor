@@ -10,8 +10,10 @@ from local_ai_doctor.hardware import (
     CPUInfo,
     HardwareInventory,
     MemoryInfo,
+    SystemHardwareProbe,
     select_hardware,
 )
+from local_ai_doctor.hardware import probe as hardware_probe
 
 
 def inventory(*devices: AcceleratorDevice) -> HardwareInventory:
@@ -63,3 +65,18 @@ def test_requested_cuda_falls_back_only_when_allowed() -> None:
 def test_cpu_rejects_unsafe_float16_request() -> None:
     with pytest.raises(BackendUnavailableError):
         select_hardware(inventory(), DeviceMode.CPU, requested_dtype=DType.FLOAT16)
+
+
+def test_explicit_cpu_probe_does_not_import_accelerator_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_torch_probe() -> tuple[list[AcceleratorDevice], list[str]]:
+        raise AssertionError("CPU-only discovery must not import the accelerator runtime")
+
+    monkeypatch.setattr(hardware_probe, "_torch_devices", unexpected_torch_probe)
+    monkeypatch.setattr(hardware_probe, "_nvidia_smi_devices", lambda: ([], []))
+
+    discovered = SystemHardwareProbe().discover(probe_runtime=False)
+
+    assert discovered.accelerators == ()
+    assert "CPU execution is configured" in discovered.discovery_warnings[0]

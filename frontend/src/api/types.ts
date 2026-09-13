@@ -158,6 +158,34 @@ export interface ReasoningSlice {
   delimiter: boolean;
 }
 
+export interface AttentionContextToken {
+  contextIndex: number;
+  tokenId: number;
+  piece: string;
+  displayText: string;
+  sourceKind: "prompt" | "generated";
+  generatedTokenIndex?: number;
+}
+
+export interface AttentionSourceToken extends AttentionContextToken {
+  weight: number;
+}
+
+export interface AttentionAttribution {
+  method: string;
+  aggregation: string;
+  semantics: string;
+  sourceTokens: AttentionSourceToken[];
+  contextTokens?: AttentionContextToken[];
+  capturedLayers: number[];
+  capturedHeads: number;
+  normalized: boolean;
+  totalSourceCount: number;
+  retainedSourceCount: number;
+  retainedWeight: number;
+  omittedWeight: number;
+}
+
 export interface TokenEvent {
   index: number;
   tokenId: number;
@@ -183,6 +211,7 @@ export interface TokenEvent {
   samplingAlternatives?: TokenAlternative[];
   timing?: TokenTiming;
   expertRoutes?: ExpertRoute[];
+  attentionAttribution?: AttentionAttribution;
 }
 
 export interface ContextUsage {

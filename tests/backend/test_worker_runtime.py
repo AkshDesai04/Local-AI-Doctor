@@ -15,6 +15,7 @@ from local_ai_doctor.workers.runtime import (
     _decoder_start_token,
     _embedding_dimension_bounds,
     _embedding_model_kwargs,
+    _mean_causal_self_attention,
     _reasoning_segmenter,
     _render_messages,
     _safe_error,
@@ -44,6 +45,90 @@ def test_worker_error_payload_never_exposes_raw_exception_text_or_paths() -> Non
     }
     assert "alice" not in str(error).lower()
     assert "weights.safetensors" not in str(error)
+
+
+def test_attention_aggregation_retains_exact_top_weights_and_reports_omitted_mass() -> None:
+    import torch
+
+    sources = [
+        {
+            "context_index": index,
+            "token_id": index + 10,
+            "piece": str(index),
+            "display_text": str(index),
+            "source_kind": "prompt",
+        }
+        for index in range(4)
+    ]
+    attentions = (
+        torch.tensor([[[[0.1, 0.2, 0.3, 0.4]], [[0.4, 0.3, 0.2, 0.1]]]]),
+        torch.tensor([[[[0.0, 0.2, 0.3, 0.5]], [[0.2, 0.2, 0.2, 0.4]]]]),
+    )
+
+    attribution, error = _mean_causal_self_attention(
+        torch,
+        attentions,
+        sources,
+        source_limit=2,
+    )
+
+    assert error is None
+    assert attribution is not None
+    assert attribution["method"] == "mean_causal_self_attention"
+    assert attribution["semantics"] == "attention_weights_not_causal_contributions"
+    assert attribution["scope"] == (
+        "decoder_step_context_attention_independent_of_sampled_candidate"
+    )
+    assert attribution["captured_layers"] == [0, 1]
+    assert attribution["captured_heads"] == 2
+    assert attribution["total_head_rows"] == 4
+    assert attribution["total_source_count"] == 4
+    assert attribution["retained_source_count"] == 2
+    assert [item["context_index"] for item in attribution["source_tokens"]] == [2, 3]
+    assert attribution["retained_weight"] == pytest.approx(0.6)
+    assert attribution["omitted_weight"] == pytest.approx(0.4)
+
+
+def test_attention_capture_falls_back_to_native_model_outputs_without_hooks() -> None:
+    import torch
+
+    native_attentions = (torch.ones((1, 1, 1, 2)),)
+
+    class Body:
+        @staticmethod
+        def __call__(**_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                last_hidden_state=torch.zeros((1, 1, 2)),
+                past_key_values="cache",
+                attentions=native_attentions,
+            )
+
+    class Head:
+        @staticmethod
+        def __call__(_hidden: Any) -> Any:
+            return torch.zeros((1, 1, 3))
+
+    class NativeAttentionModel:
+        config = SimpleNamespace(is_encoder_decoder=False)
+        model = Body()
+        lm_head = Head()
+
+        @staticmethod
+        def named_modules() -> list[tuple[str, Any]]:
+            return []
+
+    runtime = WorkerRuntime(cast(Any, FakeQueue()), cast(Any, FakeQueue()), FakeCancelEvent())
+    runtime.model = NativeAttentionModel()
+    logits, past, attentions = runtime._forward_last(
+        torch,
+        torch.tensor([[1, 2]]),
+        torch.ones((1, 2), dtype=torch.long),
+        capture_attention=True,
+    )
+
+    assert logits.shape == (1, 3)
+    assert past == "cache"
+    assert attentions is native_attentions
 
 
 def test_embedding_loader_does_not_remap_other_architectures(tmp_path: Path) -> None:
@@ -791,6 +876,233 @@ def test_causal_generation_advances_cache_with_substituted_prefix_before_suffix(
     assert model.calls[2]["past_key_values"] == "cache-after-substitution-4"
     assert completed["finish_reason"] == "eos"
     assert completed["text"] == "alternatehello</s>"
+
+
+def test_full_instrumentation_captures_qwen_causal_attention_and_restores_kernel() -> None:
+    import torch
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    class TinyTokenizer:
+        chat_template = None
+        eos_token_id = None
+        bos_token_id = None
+
+        @staticmethod
+        def __call__(_text: str, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "input_ids": torch.tensor([[5, 6, 7]], dtype=torch.long),
+                "attention_mask": torch.ones((1, 3), dtype=torch.long),
+            }
+
+        @staticmethod
+        def convert_ids_to_tokens(token_id: int) -> str:
+            return f"token-{token_id}"
+
+        @staticmethod
+        def decode(token_ids: list[int], **_kwargs: Any) -> str:
+            return "".join(f"<{token_id}>" for token_id in token_ids)
+
+    model = Qwen2ForCausalLM(
+        Qwen2Config(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+            bos_token_id=None,
+            eos_token_id=None,
+        )
+    ).eval()
+    model.set_attn_implementation("sdpa")
+    attention_modules = [
+        module for name, module in model.named_modules() if name.rsplit(".", 1)[-1] == "self_attn"
+    ]
+    initial_hook_counts = [len(module._forward_hooks) for module in attention_modules]
+    forward_implementations: list[tuple[int, str]] = []
+
+    def record_attention_implementation(_module: Any, _args: Any, kwargs: dict[str, Any]) -> None:
+        forward_implementations.append(
+            (
+                int(kwargs["input_ids"].shape[-1]),
+                str(model.config._attn_implementation),
+            )
+        )
+
+    implementation_hook = model.model.register_forward_pre_hook(
+        record_attention_implementation,
+        with_kwargs=True,
+    )
+    output = FakeQueue()
+    runtime = WorkerRuntime(cast(Any, FakeQueue()), cast(Any, output), FakeCancelEvent())
+    runtime.model = model
+    runtime.tokenizer = TinyTokenizer()
+    runtime.model_info = {
+        "id": "tiny-qwen",
+        "display_name": "Tiny Qwen Fixture",
+        "task": "text_generation",
+        "effective_context_limit": 32,
+    }
+    runtime.loaded_attention_implementation = "sdpa"
+    command = generation_command()
+    command["instrumentation"] = "full"
+    command["sampling"]["max_output_tokens"] = 2
+
+    try:
+        runtime._generate(command)
+    finally:
+        implementation_hook.remove()
+
+    events = [item for item in output.items if item["kind"] == "run_event"]
+    tokens = [item["payload"] for item in events if item["event_type"] == "token"]
+    completed = next(item["payload"] for item in events if item["event_type"] == "completed")
+    assert len(tokens) == 2
+    first = tokens[0]["attention_attribution"]
+    second = tokens[1]["attention_attribution"]
+    assert first["total_source_count"] == 3
+    assert len(first["context_tokens"]) == 3
+    assert first["captured_layers"] == [0, 1]
+    assert first["captured_heads"] == 4
+    assert sum(item["weight"] for item in first["source_tokens"]) == pytest.approx(1.0)
+    assert second["total_source_count"] == 4
+    generated_source = next(
+        item for item in second["source_tokens"] if item["source_kind"] == "generated"
+    )
+    assert generated_source["generated_token_index"] == 0
+    assert generated_source["context_index"] == 3
+    assert completed["attention_capture"] == {
+        "requested": True,
+        "method": "mean_causal_self_attention",
+        "captured_token_count": 2,
+        "semantics": "attention_weights_not_causal_contributions",
+        "scope": "decoder_step_context_attention_independent_of_sampled_candidate",
+    }
+    assert forward_implementations == [(2, "sdpa"), (1, "eager"), (1, "eager")]
+    assert model.config._attn_implementation == "sdpa"
+    assert [len(module._forward_hooks) for module in attention_modules] == initial_hook_counts
+
+
+def test_full_instrumentation_continues_when_eager_cannot_be_reenabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    class TinyTokenizer:
+        chat_template = None
+        eos_token_id = None
+        bos_token_id = None
+
+        @staticmethod
+        def __call__(_text: str, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "input_ids": torch.tensor([[5, 6, 7]], dtype=torch.long),
+                "attention_mask": torch.ones((1, 3), dtype=torch.long),
+            }
+
+        @staticmethod
+        def convert_ids_to_tokens(token_id: int) -> str:
+            return f"token-{token_id}"
+
+        @staticmethod
+        def decode(token_ids: list[int], **_kwargs: Any) -> str:
+            return "".join(f"<{token_id}>" for token_id in token_ids)
+
+    model = Qwen2ForCausalLM(
+        Qwen2Config(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+            bos_token_id=None,
+            eos_token_id=None,
+        )
+    ).eval()
+    model.set_attn_implementation("sdpa")
+    output = FakeQueue()
+    runtime = WorkerRuntime(cast(Any, FakeQueue()), cast(Any, output), FakeCancelEvent())
+    runtime.model = model
+    runtime.tokenizer = TinyTokenizer()
+    runtime.model_info = {
+        "id": "tiny-qwen-fallback",
+        "display_name": "Tiny Qwen Fallback Fixture",
+        "task": "text_generation",
+        "effective_context_limit": 32,
+    }
+    runtime.loaded_attention_implementation = "sdpa"
+    select_implementation = runtime._select_attention_implementation
+    eager_requests = 0
+
+    def fail_second_eager_selection(implementation: str) -> bool:
+        nonlocal eager_requests
+        if implementation == "eager":
+            eager_requests += 1
+            if eager_requests == 2:
+                return False
+        return select_implementation(implementation)
+
+    monkeypatch.setattr(
+        runtime,
+        "_select_attention_implementation",
+        fail_second_eager_selection,
+    )
+    command = generation_command()
+    command["instrumentation"] = "full"
+    command["sampling"]["max_output_tokens"] = 1
+
+    runtime._generate(command)
+
+    events = [item for item in output.items if item["kind"] == "run_event"]
+    warnings = [item["payload"] for item in events if item["event_type"] == "warning"]
+    tokens = [item["payload"] for item in events if item["event_type"] == "token"]
+    completed = next(item["payload"] for item in events if item["event_type"] == "completed")
+    assert eager_requests == 2
+    assert any(item["code"] == "attention_capture_unavailable" for item in warnings)
+    assert len(tokens) == 1
+    assert tokens[0]["attention_attribution"] is None
+    assert completed["attention_capture"]["requested"] is True
+    assert completed["attention_capture"]["captured_token_count"] == 0
+    assert completed["attention_capture"]["method"] is None
+    assert model.config._attn_implementation == "sdpa"
+
+
+def test_oversized_full_prompt_is_rejected_before_catalog_decoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OversizedTokenizer(FakeTokenizer):
+        decoded_token_count = 0
+
+        def __call__(self, text: str, **_kwargs: Any) -> dict[str, FakeTensor]:
+            assert text == "summarize this"
+            return {
+                "input_ids": FakeTensor([[5] * 33]),
+                "attention_mask": FakeTensor([[1] * 33]),
+            }
+
+        def convert_ids_to_tokens(self, token_id: int) -> str:
+            self.decoded_token_count += 1
+            return str(token_id)
+
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, _model, _output = configured_causal_runtime()
+    tokenizer = OversizedTokenizer()
+    runtime.tokenizer = tokenizer
+    runtime.model_info = {
+        **cast(dict[str, Any], runtime.model_info),
+        "effective_context_limit": 8,
+    }
+    monkeypatch.setattr(runtime, "_select_attention_implementation", lambda _value: True)
+    command = generation_command()
+    command["instrumentation"] = "full"
+
+    with pytest.raises(ValueError, match="rendered prompt exceeds"):
+        runtime._generate(command)
+
+    assert tokenizer.decoded_token_count == 0
 
 
 def test_generation_rejects_a_forced_prefix_longer_than_the_recorded_output_limit(

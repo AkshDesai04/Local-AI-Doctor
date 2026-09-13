@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from copy import deepcopy
 from functools import partial
 from pathlib import Path
@@ -50,18 +51,37 @@ def test_chat_workspace_round_trip_remaps_ids_and_preserves_token_telemetry(
         },
     )
     now = utc_now()
+    attention_attribution = {
+        "method": "mean_causal_self_attention",
+        "semantics": "attention_weights_not_causal_contributions",
+        "total_source_count": 1,
+        "retained_source_count": 1,
+        "retained_weight": 1.0,
+        "omitted_weight": 0.0,
+        "source_tokens": [
+            {
+                "context_index": 0,
+                "token_id": 5,
+                "piece": "Explain",
+                "display_text": "Explain",
+                "source_kind": "prompt",
+                "weight": 1.0,
+            }
+        ],
+    }
     portal.call(
         services.database.execute,
         """
         INSERT INTO token_events(
             run_id, token_index, token_id, piece, escaped_bytes, display_text,
             raw_logprob, raw_probability, segment, reasoning_slices_json,
-            selected_experts_json, created_at
-        ) VALUES (?, 0, 7, '4', '\\x34', '4', -0.25, 0.75, 'answer', ?, '[1,2]', ?)
+            selected_experts_json, attention_attribution_json, created_at
+        ) VALUES (?, 0, 7, '4', '\\x34', '4', -0.25, 0.75, 'answer', ?, '[1,2]', ?, ?)
         """,
         (
             run["id"],
             '[{"start":0,"end":1,"classification":"answer","delimiter":false}]',
+            json.dumps(attention_attribution),
             now,
         ),
     )
@@ -88,6 +108,7 @@ def test_chat_workspace_round_trip_remaps_ids_and_preserves_token_telemetry(
     assert exported["runs"][0]["tokens"][0]["reasoning_slices"] == [
         {"start": 0, "end": 1, "classification": "answer", "delimiter": False}
     ]
+    assert exported["runs"][0]["tokens"][0]["attention_attribution"] == (attention_attribution)
     assert exported["runs"][0]["tokens"][0]["alternatives"][0]["probability"] == 0.75
     assert "storage_name" not in exported_response.text
     assert "canonical_path" not in exported_response.text
@@ -110,6 +131,7 @@ def test_chat_workspace_round_trip_remaps_ids_and_preserves_token_telemetry(
     imported_tokens = portal.call(services.repository.list_run_tokens, imported_runs[0]["id"])
     assert imported_tokens[0]["piece"] == "4"
     assert imported_tokens[0]["reasoning_slices"][0]["classification"] == "answer"
+    assert imported_tokens[0]["attention_attribution"] == attention_attribution
     assert imported_tokens[0]["alternatives"][0]["probability"] == 0.75
 
     assert api_client.delete(f"/api/v1/chats/{chat['id']}", headers=API_HEADERS).status_code == 204
@@ -296,6 +318,15 @@ def test_token_branch_validates_telemetry_and_clones_lineage_into_a_new_chat(
         },
     )
     earlier_now = utc_now()
+    cloned_attention_attribution = {
+        "method": "mean_causal_self_attention",
+        "semantics": "attention_weights_not_causal_contributions",
+        "total_source_count": 1,
+        "retained_source_count": 1,
+        "retained_weight": 1.0,
+        "omitted_weight": 0.0,
+        "source_tokens": [],
+    }
     portal.call(
         partial(
             services.repository.update_run,
@@ -330,11 +361,16 @@ def test_token_branch_validates_telemetry_and_clones_lineage_into_a_new_chat(
         """
         INSERT INTO token_events(
             run_id, token_index, token_id, piece, escaped_bytes, display_text,
-            selected_experts_json, created_at, reasoning_slices_json
+            selected_experts_json, created_at, reasoning_slices_json,
+            attention_attribution_json
         ) VALUES (?, 0, 7, 'Earlier', 'Earlier', 'Earlier', '[1]', ?,
-                  '[{"kind":"answer","start":0,"end":7}]')
+                  '[{"kind":"answer","start":0,"end":7}]', ?)
         """,
-        (earlier_run["id"], earlier_now),
+        (
+            earlier_run["id"],
+            earlier_now,
+            json.dumps(cloned_attention_attribution),
+        ),
     )
     portal.call(
         services.database.execute,
@@ -552,6 +588,7 @@ def test_token_branch_validates_telemetry_and_clones_lineage_into_a_new_chat(
     assert cloned_details["tokens"][0]["reasoning_slices"] == [
         {"kind": "answer", "start": 0, "end": 7}
     ]
+    assert cloned_details["tokens"][0]["attention_attribution"] == (cloned_attention_attribution)
     assert cloned_details["tokens"][0]["alternatives"][0]["token_id"] == 8
     assert cloned_details["summary"] == {"finish_reason": "stop"}
     assert cloned_details["warnings"] == ["historical warning"]

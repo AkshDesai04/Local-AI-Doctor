@@ -73,6 +73,31 @@ Lower perplexity means the generated sequence was more likely under this exact m
 
 The core math library also defines post-sampler perplexity, but the production token schema currently persists the raw running/response values and the selected token's sampler likelihood rather than a run-level post-sampler perplexity.
 
+## Context attention attribution
+
+For a decoder-only generation run at `full` or `expert` instrumentation, each generated token can carry a bounded summary of the causal self-attention rows used by the forward pass that produced its logits. If generated token `y_t` is predicted from source positions `j` in the rendered prompt and already-generated prefix, the worker reads the final query row returned by each usable layer `l` and attention head `h`:
+
+```text
+A[l,h,t,j] = exp(S[l,h,t,j]) / sum over allowed k of exp(S[l,h,t,k])
+
+mean_attention[t,j]
+    = (1 / captured_head_rows) * sum over captured (l,h) of A[l,h,t,j]
+```
+
+Here `S` is the model's actual masked pre-softmax attention score, including its architecture-specific scaling and position treatment; for ordinary scaled dot-product attention it contains `QK^T / sqrt(d_head)` plus the causal mask. The worker clamps only numerical underflow below zero and normalizes the resulting mean back to unit mass. The stored values are therefore the post-softmax attention allocations returned by the eager forward pass that actually produced that step's logits, summarized by an arithmetic mean across all captured layer/head rows. The mean is a deliberate visualization statistic, not a uniquely correct explanation of the model, and the individual per-layer/per-head matrices are not persisted.
+
+The attention row is specific to the decoding step and its prefix, not to one vocabulary candidate. With an unchanged prefix, it is the same row whether the sampler chooses the observed token or a different candidate from that step's logits. Attention weight is therefore not the probability that a source token caused the selected token, and it is unrelated to the selected token's raw or sampler probability. It does not include the direction or magnitude of value vectors, attention output projections, residual-stream state, layer normalization, MLP contributions, or the final vocabulary projection. High attention can accompany little downstream effect, and low direct attention does not rule out information already mixed into another position. Consequently this view can guide investigation, but it cannot by itself prove grounding, factuality, or hallucination.
+
+The context positions have these semantics:
+
+- `prompt` covers the exact tokenizer input after chat-template rendering. It includes system text, earlier conversation turns, the current user prompt, and any template/control tokens. Arbitrary templates can inject or rewrite text, so prompt positions are not guessed back into message/role boundaries.
+- `generated` covers earlier tokens from the same assistant response. The token being explained is never one of its own sources because causal decoding predicts it from the preceding context.
+- `context_index` is the absolute zero-based position in that combined model context. A generated source also carries its zero-based `generated_token_index`.
+
+Persisting every source weight for every generated token would grow quadratically. Each attribution therefore retains at most the 128 highest-weight source positions, keeps their original normalized-row weights, and reports `retained_weight` plus `omitted_weight`; retained weights are not renormalized. Retained entries are stored in context order after selection. Token 0 additionally stores the complete prompt-token catalogue once, and the client combines it with persisted generated-token rows so lower-weight positions can remain visible but dimmed. Heat intensity is scaled relative to the strongest retained source for legibility; hover text reports the exact stored mean weight and its percentage of the normalized row.
+
+Capture is supported only for decoder-only causal text generation. Encoder-decoder models have distinct decoder self-attention and encoder cross-attention distributions, so the workbench does not merge them into a misleading single score. A model must also support switching to eager attention and expose usable per-layer tensors. Otherwise the run emits an `attention_capture_unavailable` warning and continues without attribution.
+
 ## Prompt scoring
 
 `POST /api/v1/runs/prompt-score` performs a separate teacher-forced forward pass for causal generation models only. Encoder-decoder scoring is rejected because this endpoint has one text field rather than distinct source and target inputs. For tokens `x_0 ... x_(n-1)`, the logit row at position `t-1` scores target `x_t`. The first token has no preceding in-sequence distribution and is excluded.
@@ -131,10 +156,10 @@ The API accepts `off`, `basic`, `token`, `full`, and `expert`. The important cos
 | `off` | Emits token identity/display text, selected raw/processed logits, selected sampler likelihood, sampler/filter identity, timing, throughput, and segment. Skips exact raw full-vocabulary normalization/rank, entropy, surprise, perplexity, and alternatives. |
 | `basic` | Same current capture as `off`. It is a reserved semantic tier even though its present fields are identical. |
 | `token` | Adds exact selected raw log probability/probability/rank, sampler entropy/surprise, cumulative likelihood/perplexity, segment likelihood summaries, and up to the requested number of bounded raw/sampling alternatives. |
-| `full` | `token` capture plus explicit CUDA synchronization around forward timing. |
-| `expert` | Current `full` behavior. Router fields are emitted as not applicable for dense models; no production MoE hook is composed. |
+| `full` | `token` capture plus explicit CUDA synchronization around forward timing and bounded causal self-attention attribution for compatible decoder-only models. |
+| `expert` | Current `full` behavior, including attention attribution. Router fields are emitted as not applicable for dense models; no production MoE hook is composed. |
 
-`off` and `basic` still perform the sampling distribution work required to choose a token, so they are not zero-overhead modes. No measured overhead percentage is returned. Benchmark levels independently before comparing throughput. Attention maps, hidden-state norms, activation probes, logit lens, and routed-expert traces are capability placeholders, not active captures.
+`off` and `basic` still perform the sampling distribution work required to choose a token, so they are not zero-overhead modes. No measured overhead percentage is returned. Benchmark levels independently before comparing throughput. `full` and `expert` temporarily select eager attention for compatible causal decoders and restore the model's configured implementation afterward. To avoid materializing a prompt-by-prompt attention matrix, the worker prefills every prompt token except the last into the KV cache and captures only the last prompt query row that predicts token 0; later decode steps already have one query position. Eager kernels, the split prefill, tensor capture, CPU transfer, persistence, and CUDA synchronization can materially reduce throughput and can produce floating-point differences from SDPA or Flash Attention. Hidden-state norms, activation probes, logit lens, and production routed-expert traces remain capability placeholders rather than active captures.
 
 ## Reproducibility
 
