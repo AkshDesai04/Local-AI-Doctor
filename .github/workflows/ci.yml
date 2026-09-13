@@ -239,8 +239,33 @@ jobs:
               -F "tag=$tag"
             if ($LASTEXITCODE -ne 0) { throw "Could not query release identity for $tag." }
             $releaseId = ($identityJson | ConvertFrom-Json).data.repository.release.databaseId
-            if ($null -eq $releaseId) { return $null }
-            return Invoke-RestMethod -Method Get -Uri "$apiRoot/releases/$releaseId" -Headers $apiHeaders
+            if ($null -ne $releaseId) {
+              return Invoke-RestMethod -Method Get -Uri "$apiRoot/releases/$releaseId" -Headers $apiHeaders
+            }
+
+            # GitHub can expose a newly-created draft under an internal
+            # untagged-* alias. Recover it by its unique title and commit.
+            $draftMatches = @()
+            $page = 1
+            do {
+              $pageResponse = Invoke-RestMethod `
+                -Method Get `
+                -Uri "${apiRoot}/releases?per_page=100&page=$page" `
+                -Headers $apiHeaders
+              $pageReleases = @($pageResponse)
+              $draftMatches += @($pageReleases | Where-Object {
+                $_.draft -and
+                $_.name -eq $releaseTitle -and
+                ([string] $_.target_commitish).ToLowerInvariant() -eq $currentSha
+              })
+              $page += 1
+            } while ($pageReleases.Count -eq 100)
+
+            if ($draftMatches.Count -gt 1) {
+              throw "Multiple draft releases match $releaseTitle at $currentSha."
+            }
+            if ($draftMatches.Count -eq 1) { return $draftMatches[0] }
+            return $null
           }
 
           $integrityPattern = '(?m)^[ \t]*<!-- local-ai-doctor-release-integrity:v1 commit=(?<commit>[0-9a-f]{40,64}) asset=(?<asset>[^ \r\n]+) digest=(?<digest>sha256:[0-9a-f]{64}) -->[ \t]*\r?$'
@@ -280,7 +305,7 @@ jobs:
               "$cleanBody`n`n$expectedMarker"
             }
             $payload = @{ body = $updatedBody } | ConvertTo-Json -Compress
-            $null = Invoke-RestMethod `
+            return Invoke-RestMethod `
               -Method Patch `
               -Uri "$apiRoot/releases/$($Release.id)" `
               -Headers $apiHeaders `
@@ -330,8 +355,14 @@ jobs:
                 gh api --method DELETE "repos/${{ github.repository }}/releases/assets/$($existingAsset.id)"
                 if ($LASTEXITCODE -ne 0) { throw "Could not remove an incomplete draft asset." }
               }
-              gh release upload $tag $artifact --repo "${{ github.repository }}"
-              if ($LASTEXITCODE -ne 0) { throw "Could not upload the executable to draft release $tag." }
+              $encodedAssetName = [Uri]::EscapeDataString($artifactName)
+              $uploadUri = ([string] $release.upload_url) -replace '\{\?name,label\}$', "?name=$encodedAssetName"
+              $null = Invoke-RestMethod `
+                -Method Post `
+                -Uri $uploadUri `
+                -Headers $apiHeaders `
+                -ContentType "application/octet-stream" `
+                -InFile $artifact
             } else {
               $createArguments = @(
                 "release", "create", $tag, $artifact,
@@ -353,27 +384,27 @@ jobs:
             if (@($draft.assets).Count -ne 1 -or @($draftAsset).Count -ne 1 -or $draftAsset[0].digest -ne $expectedDigest) {
               throw "Draft release verification failed; it was left unpublished for recovery."
             }
-            Set-ReleaseIntegrity $draft
-            $draft = Get-ReleaseByTag
-            if ($null -eq $draft) { throw "Draft release $tag could not be retrieved after recording integrity metadata." }
+            $draft = Set-ReleaseIntegrity $draft
             $null = Assert-ReleaseIntegrity $draft $expectedDigest
 
-            $prereleaseValue = $expectedPrerelease.ToString().ToLowerInvariant()
-            $editArguments = @(
-              "release", "edit", $tag,
-              "--repo", "${{ github.repository }}",
-              "--title", $releaseTitle,
-              "--draft=false",
-              "--prerelease=$prereleaseValue"
-            )
-            if ($channel -eq "stable") { $editArguments += "--latest" }
-            & gh @editArguments
-            if ($LASTEXITCODE -ne 0) { throw "The verified draft could not be published." }
+            $publishPayload = @{
+              tag_name = $tag
+              target_commitish = $currentSha
+              name = $releaseTitle
+              draft = $false
+              prerelease = $expectedPrerelease
+              make_latest = if ($channel -eq "stable") { "true" } else { "false" }
+            } | ConvertTo-Json -Compress
+            $release = Invoke-RestMethod `
+              -Method Patch `
+              -Uri "$apiRoot/releases/$($draft.id)" `
+              -Headers $apiHeaders `
+              -ContentType "application/json; charset=utf-8" `
+              -Body $publishPayload
           }
 
-          $release = Get-ReleaseByTag
-          if ($null -eq $release) { throw "Published release $tag could not be retrieved." }
-          if ($release.draft -or [bool]$release.prerelease -ne $expectedPrerelease) {
+          $release = Invoke-RestMethod -Method Get -Uri "$apiRoot/releases/$($release.id)" -Headers $apiHeaders
+          if ($release.tag_name -ne $tag -or $release.draft -or [bool]$release.prerelease -ne $expectedPrerelease) {
             throw "The GitHub release does not contain exactly the expected executable asset."
           }
           $finalIntegrity = Assert-ReleaseIntegrity $release
