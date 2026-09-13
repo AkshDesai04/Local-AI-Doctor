@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import math
@@ -67,7 +68,13 @@ def _safe_error(exc: BaseException) -> dict[str, Any]:
     return {"code": code, "message": message, "hint": hint, "exception": type(exc).__name__}
 
 
-def _render_messages(tokenizer: Any, messages: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
+def _render_messages(
+    tokenizer: Any,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    reasoning: bool | None = None,
+    reasoning_delimiters: tuple[str, str] | None = None,
+) -> tuple[str, str]:
     """Render chat messages, with a deterministic plain-text fallback.
 
     Many encoder-decoder checkpoints have no chat template at all.  A single
@@ -81,13 +88,44 @@ def _render_messages(tokenizer: Any, messages: Sequence[Mapping[str, Any]]) -> t
     template = getattr(tokenizer, "chat_template", None)
     apply_template = getattr(tokenizer, "apply_chat_template", None)
     if template and callable(apply_template):
-        rendered = apply_template(
-            list(messages),
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        template_options: dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if reasoning is not None:
+            # Transformers forwards extra keyword arguments to the tokenizer's
+            # Jinja template. Thinking-capable templates (for example Qwen3)
+            # consume ``enable_thinking``; ordinary templates safely ignore it.
+            template_options["enable_thinking"] = reasoning
+        rendered = apply_template(list(messages), **template_options)
         if not isinstance(rendered, str):
             raise ValueError("tokenizer chat template did not render text")
+        if reasoning is False and reasoning_delimiters is not None:
+            opening, closing = reasoning_delimiters
+            trimmed = rendered.rstrip()
+            if trimmed.endswith(opening):
+                history_only: Any = None
+                # The preference remains best-effort for unusual custom
+                # templates; never rewrite a suffix without proving that it
+                # came from the generation prompt.
+                with contextlib.suppress(TypeError, ValueError):
+                    history_only = apply_template(
+                        list(messages),
+                        tokenize=False,
+                        add_generation_prompt=False,
+                        enable_thinking=False,
+                    )
+                if isinstance(history_only, str):
+                    history = history_only.rstrip()
+                    prompt_suffix = (
+                        trimmed[len(history) :].strip() if trimmed.startswith(history) else ""
+                    )
+                    # Some reasoning checkpoints hard-code an opening marker
+                    # and ignore ``enable_thinking``. Only close it when the
+                    # history-only rendering proves the marker was injected by
+                    # add_generation_prompt, rather than typed by the user.
+                    if prompt_suffix.endswith(opening):
+                        rendered = f"{trimmed}\n\n{closing}\n\n"
         return rendered, "chat_template"
 
     normalized: list[tuple[str, str]] = []
@@ -613,7 +651,15 @@ class WorkerRuntime:
                 },
             )
         template_started = time.monotonic_ns()
-        rendered_prompt, prompt_renderer = _render_messages(self.tokenizer, messages)
+        reasoning_requested = command.get("reasoning")
+        if reasoning_requested is not None and not isinstance(reasoning_requested, bool):
+            raise ValueError("reasoning must be a boolean when provided")
+        rendered_prompt, prompt_renderer = _render_messages(
+            self.tokenizer,
+            messages,
+            reasoning=reasoning_requested,
+            reasoning_delimiters=self.model_info.get("reasoning_delimiters"),
+        )
         template_ended = time.monotonic_ns()
         if prompt_renderer == "plain_text_fallback":
             self._emit_run(
@@ -734,6 +780,7 @@ class WorkerRuntime:
                 if encoder_decoder
                 else None,
                 "reasoning_primed": reasoning_primed,
+                "reasoning_requested": reasoning_requested,
                 "template_ms": (template_ended - template_started) / 1e6,
                 "tokenization_ms": (tokenization_ended - tokenization_started) / 1e6,
             },

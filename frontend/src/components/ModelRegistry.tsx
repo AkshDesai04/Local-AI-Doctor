@@ -20,11 +20,13 @@ import { api } from "../api/client";
 import type { CapabilityKey, CapabilityState, ModelInspection, ModelSummary } from "../api/types";
 import { capabilityKeys, capabilityLabel, capabilityOf } from "../domain/capabilities";
 import { formatNumber, shortFingerprint } from "../utils/format";
+import { ModelRootSettings } from "./ModelRootSettings";
 
 interface ModelRegistryProps {
   models: ModelSummary[];
   connected: boolean;
   onRefresh: () => void;
+  onSynchronize: () => void;
   onToggleLoaded: (model: ModelSummary) => void;
   onSelectModel: (id: string) => void;
 }
@@ -90,13 +92,14 @@ function ModelCard({ model, onToggleLoaded, onSelectModel }: { model: ModelSumma
   );
 }
 
-export function ModelRegistry({ models, connected, onRefresh, onToggleLoaded, onSelectModel }: ModelRegistryProps): React.ReactNode {
+export function ModelRegistry({ models, connected, onRefresh, onSynchronize, onToggleLoaded, onSelectModel }: ModelRegistryProps): React.ReactNode {
   return (
     <main className="model-registry">
       <header className="workspace-titlebar registry-titlebar">
         <div><span className="eyebrow">Read-only discovery</span><h1>Model registry</h1><p>Capabilities are adapter claims with reasons—not guesses based on architecture names.</p></div>
         <button className="button primary" disabled={!connected} onClick={onRefresh} type="button"><RefreshCw size={15} /> Rescan roots</button>
       </header>
+      <ModelRootSettings connected={connected} modelLoaded={models.some((model) => model.lifecycle === "loaded")} onRefresh={onSynchronize} />
       {!models.length ? (
         <div className="registry-empty"><div className="empty-orbit"><Database size={23} /></div><h2>{connected ? "No model folders discovered" : "Backend offline"}</h2><p>{connected ? "Check the effective configuration for a readable model root, then rescan. Model roots are never modified." : "Start the local backend before scanning configured roots."}</p></div>
       ) : (

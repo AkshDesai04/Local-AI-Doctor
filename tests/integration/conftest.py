@@ -72,6 +72,19 @@ def api_settings(tmp_path_factory: pytest.TempPathFactory) -> AppSettings:
 
 
 @pytest.fixture(scope="module")
-def api_client(api_settings: AppSettings) -> Iterator[TestClient]:
-    with TestClient(create_app(api_settings), base_url="http://127.0.0.1") as client:
+def api_user_config_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("api-user-config") / "local.yaml"
+    path.write_text("schema_version: 1\n", encoding="utf-8")
+    return path
+
+
+@pytest.fixture(scope="module")
+def api_client(
+    api_settings: AppSettings,
+    api_user_config_path: Path,
+) -> Iterator[TestClient]:
+    with TestClient(
+        create_app(api_settings, user_config_path=api_user_config_path),
+        base_url="http://127.0.0.1",
+    ) as client:
         yield client

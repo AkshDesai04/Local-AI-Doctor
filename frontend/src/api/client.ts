@@ -685,6 +685,7 @@ export const api = {
         device: body.settings.device,
         dtype: body.settings.dtype,
         instrumentation: body.settings.instrumentation,
+        reasoning: body.settings.reasoning,
         deterministic_reference_mode: body.settings.deterministic,
         sampling: {
           max_output_tokens: body.settings.maxOutputTokens,

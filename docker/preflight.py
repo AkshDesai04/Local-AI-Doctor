@@ -7,7 +7,8 @@ import tempfile
 from pathlib import Path
 
 MODEL_ROOT = Path("/models")
-CONFIG_PATHS = (Path("/app/config/default.yaml"), Path("/app/config/local.yaml"))
+DEFAULT_CONFIG_PATH = Path("/app/config/default.yaml")
+USER_CONFIG_PATH = Path("/app/user-config/local.yaml")
 WRITABLE_ROOTS = (
     Path("/data/database"),
     Path("/data/uploads"),
@@ -23,9 +24,22 @@ def main() -> None:
     if not os.statvfs(MODEL_ROOT).f_flag & os.ST_RDONLY:
         raise SystemExit("/models is not mounted read-only")
 
-    for path in CONFIG_PATHS:
+    for path in (DEFAULT_CONFIG_PATH, USER_CONFIG_PATH):
         if not path.is_file() or not os.access(path, os.R_OK):
             raise SystemExit(f"required configuration is not readable: {path}")
+    try:
+        descriptor = os.open(USER_CONFIG_PATH, os.O_WRONLY)
+        os.close(descriptor)
+        with tempfile.NamedTemporaryFile(
+            dir=USER_CONFIG_PATH.parent,
+            prefix=".config-write-check-",
+            delete=True,
+        ):
+            pass
+    except OSError as exc:
+        raise SystemExit(
+            f"user-local configuration and its directory must be writable: {USER_CONFIG_PATH}: {exc}"
+        ) from exc
 
     for root in WRITABLE_ROOTS:
         if not root.is_dir():

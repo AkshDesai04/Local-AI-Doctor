@@ -114,7 +114,11 @@ Install a PyTorch wheel appropriate to that WSL environment when using GPU passt
 
 ## Containers through WSL2
 
-Docker operations are intentionally routed through WSL2. Copy `.env.example` to the ignored `.env`, set a Linux-visible `MODEL_PATH`, then use the wrapper:
+Docker operations are intentionally routed through WSL2. Copy `.env.example` to the ignored `.env`
+and `config/local.example.yaml` to the ignored `config/local.yaml`, set a Linux-visible `MODEL_PATH`,
+then use the wrapper. The Model registry screen can subsequently persist backend-visible model roots
+to that local configuration; containers normally use `/models` because the host directory remains a
+read-only bind mount.
 
 ```powershell
 .\scripts\wsl-docker.ps1 -Action Check

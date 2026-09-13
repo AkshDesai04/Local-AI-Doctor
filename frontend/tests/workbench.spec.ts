@@ -16,6 +16,7 @@ const model = {
     video: { state: "unsupported", reason: "Text-only fixture." },
     raw_logits: { state: "full" },
     streaming: { state: "full" },
+    reasoning_segments: { state: "full" },
     moe_routing: { state: "unsupported", reason: "Dense fixture." },
   },
 };
@@ -124,4 +125,23 @@ test("mobile chat cleans protocol text and wraps the run summary", async ({ page
   const viewport = page.viewportSize();
   if (!bounds || !viewport) throw new Error("Expected a measurable mobile run summary.");
   expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.width + 0.5);
+});
+
+test("mobile prompt controls stay inside a narrow viewport", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chromium", "mobile-only assertion");
+  await page.setViewportSize({ width: 320, height: 360 });
+
+  await page.getByRole("button", { name: "Prompt controls" }).click();
+  await expect(page.getByRole("slider", { name: "Temperature" })).toBeVisible();
+  await expect(page.getByRole("slider", { name: "Top K" })).toBeVisible();
+  await expect(page.getByRole("slider", { name: "Top P" })).toBeVisible();
+
+  const panel = page.getByLabel("Prompt controls panel");
+  const bounds = await panel.boundingBox();
+  const viewport = page.viewportSize();
+  if (!bounds || !viewport) throw new Error("Expected measurable prompt controls.");
+  expect(bounds.x).toBeGreaterThanOrEqual(-0.5);
+  expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.width + 0.5);
+  expect(bounds.y).toBeGreaterThanOrEqual(-0.5);
+  expect(bounds.y + bounds.height).toBeLessThanOrEqual(viewport.height + 0.5);
 });

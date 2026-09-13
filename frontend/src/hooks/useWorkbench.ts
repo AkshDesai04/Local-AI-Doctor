@@ -16,9 +16,11 @@ import type {
   RunStreamEvent,
   TokenAlternative,
 } from "../api/types";
+import { isUsable } from "../domain/capabilities";
 import { cleanAssistantOutput } from "../utils/markdown";
 
 export const defaultGenerationSettings: GenerationSettings = {
+  reasoning: true,
   device: "auto",
   dtype: "auto",
   instrumentation: "token",
@@ -57,6 +59,7 @@ export function generationSettingsFromConfiguration(
   const instrumentation = inference.instrumentation;
   return {
     ...defaultGenerationSettings,
+    reasoning: inference.reasoning !== false,
     device: device === "cpu" || device === "cuda" ? device : "auto",
     dtype: dtype === "float32" || dtype === "float16" || dtype === "bfloat16" ? dtype : "auto",
     instrumentation: instrumentation === "off" || instrumentation === "basic"
@@ -194,9 +197,17 @@ function restoreClientTelemetry(run: RunDetails): RunDetails {
 
 function mergeRefreshedRun(persisted: RunDetails, live: RunDetails): RunDetails {
   const liveTokens = new Map(live.tokens.map((token) => [token.index, token]));
+  const finalizedMetrics = mergeMetrics(live.metrics, persisted.metrics ?? {});
   return {
     ...persisted,
-    metrics: mergeMetrics(persisted.metrics, live.metrics ?? {}),
+    metrics: {
+      ...finalizedMetrics,
+      timing: {
+        ...finalizedMetrics.timing,
+        clientTtftMs: live.metrics?.timing?.clientTtftMs ?? finalizedMetrics.timing?.clientTtftMs,
+        firstVisibleTextMs: live.metrics?.timing?.firstVisibleTextMs ?? finalizedMetrics.timing?.firstVisibleTextMs,
+      },
+    },
     tokens: persisted.tokens.map((token) => {
       const liveToken = liveTokens.get(token.index);
       return liveToken ? { ...token, timing: { ...token.timing, ...liveToken.timing } } : token;
@@ -532,7 +543,9 @@ export function useWorkbench(): WorkbenchState {
       const synchronized = reflectLoadedModel(discovered, backendHealth);
       setHealth(backendHealth);
       setModels(synchronized);
-      setSelectedModelId((current) => current || synchronized.find((model) => model.lifecycle === "loaded")?.id || synchronized[0]?.id || "");
+      setSelectedModelId((current) => synchronized.some((model) => model.id === current)
+        ? current
+        : synchronized.find((model) => model.lifecycle === "loaded")?.id || synchronized[0]?.id || "");
       setConnected(backendHealth.status !== "error");
     } catch {
       // Preserve the completed inference and the last coherent runtime snapshot
@@ -547,7 +560,9 @@ export function useWorkbench(): WorkbenchState {
       const discovered = reflectLoadedModel(scanned, backendHealth);
       setHealth(backendHealth);
       setModels(discovered);
-      setSelectedModelId((current) => current || discovered.find((model) => model.lifecycle === "loaded")?.id || discovered[0]?.id || "");
+      setSelectedModelId((current) => discovered.some((model) => model.id === current)
+        ? current
+        : discovered.find((model) => model.lifecycle === "loaded")?.id || discovered[0]?.id || "");
       setNotice(`Model scan complete: ${String(discovered.length)} found.`);
       setConnected(true);
     } catch (cause) {
@@ -608,11 +623,31 @@ export function useWorkbench(): WorkbenchState {
                 timing.firstVisibleTextMs = receipt - clientRequestStarted.current;
               }
             }
-            const hasTimingUpdate = timing.clientTtftMs !== undefined || timing.firstVisibleTextMs !== undefined;
+            const tokens = [...current.tokens, resolvedEvent.token];
+            const generatedTokens = Math.max(
+              current.metrics?.generatedTokens ?? 0,
+              current.metrics?.context?.generatedTokens ?? 0,
+              tokens.length,
+              resolvedEvent.token.index + 1,
+            );
+            const liveTokensPerSecond = resolvedEvent.token.timing?.rollingTps;
             return {
               ...current,
-              tokens: [...current.tokens, resolvedEvent.token],
-              metrics: hasTimingUpdate ? mergeMetrics(current.metrics, { timing }) : current.metrics,
+              status: current.status === "complete" || current.status === "cancelled" || current.status === "failed" ? current.status : "running",
+              tokens,
+              metrics: mergeMetrics(current.metrics, {
+                generatedTokens,
+                responsePerplexity: resolvedEvent.token.runningPerplexity,
+                timing: {
+                  ...timing,
+                  decodeTokensPerSecond: liveTokensPerSecond,
+                },
+                context: {
+                  ...current.metrics?.context,
+                  generatedTokens,
+                  effectiveLimit: current.metrics?.context?.effectiveLimit ?? null,
+                },
+              }),
               rawEvents,
             };
           }
@@ -699,7 +734,10 @@ export function useWorkbench(): WorkbenchState {
         modelId: selectedModel.id,
         content: content.trim(),
         attachmentIds: attachments.filter((item) => item.status === "ready").map((item) => item.id),
-        settings,
+        settings: {
+          ...settings,
+          reasoning: isUsable(selectedModel, "reasoning_segments") ? settings.reasoning !== false : undefined,
+        },
         parentMessageId: resolvedParentMessageId,
       };
       clientRequestStarted.current = performance.now();

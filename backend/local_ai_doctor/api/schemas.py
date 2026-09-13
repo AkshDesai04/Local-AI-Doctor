@@ -16,6 +16,27 @@ class StrictRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
+class ModelRootsUpdate(StrictRequest):
+    model_roots: list[str] = Field(min_length=1, max_length=16)
+
+    @field_validator("model_roots")
+    @classmethod
+    def model_roots_are_bounded_and_unique(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            candidate = value.strip()
+            if not candidate:
+                raise ValueError("model root paths must not be empty")
+            if len(candidate.encode("utf-8")) > 4096:
+                raise ValueError("model root paths must be at most 4096 UTF-8 bytes")
+            if any(ord(character) < 0x20 for character in candidate):
+                raise ValueError("model root paths must not contain control characters")
+            normalized.append(candidate)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("model root paths must not contain duplicates")
+        return normalized
+
+
 class ChatCreate(StrictRequest):
     title: str = Field(default="New chat", max_length=200)
 
@@ -74,6 +95,7 @@ class GenerationRunCreate(StrictRequest):
     device: DeviceMode | None = None
     dtype: DType | None = None
     instrumentation: InstrumentationLevel | None = None
+    reasoning: bool | None = None
     deterministic_reference_mode: bool = False
     sampling: SamplingRequest = Field(default_factory=SamplingRequest)
     attachment_ids: list[str] = Field(default_factory=list, max_length=1024)
@@ -97,7 +119,7 @@ class GenerationRunCreate(StrictRequest):
         browser_settings = data.pop("settings", None)
         if isinstance(browser_settings, Mapping):
             settings = dict(browser_settings)
-            for name in ("device", "dtype", "instrumentation"):
+            for name in ("device", "dtype", "instrumentation", "reasoning"):
                 if name in settings and name not in data:
                     data[name] = settings[name]
             raw_seed = settings.get("seed")

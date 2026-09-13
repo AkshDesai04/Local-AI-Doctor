@@ -140,9 +140,11 @@ export default function App(): React.ReactNode {
                   model={workbench.selectedModel}
                   onAttach={(file) => void workbench.addAttachment(file)}
                   onRemoveAttachment={workbench.removeAttachment}
+                  onSettingsChange={workbench.setSettings}
                   onStop={() => void workbench.stop()}
                   onSubmit={(content) => void workbench.submit(content)}
                   running={Boolean(workbench.runningRunId)}
+                  settings={workbench.settings}
                 />
               </>
             )}
@@ -161,6 +163,7 @@ export default function App(): React.ReactNode {
                 models={workbench.models}
                 onRefresh={() => void workbench.refreshModels()}
                 onSelectModel={workbench.setSelectedModelId}
+                onSynchronize={() => void workbench.synchronizeRuntimeState()}
                 onToggleLoaded={(model) => void workbench.toggleModelLoaded(model)}
               />
             )}

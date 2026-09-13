@@ -125,6 +125,115 @@ describe("runtime lifecycle synchronization", () => {
     expect(mockedApi.health.mock.calls).toHaveLength(2);
   });
 
+  it("updates live run summary metrics per token and replaces them with the durable final snapshot", async () => {
+    let resolvePersistedRun: ((run: RunDetails) => void) | undefined;
+    mockedApi.run.mockImplementationOnce(() => new Promise((resolve) => {
+      resolvePersistedRun = resolve;
+    }));
+    const { result } = renderHook(() => useWorkbench());
+    await waitFor(() => expect(result.current.booting).toBe(false));
+
+    await act(async () => {
+      await result.current.submit("Stream observability");
+    });
+
+    act(() => {
+      emitStreamEvent?.({
+        version: 1,
+        sequence: 1,
+        type: "token",
+        token: {
+          index: 0,
+          tokenId: 1,
+          piece: "Live",
+          displayText: "Live",
+          reasoningSegment: "answer",
+          runningPerplexity: 2.5,
+          timing: { rollingTps: 11.25 },
+        },
+      });
+    });
+    expect(result.current.selectedRun).toMatchObject({
+      id: "run-fixture",
+      status: "running",
+      metrics: {
+        generatedTokens: 1,
+        responsePerplexity: 2.5,
+        timing: { decodeTokensPerSecond: 11.25 },
+        context: { generatedTokens: 1 },
+      },
+    });
+
+    act(() => {
+      emitStreamEvent?.({
+        version: 1,
+        sequence: 2,
+        type: "token",
+        token: {
+          index: 1,
+          tokenId: 2,
+          piece: " metrics",
+          displayText: " metrics",
+          reasoningSegment: "answer",
+          runningPerplexity: 1.75,
+          timing: { rollingTps: 17.5 },
+        },
+      });
+    });
+    expect(result.current.selectedRun?.metrics).toMatchObject({
+      generatedTokens: 2,
+      responsePerplexity: 1.75,
+      timing: { decodeTokensPerSecond: 17.5 },
+      context: { generatedTokens: 2 },
+    });
+
+    act(() => {
+      emitStreamEvent?.({
+        version: 1,
+        sequence: 3,
+        type: "completed",
+        run: {
+          metrics: {
+            generatedTokens: 2,
+            responsePerplexity: 1.6,
+            timing: { decodeTokensPerSecond: 15 },
+          },
+        },
+      });
+    });
+    expect(result.current.selectedRun).toMatchObject({
+      status: "complete",
+      metrics: {
+        generatedTokens: 2,
+        responsePerplexity: 1.6,
+        timing: { decodeTokensPerSecond: 15 },
+      },
+    });
+    expect(result.current.runningRunId).toBeNull();
+    expect(resolvePersistedRun).toBeDefined();
+
+    act(() => {
+      resolvePersistedRun?.({
+        ...persistedRun,
+        id: "run-fixture",
+        messageId: "assistant-fixture",
+        tokens: result.current.selectedRun?.tokens ?? [],
+        metrics: {
+          generatedTokens: 2,
+          responsePerplexity: 1.5,
+          timing: { decodeTokensPerSecond: 14.5, totalMs: 180 },
+        },
+      });
+    });
+
+    await waitFor(() => expect(result.current.selectedRun?.metrics).toMatchObject({
+      generatedTokens: 2,
+      responsePerplexity: 1.5,
+      timing: { decodeTokensPerSecond: 14.5, totalMs: 180 },
+    }));
+    expect(mockedApi.run.mock.calls).toContainEqual(["run-fixture"]);
+  });
+
   it("restores the latest persisted run and inspector telemetry when a chat opens", async () => {
     window.localStorage.setItem("local-ai-doctor.client-telemetry.v1", JSON.stringify({
       [persistedRun.id]: {
@@ -332,6 +441,7 @@ describe("runtime lifecycle synchronization", () => {
     await act(async () => {
       await result.current.submit("Answer directly");
     });
+    expect(mockedApi.generate.mock.calls.at(-1)?.[0].settings.reasoning).toBeUndefined();
     now.mockReturnValue(2_025);
     act(() => {
       emitStreamEvent?.({

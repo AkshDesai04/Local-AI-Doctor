@@ -335,6 +335,7 @@ class ModelWorkerSupervisor:
         reserved_output_tokens: int,
         timeout_seconds: float,
         forced_prefix_token_ids: Sequence[int] = (),
+        reasoning: bool | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         if getattr(self, "_poisoned", False) or not self.alive:
             await self.start()
@@ -368,6 +369,7 @@ class ModelWorkerSupervisor:
                         "max_prompt_tokens": max_prompt_tokens,
                         "reserved_output_tokens": reserved_output_tokens,
                         "forced_prefix_token_ids": list(forced_prefix_token_ids),
+                        "reasoning": reasoning,
                     },
                     True,
                     timeout_seconds,

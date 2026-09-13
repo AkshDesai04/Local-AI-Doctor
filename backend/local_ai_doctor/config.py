@@ -18,10 +18,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import errno
 import hashlib
 import ipaddress
 import json
 import os
+import stat
+import tempfile
 import tomllib
 from collections.abc import Iterable, Mapping, MutableMapping, Sequence
 from enum import StrEnum
@@ -601,6 +604,108 @@ def _read_document(path: Path) -> dict[str, Any]:
     return migrate_config(parsed)
 
 
+def _serialize_document(path: Path, document: Mapping[str, Any]) -> bytes:
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if suffix in {".yaml", ".yml"}:
+        try:
+            import yaml
+        except ImportError as exc:
+            raise ConfigurationIOError(
+                "YAML configuration requires PyYAML",
+                hint="Install the backend dependencies or use a JSON user configuration.",
+            ) from exc
+        return yaml.safe_dump(
+            dict(document),
+            allow_unicode=True,
+            default_flow_style=False,
+            sort_keys=False,
+        ).encode("utf-8")
+    raise ConfigurationError(
+        "this user configuration format cannot be edited from the workbench",
+        hint="Use a .yaml, .yml, or .json user-local configuration file.",
+    )
+
+
+def persist_user_model_roots(
+    path: Path,
+    profile: ProfileName,
+    roots: Sequence[Path],
+) -> None:
+    """Persist model roots in the selected profile of the user-local wrapper.
+
+    Writes use a same-directory temporary file and replacement so a crash cannot
+    leave a partially serialized configuration. Docker single-file bind mounts
+    reject replacement with ``EBUSY``; for that specific case we overwrite and
+    fsync the already-mounted file after the complete payload has been prepared.
+    """
+
+    target = path.expanduser().resolve(strict=False)
+    document: dict[str, Any] = _read_document(target) if target.is_file() else {"schema_version": 1}
+    profiles = document.setdefault("profiles", {})
+    if not isinstance(profiles, MutableMapping):
+        raise ConfigurationError("configuration profiles must be an object/mapping")
+    selected = profiles.setdefault(profile.value, {})
+    if not isinstance(selected, MutableMapping):
+        raise ConfigurationError(f"profile {profile.value!r} must be an object/mapping")
+    paths = selected.setdefault("paths", {})
+    if not isinstance(paths, MutableMapping):
+        raise ConfigurationError(f"profile {profile.value!r} paths must be an object/mapping")
+    paths["model_roots"] = [str(root) for root in roots]
+    document["schema_version"] = CURRENT_SCHEMA_VERSION
+    payload = _serialize_document(target, document)
+
+    def overwrite_mounted_file() -> None:
+        with target.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    temporary: Path | None = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        existing_mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o600
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+            )
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EROFS} or not target.is_file():
+                raise
+            # A read-only container root can still contain one explicitly
+            # writable file bind mount, while rejecting sibling temp files.
+            overwrite_mounted_file()
+            return
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, existing_mode)
+        try:
+            os.replace(temporary, target)
+            temporary = None
+        except OSError as exc:
+            if exc.errno != errno.EBUSY or not target.is_file():
+                raise
+            # A bind-mounted file is itself a mount point and cannot be the
+            # destination of rename(2). Keep this fallback narrowly scoped.
+            overwrite_mounted_file()
+    except ConfigurationError:
+        raise
+    except OSError as exc:
+        raise ConfigurationIOError(
+            "could not update the user-local configuration file",
+            hint="Verify that the configured user-local file and its directory are writable.",
+            details={"filename": target.name, "reason": type(exc).__name__},
+        ) from exc
+    finally:
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+
+
 def _split_document(
     document: Mapping[str, Any], profile: ProfileName
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -773,4 +878,5 @@ __all__ = [
     "environment_overrides",
     "migrate_config",
     "parse_key_value_overrides",
+    "persist_user_model_roots",
 ]

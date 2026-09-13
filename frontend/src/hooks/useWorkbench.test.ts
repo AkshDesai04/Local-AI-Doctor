@@ -49,6 +49,7 @@ describe("configured generation defaults", () => {
       dtype: "bfloat16",
       instrumentation: "full",
       deterministic: true,
+      reasoning: true,
       maxOutputTokens: 77,
       topK: 7,
       alternatives: 4,

@@ -30,9 +30,9 @@ x-persistent-mounts: &persistent-mounts
     bind:
       create_host_path: false
   - type: bind
-    source: ${APP_CONFIG_PATH:-./config/local.example.yaml}
-    target: /app/config/local.yaml
-    read_only: true
+    source: ${APP_CONFIG_DIR:-./config}
+    target: /app/user-config
+    read_only: false
     bind:
       create_host_path: false
   - type: volume
@@ -53,11 +53,10 @@ x-persistent-mounts: &persistent-mounts
 
 x-app-environment: &app-environment
   LAD_CONFIG: /app/config/default.yaml
-  LAD_USER_CONFIG: /app/config/local.yaml
+  LAD_USER_CONFIG: /app/user-config/local.yaml
   LAD_SERVER__HOST: 127.0.0.1
   LAD_SERVER__PORT: 6767
   LAD_SERVER__ALLOWED_ORIGINS: '["http://127.0.0.1:6969","http://localhost:6969","http://127.0.0.1:6767","http://localhost:6767"]'
-  LAD_PATHS__MODEL_ROOTS: '["/models"]'
   LAD_PATHS__DATABASE: /data/database/workbench.sqlite3
   LAD_PATHS__UPLOADS: /data/uploads
   LAD_PATHS__CACHE: /data/cache

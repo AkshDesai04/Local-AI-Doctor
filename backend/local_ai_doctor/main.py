@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import csv
 import io
 import ipaddress
 import json
+import os
 import secrets
 import sys
 import uuid
@@ -48,11 +50,18 @@ from .api.schemas import (
     GenerationRunCreate,
     MessageCreate,
     ModelLoadRequest,
+    ModelRootsUpdate,
     PromptScoreRequest,
     TokenBranchCreate,
 )
-from .config import AppSettings, ProfileName, SettingsLoader
-from .errors import InvalidRequestError, PayloadTooLargeError, WorkbenchError
+from .config import AppSettings, ProfileName, SettingsLoader, persist_user_model_roots
+from .errors import (
+    CapabilityUnavailableError,
+    ConfigurationError,
+    InvalidRequestError,
+    PayloadTooLargeError,
+    WorkbenchError,
+)
 from .persistence import Database, TelemetryWriter, WorkspaceRepository
 from .services.events import EventBroker
 from .services.models import ModelRegistry
@@ -65,6 +74,9 @@ from .workers import ModelWorkerSupervisor
 @dataclass(slots=True)
 class ApplicationServices:
     settings: AppSettings
+    user_config_path: Path | None
+    model_roots_override_source: str | None
+    configuration_lock: asyncio.Lock
     database: Database
     repository: WorkspaceRepository
     telemetry: TelemetryWriter
@@ -85,6 +97,26 @@ def _load_settings() -> AppSettings:
         fallback_config=default_path if default_path.is_file() else None,
         fallback_user_config=local_path if local_path.is_file() else None,
     )
+
+
+def _user_configuration_path() -> Path:
+    options = SettingsLoader.parse_cli(sys.argv[1:])
+    configured = options.user_config or (
+        Path(os.environ["LAD_USER_CONFIG"])
+        if "LAD_USER_CONFIG" in os.environ
+        else Path.cwd() / "config" / "local.yaml"
+    )
+    return configured.expanduser().resolve(strict=False)
+
+
+def _model_roots_override_source() -> str | None:
+    if "LAD_PATHS__MODEL_ROOTS" in os.environ:
+        return "LAD_PATHS__MODEL_ROOTS environment override"
+    overrides = SettingsLoader.parse_cli(sys.argv[1:]).overrides
+    paths = overrides.get("paths")
+    if isinstance(paths, Mapping) and "model_roots" in paths:
+        return "--set paths.model_roots command-line override"
+    return None
 
 
 def _json_error(code: str, message: str, *, hint: str | None = None) -> dict[str, Any]:
@@ -231,8 +263,83 @@ def _auth_valid(
     return bool(candidate) and secrets.compare_digest(candidate, expected.get_secret_value())
 
 
-def create_app(settings: AppSettings | None = None) -> FastAPI:
+def _model_roots_configuration(services: ApplicationServices) -> dict[str, Any]:
+    path = services.user_config_path
+    reason: str | None = None
+    if services.model_roots_override_source:
+        reason = (
+            f"Model roots are controlled by the {services.model_roots_override_source}; "
+            "remove that higher-precedence override before editing them here."
+        )
+    elif path is None:
+        reason = "No user-local configuration file is configured for this backend."
+    elif path.suffix.lower() not in {".yaml", ".yml", ".json"}:
+        reason = "Workbench edits require a YAML or JSON user-local configuration file."
+    elif path.exists() and (not path.is_file() or not os.access(path, os.W_OK)):
+        reason = "The user-local configuration file is not writable by the backend."
+    return {
+        "model_roots": [str(root) for root in services.settings.paths.model_roots],
+        "writable": reason is None,
+        "source": "user-local configuration",
+        "reason": reason,
+        "containerized": services.settings.active_profile
+        in {ProfileName.CONTAINER_CPU, ProfileName.CONTAINER_NVIDIA},
+    }
+
+
+def _validated_model_roots(values: list[str]) -> tuple[Path, ...]:
+    resolved_roots: list[Path] = []
+    for index, value in enumerate(values):
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            raise ConfigurationError(
+                "model root paths must be absolute in the backend environment",
+                hint="For Docker, use the mounted container path (normally /models).",
+                details={"index": index},
+            )
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ConfigurationError(
+                "a configured model root does not exist or cannot be resolved",
+                hint="Choose an existing directory visible to the backend process.",
+                details={"index": index, "reason": type(exc).__name__},
+            ) from exc
+        if resolved == Path(resolved.anchor) or not resolved.is_dir():
+            raise ConfigurationError(
+                "a configured model root is not an eligible directory",
+                hint="Choose a dedicated directory containing local model folders.",
+                details={"index": index},
+            )
+        if not os.access(resolved, os.R_OK | os.X_OK):
+            raise ConfigurationError(
+                "a configured model root is not readable by the backend",
+                hint="Grant the backend read access or choose another directory.",
+                details={"index": index},
+            )
+        if resolved in resolved_roots:
+            raise ConfigurationError(
+                "model roots resolve to the same directory",
+                details={"index": index},
+            )
+        resolved_roots.append(resolved)
+    return tuple(resolved_roots)
+
+
+def create_app(
+    settings: AppSettings | None = None,
+    *,
+    user_config_path: Path | None = None,
+) -> FastAPI:
     effective_settings = settings or _load_settings()
+    configured_user_path = (
+        user_config_path.expanduser().resolve(strict=False)
+        if user_config_path is not None
+        else _user_configuration_path()
+        if settings is None
+        else None
+    )
+    roots_override_source = _model_roots_override_source() if settings is None else None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -325,6 +432,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         workspace = WorkspaceService(repository)
         app.state.services = ApplicationServices(
             settings=effective_settings,
+            user_config_path=configured_user_path,
+            model_roots_override_source=roots_override_source,
+            configuration_lock=asyncio.Lock(),
             database=database,
             repository=repository,
             telemetry=telemetry,
@@ -492,6 +602,51 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 "LAD_ environment overrides",
                 "--set command-line overrides",
             ],
+        }
+
+    @api.get("/configuration/model-roots")
+    async def model_root_configuration(request: Request) -> dict[str, Any]:
+        return _model_roots_configuration(_services(request))
+
+    @api.put("/configuration/model-roots")
+    async def update_model_root_configuration(
+        request: Request,
+        body: ModelRootsUpdate,
+    ) -> dict[str, Any]:
+        services = _services(request)
+        availability = _model_roots_configuration(services)
+        if not availability["writable"] or services.user_config_path is None:
+            raise ConfigurationError(
+                "model roots cannot be edited from this backend",
+                hint=str(availability["reason"]),
+            )
+        roots = _validated_model_roots(body.model_roots)
+        updated_paths = type(services.settings.paths).model_validate(
+            {
+                **services.settings.paths.model_dump(mode="python"),
+                "model_roots": roots,
+            }
+        )
+        async with (
+            services.configuration_lock,
+            services.registry.admission.lifecycle("model_roots_update"),
+        ):
+            if services.worker.loaded is not None:
+                raise CapabilityUnavailableError(
+                    "model roots cannot be changed while a model is loaded",
+                    hint="Unload the current model first so it cannot remain hidden while occupying memory.",
+                )
+            await asyncio.to_thread(
+                persist_user_model_roots,
+                services.user_config_path,
+                services.settings.active_profile,
+                roots,
+            )
+            services.settings.paths = updated_paths
+            await services.registry.refresh()
+        return {
+            **_model_roots_configuration(services),
+            "models": services.registry.public_report(),
         }
 
     @api.get("/hardware")

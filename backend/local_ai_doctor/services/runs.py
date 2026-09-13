@@ -211,6 +211,7 @@ class RunManager:
         sampling = _effective_sampling(self.settings, request.sampling)
         instrumentation = request.instrumentation or self.settings.inference.instrumentation
         deterministic_reference_mode = _effective_deterministic_mode(self.settings, request)
+        reasoning = request.reasoning
         reproducibility = {
             "requested_seed": None if request.seed is None else str(request.seed),
             "effective_seed": str(effective_seed),
@@ -224,6 +225,7 @@ class RunManager:
             "quantization": self.settings.runtime.quantization.value,
             "attention_implementation": self.settings.runtime.attention_backend.value,
             "deterministic_reference_mode": deterministic_reference_mode,
+            "reasoning": reasoning,
             "deterministic_kernels": {
                 "torch_use_deterministic_algorithms": deterministic_reference_mode,
                 "cublas_workspace_config": ":4096:8" if deterministic_reference_mode else None,
@@ -248,6 +250,7 @@ class RunManager:
                 "sampling": sampling,
                 "instrumentation": instrumentation.value,
                 "deterministic_reference_mode": deterministic_reference_mode,
+                "reasoning": reasoning,
             },
             "effective_config": self.settings.inference_snapshot(),
             "reproducibility": reproducibility,
@@ -285,6 +288,7 @@ class RunManager:
                 effective_seed=effective_seed,
                 instrumentation=instrumentation.value,
                 deterministic_reference_mode=deterministic_reference_mode,
+                reasoning=reasoning,
                 device=request.device,
                 dtype=request.dtype,
                 reservation=reservation,
@@ -370,6 +374,7 @@ class RunManager:
         dtype: Any,
         reservation: InferenceReservation,
         forced_prefix_token_ids: list[int] | None = None,
+        reasoning: bool | None = None,
     ) -> None:
         output = ""
         token_count = 0
@@ -403,6 +408,7 @@ class RunManager:
                 reserved_output_tokens=self.settings.inference.reserved_output_tokens,
                 timeout_seconds=self.settings.workers.inference_timeout_seconds,
                 forced_prefix_token_ids=forced_prefix_token_ids or (),
+                reasoning=reasoning,
             ):
                 event_type = str(worker_event["event_type"])
                 payload = dict(worker_event.get("payload", {}))
@@ -670,6 +676,8 @@ class RunManager:
                 details={"run_id": parent_run_id},
             ) from exc
         deterministic_reference_mode = bool(settings.get("deterministic_reference_mode", False))
+        recorded_reasoning = settings.get("reasoning")
+        reasoning = recorded_reasoning if isinstance(recorded_reasoning, bool) else None
         recorded_reproducibility = dict(source.get("reproducibility") or {})
         recorded_device = recorded_reproducibility.get("device")
         device: DeviceMode | None = None
@@ -703,6 +711,7 @@ class RunManager:
                 instrumentation=instrumentation,
                 effective_seed=effective_seed,
                 deterministic_reference_mode=deterministic_reference_mode,
+                reasoning=reasoning,
                 recorded_reproducibility=recorded_reproducibility,
                 selection=selection,
                 device=device,
@@ -728,6 +737,7 @@ class RunManager:
         instrumentation: InstrumentationLevel,
         effective_seed: int,
         deterministic_reference_mode: bool,
+        reasoning: bool | None,
         recorded_reproducibility: dict[str, Any],
         selection: Any,
         device: DeviceMode | None,
@@ -747,6 +757,7 @@ class RunManager:
         )
         reproducibility = {
             **recorded_reproducibility,
+            "reasoning": reasoning,
             "replayed_from_run_id": parent_run_id,
             "replayed_from_configuration_digest": (
                 source.get("effective_config", {}).get("configuration_digest")
@@ -778,6 +789,7 @@ class RunManager:
                     "sampling": sampling,
                     "instrumentation": instrumentation.value,
                     "deterministic_reference_mode": deterministic_reference_mode,
+                    "reasoning": reasoning,
                 },
                 "effective_config": self.settings.inference_snapshot(),
                 "reproducibility": reproducibility,
@@ -810,6 +822,7 @@ class RunManager:
                 effective_seed=effective_seed,
                 instrumentation=instrumentation.value,
                 deterministic_reference_mode=deterministic_reference_mode,
+                reasoning=reasoning,
                 device=device,
                 dtype=dtype,
                 reservation=reservation,
@@ -939,6 +952,8 @@ class RunManager:
                 details={"run_id": parent_run_id},
             ) from exc
         deterministic_reference_mode = bool(settings.get("deterministic_reference_mode", False))
+        recorded_reasoning = settings.get("reasoning")
+        reasoning = recorded_reasoning if isinstance(recorded_reasoning, bool) else None
         recorded_reproducibility = dict(source.get("reproducibility") or {})
         recorded_device = recorded_reproducibility.get("device")
         device: DeviceMode | None = None
@@ -983,6 +998,7 @@ class RunManager:
             "quantization": self.settings.runtime.quantization.value,
             "attention_implementation": self.settings.runtime.attention_backend.value,
             "deterministic_reference_mode": deterministic_reference_mode,
+            "reasoning": reasoning,
             "deterministic_kernels": {
                 "torch_use_deterministic_algorithms": deterministic_reference_mode,
                 "cublas_workspace_config": ":4096:8" if deterministic_reference_mode else None,
@@ -1023,6 +1039,7 @@ class RunManager:
                         "sampling": sampling,
                         "instrumentation": instrumentation.value,
                         "deterministic_reference_mode": deterministic_reference_mode,
+                        "reasoning": reasoning,
                         "token_branch": branch_details,
                     },
                     "effective_config": self.settings.inference_snapshot(),
@@ -1056,6 +1073,7 @@ class RunManager:
                     dtype=dtype,
                     reservation=reservation,
                     forced_prefix_token_ids=forced_prefix_token_ids,
+                    reasoning=reasoning,
                 ),
                 name=f"generation-token-branch-{run_id}",
             )

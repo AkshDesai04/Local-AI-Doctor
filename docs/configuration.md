@@ -41,6 +41,13 @@ A document without a `defaults` key is also accepted as a flat settings document
 
 Copy `config/local.example.yaml` to `config/local.yaml`; never edit the example with personal paths and never commit the local file.
 
+The Model registry screen can update `paths.model_roots` in the active profile of that same
+user-local YAML or JSON file and rescan without restarting. Paths must be absolute, existing,
+readable directories in the backend environment. In Docker, enter the mounted container path
+(normally `/models`), not the Windows or WSL host-side bind source. A higher-precedence
+`LAD_PATHS__MODEL_ROOTS` or `--set paths.model_roots=...` override intentionally disables web edits
+so the displayed setting cannot pretend to be durable.
+
 ## Environment and CLI values
 
 Environment variables use `LAD_` and double underscores between nested keys. Values are parsed as safe YAML scalars, so booleans, numbers, lists, and `null` retain their types.

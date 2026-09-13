@@ -27,6 +27,8 @@ function conversation(
     onBranch?: (content: string, parentMessageId: string | null) => void;
     onRetry?: (message: Message) => void;
     run?: RunDetails | null;
+    runningRunId?: string | null;
+    streamConnected?: boolean;
   } = {},
 ): React.ReactElement {
   return (
@@ -46,9 +48,9 @@ function conversation(
       onRetry={options.onRetry ?? vi.fn()}
       onSelectToken={vi.fn()}
       run={options.run ?? null}
-      runningRunId={null}
+      runningRunId={options.runningRunId ?? null}
       selectedToken={null}
-      streamConnected={false}
+      streamConnected={options.streamConnected ?? false}
     />
   );
 }
@@ -105,6 +107,88 @@ describe("chat response rendering", () => {
     render(conversation([clonedMessage], { nerdMode: true, run }));
 
     expect(screen.getByRole("button", { name: /Token 0 Done/i })).toBeInTheDocument();
+  });
+
+  it("uses live and persisted summary metrics even when retained token telemetry is partial", () => {
+    const run: RunDetails = {
+      id: "run-1",
+      messageId: "assistant-1",
+      modelId: "model-1",
+      status: "running",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [{ index: 0, tokenId: 13, piece: "Done.", displayText: "Done.", reasoningSegment: "answer" }],
+      metrics: {
+        generatedTokens: 4,
+        responsePerplexity: 1.75,
+        timing: { decodeTokensPerSecond: 12.5 },
+      },
+    };
+    render(conversation([message], { run }));
+
+    const summary = screen.getByRole("button", { name: /Inspect run/i });
+    expect(summary).toHaveTextContent("4 tokens");
+    expect(summary).toHaveTextContent("12.5 tok/s");
+    expect(summary).toHaveTextContent("PPL 1.75");
+    expect(summary).toHaveTextContent("running");
+  });
+
+  it("shows the live run strip before the first token arrives", () => {
+    const streamingMessage: Message = { ...message, content: "", status: "streaming" };
+    const run: RunDetails = {
+      id: "run-1",
+      messageId: "assistant-1",
+      modelId: "model-1",
+      status: "queued",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [],
+    };
+    render(conversation([streamingMessage], { run, runningRunId: run.id, streamConnected: true }));
+
+    const summary = screen.getByRole("button", { name: /Inspect run/i });
+    expect(summary).toHaveTextContent("0 tokens");
+    expect(summary).toHaveTextContent("queued · live");
+  });
+
+  it("does not label an inspected historical run as live for a different active run", () => {
+    const run: RunDetails = {
+      id: "run-1",
+      messageId: "assistant-1",
+      modelId: "model-1",
+      status: "complete",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [{ index: 0, tokenId: 13, piece: "Done.", displayText: "Done.", reasoningSegment: "answer" }],
+    };
+    render(conversation([message], { run, runningRunId: "another-run", streamConnected: true }));
+
+    const summary = screen.getByRole("button", { name: /Inspect run/i });
+    expect(summary).toHaveTextContent("complete");
+    expect(summary).not.toHaveTextContent("live");
+  });
+
+  it("shows compact token labels without tokenizer marker glyphs or multiline chips", () => {
+    const markedMessage = { ...message, content: " answer\n." };
+    const run: RunDetails = {
+      id: "run-token-labels",
+      messageId: "assistant-1",
+      modelId: "model-1",
+      status: "complete",
+      createdAt: "2026-09-12T00:00:00Z",
+      tokens: [
+        { index: 0, tokenId: 20, piece: "Ġanswer", displayText: " answer", reasoningSegment: "answer" },
+        { index: 1, tokenId: 21, piece: "Ċ", displayText: "\n", reasoningSegment: "answer" },
+        { index: 2, tokenId: 22, piece: "Ċ.", displayText: "\n.", reasoningSegment: "answer" },
+      ],
+    };
+    const { container } = render(conversation([markedMessage], { nerdMode: true, run }));
+
+    const answerToken = screen.getByRole("button", { name: "Token 0 answer" });
+    expect(answerToken).toHaveTextContent("answer");
+    expect(answerToken.getAttribute("title")).toContain("Raw tokenizer piece: Ġanswer");
+    expect(answerToken.getAttribute("title")).toContain("Click to inspect this token.");
+    expect(screen.getByRole("button", { name: "Token 1 ↵" })).toHaveTextContent("↵");
+    expect(screen.getByRole("button", { name: "Token 2 ." })).toHaveTextContent(".");
+    expect(Array.from(container.querySelectorAll(".nerd-token")).every((token) => !token.textContent?.includes("\n"))).toBe(true);
+    expect(container.textContent).not.toContain("Ġanswer");
   });
 
   it("uses exact reasoning slices so a mixed closing token does not hide answer text", () => {

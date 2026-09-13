@@ -15,3 +15,11 @@ profiles:
     paths:
       model_roots:
         - /mnt/x/path/to/read-only-models
+  container-cpu:
+    paths:
+      model_roots:
+        - /models
+  container-nvidia:
+    paths:
+      model_roots:
+        - /models

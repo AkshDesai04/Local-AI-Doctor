@@ -1,7 +1,7 @@
 import { Maximize2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { TokenEvent } from "../api/types";
-import { escapeToken, formatNumber } from "../utils/format";
+import { displayTokenText, formatNumber } from "../utils/format";
 
 export interface ChartMetric {
   key: string;
@@ -84,7 +84,7 @@ export function TraceChart({ title, tokens, metrics, revealTokenText = false, se
                   onClick={() => onSelectToken(token.index)}
                   r={selectedToken === token.index ? 5 : 2.5}
                   tabIndex={0}
-                ><title>#{String(token.index)}{revealTokenText ? ` “${escapeToken(token.piece)}”` : ""} · {formatNumber(value, 4)}</title></circle>
+                ><title>#{String(token.index)}{revealTokenText ? ` “${displayTokenText(token.displayText || token.piece) || "∅"}”` : ""} · {formatNumber(value, 4)}</title></circle>
               ))}
               <text className="chart-axis-title" x={(plot.left + width - plot.right) / 2} y={height - 7}>Generated token position</text>
             </svg>

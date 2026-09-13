@@ -270,6 +270,7 @@ export interface RunDetails {
 }
 
 export interface GenerationSettings {
+  reasoning?: boolean;
   device: "auto" | "cpu" | "cuda";
   dtype: "auto" | "float32" | "float16" | "bfloat16";
   instrumentation: "off" | "basic" | "token" | "full" | "expert";

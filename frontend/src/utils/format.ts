@@ -54,6 +54,50 @@ export function escapeToken(value: string): string {
     .replaceAll(" ", "·");
 }
 
+const tokenizerWhitespaceMarkers: Readonly<Record<string, string>> = {
+  "Ġ": " ",
+  "▁": " ",
+  "Ċ": "\n",
+  "č": "\r",
+  "ĉ": "\t",
+};
+
+/**
+ * Produces a compact, human-facing label for a tokenizer piece. Byte-level BPE
+ * and SentencePiece expose whitespace using private-looking glyphs such as
+ * `Ġ`, `Ċ`, and `▁`; those remain available in the raw metadata tooltip,
+ * but should not leak into the primary UI. Control whitespace is represented on
+ * one line so a newline-only token cannot stretch a token chip vertically.
+ */
+export function displayTokenText(value: string): string {
+  const characters = Array.from(value);
+  let markerEnd = 0;
+  let decodedPrefix = "";
+  while (markerEnd < characters.length) {
+    const marker = tokenizerWhitespaceMarkers[characters[markerEnd] ?? ""];
+    if (marker === undefined) break;
+    decodedPrefix += marker;
+    markerEnd += 1;
+  }
+  const decoded = `${decodedPrefix}${characters.slice(markerEnd).join("")}`;
+  if (!decoded) return "";
+  if (/^\s+$/u.test(decoded)) {
+    if (/\r|\n/u.test(decoded)) return decoded.replace(/\r\n|\r|\n/gu, "↵").replace(/[ \t]/gu, "");
+    if (decoded.includes("\t")) return "⇥";
+    return "␠";
+  }
+  return decoded
+    .trimStart()
+    .replace(/\r\n|\r|\n/gu, "↵")
+    .replaceAll("\t", "⇥");
+}
+
+/** Keeps exact tokenizer data discoverable without making it the visible label. */
+export function tokenTextHint(piece: string, displayText?: string): string {
+  const visible = displayTokenText(displayText ?? piece) || "∅";
+  return `Displayed text: ${visible}\nRaw tokenizer piece: ${escapeToken(piece) || "∅"}`;
+}
+
 export function downloadBlob(name: string, value: BlobPart, type: string): void {
   const url = URL.createObjectURL(new Blob([value], { type }));
   const anchor = document.createElement("a");

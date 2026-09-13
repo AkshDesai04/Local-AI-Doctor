@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { TokenEvent } from "../api/types";
-import { escapeToken, formatDuration, formatNumber, formatPercent } from "../utils/format";
+import { displayTokenText, formatDuration, formatNumber, formatPercent, tokenTextHint } from "../utils/format";
 
 interface VirtualTokenTableProps {
   tokens: TokenEvent[];
@@ -35,7 +35,7 @@ export function VirtualTokenTable({ tokens, selectedToken, onSelectToken }: Virt
   return (
     <div className="token-table-shell">
       <div className="token-table-header" role="row">
-        <span>#</span><span>Piece</span><span>ID</span><span>Model p</span><span>Sampler p</span><span>Rank</span><span>Latency</span>
+        <span title="Generation order">#</span><span title="Human-readable token text">Piece</span><span title="Tokenizer vocabulary ID">ID</span><span title="Probability before sampling filters">Model p</span><span title="Probability after sampling filters">Sampler p</span><span title="Raw model probability rank">Rank</span><span title="Time spent decoding this token">Latency</span>
       </div>
       <div
         aria-label="Token event table"
@@ -55,10 +55,11 @@ export function VirtualTokenTable({ tokens, selectedToken, onSelectToken }: Virt
               onClick={() => onSelectToken(token.index)}
               role="row"
               style={{ height: rowHeight, top: (start + localIndex) * rowHeight }}
+              title={`${tokenTextHint(token.piece, token.displayText)}\nClick to inspect this token.`}
               type="button"
             >
               <span>{String(token.index)}</span>
-              <span className="mono token-piece" title={escapeToken(token.piece)}>{escapeToken(token.piece) || "∅"}</span>
+              <span className="mono token-piece">{displayTokenText(token.displayText || token.piece) || "∅"}</span>
               <span className="mono">{String(token.tokenId)}</span>
               <span>{formatPercent(token.rawProbability, 3)}</span>
               <span>{formatPercent(token.samplingProbability, 3)}</span>

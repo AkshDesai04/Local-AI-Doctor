@@ -13,6 +13,7 @@ from local_ai_doctor.config import (
     ServerSettings,
     SettingsLoader,
     migrate_config,
+    persist_user_model_roots,
 )
 from local_ai_doctor.errors import ConfigurationError
 
@@ -111,3 +112,23 @@ def test_schema_zero_migration_is_explicit_and_non_mutating() -> None:
     assert source == {"models_path": "somewhere", "database_path": "state.db"}
     assert result["schema_version"] == 1
     assert result["paths"] == {"model_roots": ["somewhere"], "database": "state.db"}
+
+
+def test_model_root_update_persists_in_selected_user_profile(tmp_path: Path) -> None:
+    model_root = tmp_path / "models"
+    model_root.mkdir()
+    user = tmp_path / "local.yaml"
+    user.write_text(
+        "schema_version: 1\nprofiles:\n  native-windows:\n    runtime:\n      cpu_threads: 3\n",
+        encoding="utf-8",
+    )
+
+    persist_user_model_roots(user, ProfileName.NATIVE_WINDOWS, (model_root,))
+
+    saved = SettingsLoader().load(
+        user_path=user,
+        profile=ProfileName.NATIVE_WINDOWS,
+        environ={},
+    )
+    assert saved.paths.model_roots == (model_root.resolve(),)
+    assert saved.runtime.cpu_threads == 3

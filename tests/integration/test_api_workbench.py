@@ -4,12 +4,13 @@ import base64
 import hashlib
 import json
 from functools import partial
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from local_ai_doctor.config import AppSettings
+from local_ai_doctor.config import AppSettings, ProfileName, SettingsLoader
 
 API_TOKEN = "integration-test-token"
 API_HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
@@ -73,6 +74,82 @@ def test_health_configuration_redaction_and_model_scan(
     refreshed = api_client.post("/api/v1/models/refresh", headers=API_HEADERS)
     assert refreshed.status_code == 200
     assert refreshed.json()["models"][0]["id"] == descriptor["id"]
+
+
+def test_model_root_settings_are_persisted_and_rescanned(
+    api_client: TestClient,
+    api_settings: AppSettings,
+    api_user_config_path: Path,
+    tmp_path: Path,
+) -> None:
+    current = api_client.get("/api/v1/configuration/model-roots", headers=API_HEADERS)
+    assert current.status_code == 200
+    assert current.json() == {
+        "model_roots": [str(api_settings.paths.model_roots[0])],
+        "writable": True,
+        "source": "user-local configuration",
+        "reason": None,
+        "containerized": False,
+    }
+
+    original_root = api_settings.paths.model_roots[0]
+    alternate_root = tmp_path / "alternate-models"
+    alternate_root.mkdir()
+    try:
+        updated = api_client.put(
+            "/api/v1/configuration/model-roots",
+            headers=API_HEADERS,
+            json={"model_roots": [str(original_root), str(alternate_root)]},
+        )
+        assert updated.status_code == 200
+        assert [root["discovered_count"] for root in updated.json()["models"]["roots"]] == [1, 0]
+        reloaded = SettingsLoader().load(
+            user_path=api_user_config_path,
+            profile=ProfileName.TEST,
+            environ={},
+            base_dir=api_user_config_path.parent,
+        )
+        assert reloaded.paths.model_roots == (original_root.resolve(), alternate_root.resolve())
+    finally:
+        restored = api_client.put(
+            "/api/v1/configuration/model-roots",
+            headers=API_HEADERS,
+            json={"model_roots": [str(original_root)]},
+        )
+        assert restored.status_code == 200
+
+    assert "test:" in api_user_config_path.read_text(encoding="utf-8")
+    assert str(original_root) in api_user_config_path.read_text(encoding="utf-8")
+
+    relative = api_client.put(
+        "/api/v1/configuration/model-roots",
+        headers=API_HEADERS,
+        json={"model_roots": ["relative/models"]},
+    )
+    assert relative.status_code == 422
+    assert relative.json()["error"]["code"] == "configuration_invalid"
+
+
+def test_model_root_settings_require_an_unloaded_worker(
+    api_client: TestClient,
+    api_settings: AppSettings,
+    api_user_config_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = api_client.app.state.services
+    before = api_user_config_path.read_bytes()
+    monkeypatch.setattr(services.worker, "_loaded", {"model_id": "still-in-vram"})
+
+    response = api_client.put(
+        "/api/v1/configuration/model-roots",
+        headers=API_HEADERS,
+        json={"model_roots": [str(api_settings.paths.model_roots[0])]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "capability_unavailable"
+    assert "Unload" in response.json()["error"]["hint"]
+    assert api_user_config_path.read_bytes() == before
 
 
 def test_live_api_rejects_oversized_body_before_route_parsing(

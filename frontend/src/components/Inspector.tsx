@@ -22,7 +22,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { AlternativeDistribution, CapabilityKey, ConfigurationSnapshot, HealthStatus, ModelSummary, RunDetails, TokenAlternative, TokenEvent } from "../api/types";
 import { fetchRunExport } from "../api/client";
 import { capabilityOf, supportsGeneration } from "../domain/capabilities";
-import { downloadBlob, escapeToken, formatBytes, formatDuration, formatNumber, formatPercent, shortFingerprint } from "../utils/format";
+import { displayTokenText, downloadBlob, formatBytes, formatDuration, formatNumber, formatPercent, shortFingerprint, tokenTextHint } from "../utils/format";
 import { type ChartMetric, TraceChart } from "./TraceChart";
 import { VirtualTokenTable } from "./VirtualTokenTable";
 
@@ -88,27 +88,28 @@ function Alternatives({ title, distribution, alternatives, currentTokenId, nerdM
 }): React.ReactNode {
   return (
     <section className="alternatives-section">
-      <h4>{title}</h4>
+      <h4 title={distribution === "raw" ? "Probabilities directly from the model before sampling filters are applied." : "Probabilities after temperature, top-k, top-p, and other active sampling filters."}>{title}</h4>
       {!alternatives?.length ? <p className="muted">Not captured at this instrumentation level.</p> : (
         <div className="alternatives-table">
-          <div className="alternatives-head"><span>Rank</span><span>Piece</span><span>Probability</span><span>Log p</span><span>Filter</span></div>
+          <div className="alternatives-head"><span title="Probability rank within this distribution">Rank</span><span title="Human-readable token text; hover a row for the exact tokenizer piece">Piece</span><span title="Probability assigned to this token">Probability</span><span title="Natural logarithm of the token probability">Log p</span><span title="Whether this token survived the active sampling filters">Filter</span></div>
           {alternatives.map((item) => {
             const isCurrent = item.tokenId === currentTokenId;
             const isSelected = selected?.distribution === distribution
               && selected.alternative.tokenId === item.tokenId
               && selected.alternative.rank === item.rank;
+            const tokenLabel = displayTokenText(item.piece) || "∅";
             return (
             <button
-              aria-label={`${isCurrent ? "Current" : "Select"} token ${escapeToken(item.piece) || "empty token"} from the ${distribution} distribution`}
+              aria-label={`${isCurrent ? "Current" : "Select"} token ${tokenLabel} from the ${distribution} distribution`}
               aria-pressed={isSelected}
               className={`alternatives-row ${nerdMode && !isCurrent ? "selectable" : ""} ${isSelected ? "selected" : ""}`}
               disabled={!nerdMode || isCurrent}
               key={`${String(item.rank)}-${String(item.tokenId)}`}
               onClick={() => onSelect({ distribution, alternative: item })}
-              title={isCurrent ? "This is the token the model originally selected." : nerdMode ? "Select this token to branch the response." : "Enable Nerd Mode to branch from an alternative token."}
+              title={`${tokenTextHint(item.piece)}\n${isCurrent ? "This is the token the model originally selected." : nerdMode ? "Select this token to prepare a branched response." : "Enable Nerd Mode to branch from an alternative token."}`}
               type="button"
             >
-              <span>#{String(item.rank)}</span><code title={item.piece}>{escapeToken(item.piece) || "∅"}</code><span>{formatPercent(item.probability, 3)}</span><span>{formatNumber(item.logProbability, 4)}</span><span>{item.survivedFiltering === undefined ? "—" : item.survivedFiltering ? "kept" : "removed"}</span>
+              <span>#{String(item.rank)}</span><code>{tokenLabel}</code><span>{formatPercent(item.probability, 3)}</span><span>{formatNumber(item.logProbability, 4)}</span><span>{item.survivedFiltering === undefined ? "—" : item.survivedFiltering ? "kept" : "removed"}</span>
             </button>
           );})}
         </div>
@@ -136,14 +137,15 @@ function TokenDetail({ token, nerdMode, branching, canBranch, branchUnavailableR
     if (!selectedAlternative || branching || !canBranch) return;
     await onBranchAlternative(token.index, selectedAlternative.distribution, selectedAlternative.alternative);
   };
+  const selectedTokenLabel = displayTokenText(token.displayText || token.piece) || "∅";
   return (
     <div className="token-detail">
-      <div className="token-detail-hero"><span className={`segment-badge ${token.reasoningSegment}`}>{token.reasoningSegment}</span><code>{escapeToken(token.piece) || "∅"}</code><span>token #{String(token.index)}</span></div>
+      <div className="token-detail-hero" title={tokenTextHint(token.piece, token.displayText)}><span className={`segment-badge ${token.reasoningSegment}`}>{token.reasoningSegment}</span><code>{selectedTokenLabel}</code><span>token #{String(token.index)}</span></div>
       <dl className="definition-grid">
         <div><dt>Token ID</dt><dd>{String(token.tokenId)}</dd></div>
         <div><dt>Bytes</dt><dd className="mono">{token.bytes ?? "Not captured"}</dd></div>
         <div><dt>Character span</dt><dd>{token.characterSpan ? `${String(token.characterSpan[0])}–${String(token.characterSpan[1])}` : "Not captured"}</dd></div>
-        <div><dt>Decoded display</dt><dd className="mono">{escapeToken(token.displayText)}</dd></div>
+        <div><dt>Decoded display</dt><dd className="mono">{displayTokenText(token.displayText) || "∅"}</dd></div>
         <div><dt>Raw logit</dt><dd>{formatNumber(token.rawLogit, 5)}</dd></div>
         <div><dt>Processed logit</dt><dd>{formatNumber(token.processedLogit, 5)}</dd></div>
         <div><dt>Raw probability</dt><dd>{formatPercent(token.rawProbability, 5)}</dd></div>
@@ -163,8 +165,8 @@ function TokenDetail({ token, nerdMode, branching, canBranch, branchUnavailableR
       <Alternatives alternatives={token.samplingAlternatives} currentTokenId={token.tokenId} distribution="sampling" nerdMode={nerdMode} onSelect={setSelectedAlternative} selected={selectedAlternative} title="Top alternatives · sampler distribution" />
       {nerdMode && selectedAlternative && (
         <div className="branch-token-action">
-          <span>Continue from token <code>{escapeToken(selectedAlternative.alternative.piece) || "∅"}</code> in a new chat.</span>
-          <button disabled={branching || !canBranch} onClick={() => void branch()} title={!canBranch ? branchUnavailableReason : undefined} type="button"><GitBranch size={14} />{branching ? "Creating branch…" : canBranch ? "Branch out with selected token" : branchUnavailableReason}</button>
+          <span>Continue from token <code title={tokenTextHint(selectedAlternative.alternative.piece)}>{displayTokenText(selectedAlternative.alternative.piece) || "∅"}</code> in a new chat.</span>
+          <button disabled={branching || !canBranch} onClick={() => void branch()} title={!canBranch ? branchUnavailableReason : "Create a new chat from this point and force the selected alternative before continuing generation."} type="button"><GitBranch size={14} />{branching ? "Creating branch…" : canBranch ? "Branch out with selected token" : branchUnavailableReason}</button>
         </div>
       )}
       <div className="metric-note"><Info size={14} /><span>Alternatives are tokens with high probability under a distribution—not model thoughts or hidden reasoning.</span></div>

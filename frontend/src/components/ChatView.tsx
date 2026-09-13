@@ -22,7 +22,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
 import type { Message, ModelSummary, RunDetails, TokenEvent } from "../api/types";
 import { isUsable, supportsGeneration } from "../domain/capabilities";
-import { escapeToken, formatDuration, formatNumber, formatPercent } from "../utils/format";
+import { displayTokenText, formatDuration, formatNumber, formatPercent, tokenTextHint } from "../utils/format";
 import { cleanAssistantOutput, isTerminationToken, splitAssistantOutput } from "../utils/markdown";
 import { MarkdownMessage } from "./MarkdownMessage";
 
@@ -234,11 +234,11 @@ function groupNerdTokens(tokens: TokenEvent[], reasoningPrimed: boolean): NerdTo
 }
 
 function nerdTokenLabel(part: PositionedTokenPart): string {
-  const escaped = escapeToken(part.text || part.token.piece);
-  if (part.delimiterKind === "end") return `End reasoning token ${String(part.token.index)} ${escaped}`;
-  if (part.delimiterKind === "start") return `Start reasoning token ${String(part.token.index)} ${escaped}`;
-  if (isTerminationToken(part.text)) return `Termination token ${String(part.token.index)} ${escaped}`;
-  return `Token ${String(part.token.index)} ${escaped}`;
+  const label = displayTokenText(part.text || part.token.piece) || "empty token";
+  if (part.delimiterKind === "end") return `End reasoning token ${String(part.token.index)} ${label}`;
+  if (part.delimiterKind === "start") return `Start reasoning token ${String(part.token.index)} ${label}`;
+  if (isTerminationToken(part.text)) return `Termination token ${String(part.token.index)} ${label}`;
+  return `Token ${String(part.token.index)} ${label}`;
 }
 
 function NerdResponse({
@@ -275,6 +275,7 @@ function NerdResponse({
           const { token } = part;
           const value = nerdValue(token, metric, part.classification);
           const normalized = value === undefined ? 0 : (value - minimum) / range;
+          const tokenLabel = displayTokenText(part.text || token.piece) || "∅";
           return (
             <button
               aria-label={nerdTokenLabel(part)}
@@ -283,9 +284,9 @@ function NerdResponse({
               key={`${String(token.index)}:${String(part.start)}:${String(part.end)}`}
               onClick={() => { onSelectToken(token.index); onOpenInspector(); }}
               style={{ "--metric": String(normalized) } as React.CSSProperties}
-              title={`#${String(token.index)} ${escapeToken(token.piece)}\nID ${String(token.tokenId)} · raw p ${formatPercent(token.rawProbability, 3)} · sampler p ${formatPercent(token.samplingProbability, 3)}\n${formatDuration(token.timing?.decodeMs)} decode · ${token.reasoningSegment}`}
+              title={`Token #${String(token.index)}\n${tokenTextHint(token.piece, part.text || token.displayText)}\nID ${String(token.tokenId)} · raw p ${formatPercent(token.rawProbability, 3)} · sampler p ${formatPercent(token.samplingProbability, 3)}\n${formatDuration(token.timing?.decodeMs)} decode · ${token.reasoningSegment}\nClick to inspect this token.`}
               type="button"
-            >{part.text || "∅"}<span className="token-index">{String(token.index)}</span></button>
+            ><span className="token-text">{tokenLabel}</span><span className="token-index">{String(token.index)}</span></button>
           );
         })}
       </>
@@ -568,14 +569,15 @@ export function ChatView({
   }, [messages, run?.tokens.length, runningRunId]);
 
   const runSummary = useMemo(() => {
-    if (!run || !run.tokens.length) return null;
+    if (!run) return null;
     if (!lineage.some(({ message }) => message.runId === run.id || message.id === run.messageId)) return null;
     return {
-      tokens: run.tokens.length,
+      tokens: run.metrics?.generatedTokens ?? run.tokens.length,
       tps: run.metrics?.timing?.decodeTokensPerSecond,
       perplexity: run.metrics?.responsePerplexity,
     };
   }, [lineage, run]);
+  const displayedRunIsActive = Boolean(run && runningRunId === run.id);
 
   const armPendingBranch = (parentKey: string, fallbackChildId?: string): void => {
     if (!chatId) return;
@@ -639,8 +641,8 @@ export function ChatView({
               />
             ))}
             {runSummary && (
-              <button className="run-summary-strip" onClick={onOpenInspector} type="button">
-                <span><Eye size={14} /> Inspect run</span><span>{String(runSummary.tokens)} tokens</span><span>{runSummary.tps === undefined ? "TPS —" : `${formatNumber(runSummary.tps, 2)} tok/s`}</span><span>{runSummary.perplexity === undefined ? "PPL —" : `PPL ${formatNumber(runSummary.perplexity, 3)}`}</span><span className={`stream-indicator ${streamConnected ? "connected" : ""}`}>{runningRunId ? streamConnected ? "live" : "reconnecting" : run?.status}</span>
+              <button className="run-summary-strip" onClick={onOpenInspector} title="Open the live run inspector for timing, probability, hardware, and token telemetry" type="button">
+                <span><Eye size={14} /> Inspect run</span><span>{String(runSummary.tokens)} tokens</span><span>{runSummary.tps === undefined ? "TPS —" : `${formatNumber(runSummary.tps, 2)} tok/s`}</span><span>{runSummary.perplexity === undefined ? "PPL —" : `PPL ${formatNumber(runSummary.perplexity, 3)}`}</span><span className={`stream-indicator ${displayedRunIsActive && streamConnected ? "connected" : ""}`}>{displayedRunIsActive ? `${run?.status ?? "running"} · ${streamConnected ? "live" : "reconnecting"}` : run?.status}</span>
               </button>
             )}
             <div ref={bottom} />

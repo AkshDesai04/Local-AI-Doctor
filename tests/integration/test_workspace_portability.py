@@ -210,11 +210,13 @@ def test_replay_uses_recorded_configuration_and_creates_an_assistant_branch(
                 },
                 "instrumentation": "full",
                 "deterministic_reference_mode": True,
+                "reasoning": False,
             },
             "effective_config": {"source": "recorded"},
             "reproducibility": {
                 "device": {"requested": "cpu"},
                 "dtype": "float32",
+                "reasoning": True,
             },
             "model_fingerprint": model.fingerprint.value,
         },
@@ -232,6 +234,8 @@ def test_replay_uses_recorded_configuration_and_creates_an_assistant_branch(
     assert replayed["run"]["parent_run_id"] == source_run["id"]
     assert replayed["run"]["effective_seed"] == "123456"
     assert replayed["run"]["settings"]["sampling"]["max_output_tokens"] == 17
+    assert replayed["run"]["settings"]["reasoning"] is False
+    assert replayed["run"]["reproducibility"]["reasoning"] is False
     assert replayed["run"]["effective_config"] == services.settings.inference_snapshot()
     assert replayed["assistant_message"]["parent_id"] == user["id"]
     assert replayed["assistant_message"]["branch_index"] == 1
@@ -240,6 +244,7 @@ def test_replay_uses_recorded_configuration_and_creates_an_assistant_branch(
     assert captured["effective_seed"] == 123456
     assert captured["sampling"]["top_k"] == 5
     assert captured["deterministic_reference_mode"] is True
+    assert captured["reasoning"] is False
 
     portal.call(
         partial(

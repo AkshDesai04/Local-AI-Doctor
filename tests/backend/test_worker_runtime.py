@@ -414,6 +414,73 @@ def test_prompt_rendering_falls_back_without_chat_template() -> None:
     assert renderer == "plain_text_fallback"
 
 
+@pytest.mark.parametrize("reasoning", [True, False])
+def test_prompt_rendering_forwards_reasoning_choice_to_chat_template(reasoning: bool) -> None:
+    class CapturingTokenizer:
+        chat_template = "fixture"
+
+        def __init__(self) -> None:
+            self.options: dict[str, Any] = {}
+
+        def apply_chat_template(self, _messages: Any, **options: Any) -> str:
+            self.options = options
+            return "rendered"
+
+    tokenizer = CapturingTokenizer()
+    rendered, renderer = _render_messages(
+        tokenizer,
+        [{"role": "user", "content": "hello"}],
+        reasoning=reasoning,
+    )
+
+    assert rendered == "rendered"
+    assert renderer == "chat_template"
+    assert tokenizer.options["enable_thinking"] is reasoning
+
+
+def test_prompt_rendering_closes_a_hard_coded_reasoning_prefix_when_disabled() -> None:
+    class HardCodedReasoningTokenizer:
+        chat_template = "fixture"
+
+        @staticmethod
+        def apply_chat_template(_messages: Any, **options: Any) -> str:
+            return (
+                "User: hello\nAssistant: <think>\n"
+                if options["add_generation_prompt"]
+                else "User: hello"
+            )
+
+    tokenizer = HardCodedReasoningTokenizer()
+
+    rendered, renderer = _render_messages(
+        tokenizer,
+        [{"role": "user", "content": "hello"}],
+        reasoning=False,
+        reasoning_delimiters=("<think>", "</think>"),
+    )
+
+    assert renderer == "chat_template"
+    assert rendered.endswith("<think>\n\n</think>\n\n")
+
+
+def test_prompt_rendering_does_not_rewrite_a_literal_user_suffix() -> None:
+    class LiteralTokenizer:
+        chat_template = "fixture"
+
+        @staticmethod
+        def apply_chat_template(messages: Any, **_options: Any) -> str:
+            return str(messages[-1]["content"])
+
+    rendered, _renderer = _render_messages(
+        LiteralTokenizer(),
+        [{"role": "user", "content": "literal <think>"}],
+        reasoning=False,
+        reasoning_delimiters=("<think>", "</think>"),
+    )
+
+    assert rendered == "literal <think>"
+
+
 def test_runtime_reasoning_segmenter_uses_only_model_declared_delimiters() -> None:
     unknown, primed = _reasoning_segmenter({}, "Assistant: <think>\n")
     tagged, tagged_primed = _reasoning_segmenter(

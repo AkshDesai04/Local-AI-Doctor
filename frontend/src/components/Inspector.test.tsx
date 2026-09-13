@@ -32,7 +32,7 @@ const run: RunDetails = {
     reasoningSegment: "answer",
     rawAlternatives: [
       { tokenId: 10, piece: "chosen", probability: 0.6, logProbability: -0.5, logit: 3, rank: 1 },
-      { tokenId: 11, piece: "alternate", probability: 0.3, logProbability: -1.2, logit: 2, rank: 2 },
+      { tokenId: 11, piece: "Ġalternate", probability: 0.3, logProbability: -1.2, logit: 2, rank: 2 },
     ],
   }],
 };
@@ -54,7 +54,11 @@ describe("alternative-token branching", () => {
     const onBranchAlternative = vi.fn().mockResolvedValue(undefined);
     render(view(true, onBranchAlternative));
 
-    await user.click(screen.getByRole("button", { name: /Select token alternate from the raw distribution/i }));
+    const alternative = screen.getByRole("button", { name: /Select token alternate from the raw distribution/i });
+    expect(alternative).toHaveTextContent("alternate");
+    expect(alternative).not.toHaveTextContent("Ġalternate");
+    expect(alternative.getAttribute("title")).toContain("Raw tokenizer piece: Ġalternate");
+    await user.click(alternative);
     await user.click(screen.getByRole("button", { name: /Branch out with selected token/i }));
 
     expect(onBranchAlternative).toHaveBeenCalledWith(4, "raw", expect.objectContaining({ tokenId: 11, rank: 2 }));

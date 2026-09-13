@@ -60,6 +60,7 @@ describe("API boundary normalization", () => {
       attachmentIds: [],
       parentMessageId: "parent-1",
       settings: {
+        reasoning: false,
         device: "cpu",
         dtype: "float32",
         instrumentation: "token",
@@ -90,6 +91,7 @@ describe("API boundary normalization", () => {
       device: "cpu",
       dtype: "float32",
       instrumentation: "token",
+      reasoning: false,
       seed: "18446744073709551615",
       deterministic_reference_mode: true,
     });

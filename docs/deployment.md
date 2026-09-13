@@ -19,13 +19,14 @@ From PowerShell in the repository root:
 
 ```powershell
 Copy-Item .env.example .env
+Copy-Item config\local.example.yaml config\local.yaml
 ```
 
 Edit the ignored `.env` and set at least:
 
 ```dotenv
 MODEL_PATH=/wsl/path/to/models
-APP_CONFIG_PATH=./config/local.example.yaml
+APP_CONFIG_DIR=./config
 WSL_DISTRIBUTION=your-wsl2-distribution
 WSL_USER=your-linux-user
 ```
@@ -35,8 +36,11 @@ The wrapper parameters `-Distribution` and `-WslUser` take precedence over these
 `WSL_DISTRIBUTION` is empty, the wrapper selects the default WSL2 distribution, or the only WSL2
 distribution if there is exactly one. If `WSL_USER` is empty, WSL's configured default user is used.
 
-The local configuration file is bind-mounted read-only at `/app/config/local.yaml`. Portable
-defaults are baked into the image at `/app/config/default.yaml`. Runtime precedence remains:
+Copy `config/local.example.yaml` to the ignored `config/local.yaml` before starting Compose. The
+local configuration directory is bind-mounted read-write at `/app/user-config`, with
+`local.yaml` used as the user configuration. Mounting the directory lets settings updates use an
+atomic file replacement. Portable defaults remain
+read-only inside the image at `/app/config/default.yaml`. Runtime precedence remains:
 portable defaults, selected container profile, the mounted local file, then explicit `LAD_`
 environment overrides.
 
