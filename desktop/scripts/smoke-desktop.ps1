@@ -470,7 +470,26 @@ try {
             throw "The installed Electron process tree exited before the backend became healthy (launcher exit code $($Process.ExitCode))."
         }
         if (Test-HttpEndpoint -Uri $FrontendUri) {
-            throw "The frontend became available before the backend reported healthy."
+            # The Electron app itself only starts the frontend server after its own
+            # backend health check succeeds (see desktop/main.cjs / lifecycle.cjs), so
+            # this is only a real ordering violation if the backend is not ALSO healthy
+            # right now. Take a fresh reading instead of trusting this loop's possibly
+            # stale/slow prior poll, which can lag behind the app's own check under CI
+            # load and otherwise produce a false failure here.
+            try {
+                $Health = Invoke-RestMethod -Uri $BackendUri -TimeoutSec 2
+            } catch {
+                $Health = $null
+            }
+            if (
+                $null -eq $Health -or
+                $Health.status -ne "ok" -or
+                $Health.database -ne "ready" -or
+                $Health.worker -ne "ready"
+            ) {
+                throw "The frontend became available before the backend reported healthy."
+            }
+            break
         }
         try {
             $Health = Invoke-RestMethod -Uri $BackendUri -TimeoutSec 2
