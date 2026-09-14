@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import multiprocessing as mp
 import queue
 import uuid
@@ -12,6 +13,8 @@ from typing import Any
 
 from ..domain.models import ModelDescriptor
 from .runtime import worker_main
+
+logger = logging.getLogger(__name__)
 
 
 class WorkerFailure(RuntimeError):
@@ -260,8 +263,18 @@ class ModelWorkerSupervisor:
                 ready_event = getattr(self, "_ready_event", None)
                 if ready_event is not None:
                     ready_event.set()
-            # Diagnostics intentionally remain private to the supervisor. The
-            # structured error reply is safe for the API; tracebacks may contain paths.
+            elif kind == "diagnostic":
+                # Tracebacks may contain local paths, so they never reach the
+                # public API. They do belong in the private local log, which the
+                # structured worker error tells the operator to review.
+                payload = item.get("payload") or {}
+                traceback_text = str(payload.get("traceback", "")).strip()
+                if traceback_text:
+                    logger.error(
+                        "model worker request %s failed:\n%s",
+                        item.get("request_id"),
+                        traceback_text,
+                    )
 
     async def _monitor(self, process: Any) -> None:
         while not self._stopping:

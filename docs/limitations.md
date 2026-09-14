@@ -10,7 +10,8 @@ This page describes the implemented 0.1-series workbench, not the eventual adapt
 - CPU and CUDA are selectable. ROCm, MPS, multi-GPU placement, and device maps are not implemented runtime paths. CPU offload and non-`none` weight quantization are typed configuration choices but are explicitly rejected by the reference loader.
 - Extracted-document inference and hidden-state trace capture are not registered adapters. Causal self-attention attribution is implemented only as a partial capability for compatible decoder-only text-generation models at `full`/`expert`; encoder-decoder generation and embedding models do not expose the combined view.
 - RAM/VRAM budget preflight compares discovered checkpoint weight bytes with the selected backend's configured budget. It does not estimate or cap parameters after dtype conversion, activations, KV cache, allocator overhead, or peak runtime memory, so a later backend OOM remains possible.
-- Custom checkpoint code is not supported. `trust_remote_code=true` is globally rejected.
+- Custom checkpoint code is never executed. `trust_remote_code=true` is globally rejected. A checkpoint that declares `auto_map` is still discoverable and loadable, because many repositories keep that key for older Transformers releases after a built-in class ships: the bundled code is not imported, a warning records the declaration, and a checkpoint with no built-in architecture fails at load with an exact reason.
+- Image-text-to-text decoder checkpoints (for example Qwen3-VL) load through the Transformers image-text-to-text auto class, because Transformers does not register them for causal language modelling. Only their text generation path is exercised; image and video attachments remain rejected by the generation adapter.
 
 ## Observability gaps
 

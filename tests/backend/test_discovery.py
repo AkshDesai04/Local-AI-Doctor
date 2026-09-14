@@ -143,6 +143,51 @@ def test_unknown_architecture_fails_gracefully(tmp_path: Path) -> None:
     assert any(item.code == "unsupported_architecture" for item in model.diagnostics)
 
 
+def _write_causal_checkpoint(model_dir: Path, config: dict[str, object]) -> None:
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    header = json.dumps({"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}).encode()
+    (model_dir / "model.safetensors").write_bytes(
+        struct.pack("<Q", len(header)) + header + bytes(4)
+    )
+
+
+def test_sliding_attention_window_is_recorded_but_never_caps_the_context(tmp_path: Path) -> None:
+    _write_causal_checkpoint(
+        tmp_path / "hybrid-attention",
+        {
+            "architectures": ["Gemma3ForCausalLM"],
+            "model_type": "gemma3_text",
+            "max_position_embeddings": 32768,
+            "sliding_window": 512,
+        },
+    )
+    model = ModelScanner([tmp_path], conservative_context_limit=4096).scan().models[0]
+    assert model.effective_context_limit == 4096
+    window = next(item for item in model.context_values if item.source == "config.sliding_window")
+    assert window.value == 512
+    assert window.note is not None and "not a context limit" in window.note
+
+
+def test_legacy_custom_code_metadata_does_not_block_a_builtin_architecture(
+    tmp_path: Path,
+) -> None:
+    _write_causal_checkpoint(
+        tmp_path / "legacy-auto-map",
+        {
+            "architectures": ["Phi3ForCausalLM"],
+            "model_type": "phi3",
+            "max_position_embeddings": 4096,
+            "auto_map": {"AutoModelForCausalLM": "modeling_phi3.Phi3ForCausalLM"},
+        },
+    )
+    model = ModelScanner([tmp_path], conservative_context_limit=4096).scan().models[0]
+    assert model.loadable
+    diagnostic = next(item for item in model.diagnostics if item.code == "custom_code_not_trusted")
+    assert diagnostic.severity.value == "warning"
+
+
 def test_encoder_decoder_capabilities_do_not_overclaim_prompt_scoring(tmp_path: Path) -> None:
     model_dir = tmp_path / "encoder-decoder"
     model_dir.mkdir()

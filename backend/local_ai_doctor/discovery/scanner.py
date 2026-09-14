@@ -163,27 +163,38 @@ def _context_values(
     conservative_default: int,
 ) -> tuple[tuple[ContextValue, ...], int, list[Diagnostic]]:
     candidates: list[ContextValue] = []
+    # A sliding attention window bounds how far each layer attends, not how many
+    # positions the checkpoint accepts. Hybrid-attention models (Gemma 3, Phi-3)
+    # declare a small window alongside a much larger context, so the window is
+    # recorded as evidence but never selected as the limit.
+    sliding_window_note = "attention window, not a context limit"
+    if config.get("use_sliding_window") is False:
+        sliding_window_note = f"declared but disabled; {sliding_window_note}"
     sources = (
-        ("config.max_position_embeddings", config.get("max_position_embeddings"), None),
+        ("config.max_position_embeddings", config.get("max_position_embeddings"), None, True),
         (
             "config.text_config.max_position_embeddings",
             _nested_value(config, "text_config", "max_position_embeddings"),
             None,
+            True,
         ),
         (
             "config.sliding_window",
             config.get("sliding_window"),
-            "declared but disabled" if config.get("use_sliding_window") is False else None,
+            sliding_window_note,
+            False,
         ),
         (
             "config.rope_scaling.original_max_position_embeddings",
             _nested_value(config, "rope_scaling", "original_max_position_embeddings"),
             None,
+            True,
         ),
-        ("tokenizer_config.model_max_length", tokenizer.get("model_max_length"), None),
+        ("tokenizer_config.model_max_length", tokenizer.get("model_max_length"), None, True),
     )
     diagnostics: list[Diagnostic] = []
-    for source, raw_value, note in sources:
+    discovered: set[int] = set()
+    for source, raw_value, note, eligible in sources:
         value = _positive_int(raw_value)
         if value is None:
             continue
@@ -197,6 +208,8 @@ def _context_values(
                 )
             )
         candidates.append(ContextValue(source=source, value=value, note=note))
+        if eligible and value <= 10_000_000:
+            discovered.add(value)
     candidates.append(
         ContextValue(
             source="application.conservative_context_limit",
@@ -204,9 +217,7 @@ def _context_values(
             note="portable default until a larger limit is validated on this backend",
         )
     )
-    plausible = [item.value for item in candidates if item.value <= 10_000_000]
-    selected = min(plausible)
-    discovered = {item.value for item in candidates if not item.source.startswith("application.")}
+    selected = min({conservative_default, *discovered})
     if len(discovered) > 1:
         diagnostics.append(
             Diagnostic(
@@ -554,13 +565,23 @@ class ModelScanner:
         auto_map = config.get("auto_map")
         trust_decision = TrustDecision.BUILTIN_ONLY
         if isinstance(auto_map, Mapping) and auto_map:
+            # Repositories keep ``auto_map`` for older Transformers releases long
+            # after a reviewed built-in class ships, so its presence alone does
+            # not mean the checkpoint needs custom code. The loader always runs
+            # with trust_remote_code disabled: the bundled code is never
+            # imported, and a checkpoint with no built-in architecture fails at
+            # load with an exact reason instead of being blocked on a guess.
             trust_decision = TrustDecision.REJECTED_CUSTOM_CODE
             diagnostics.append(
                 Diagnostic(
                     code="custom_code_not_trusted",
-                    severity=DiagnosticSeverity.ERROR,
-                    message="model metadata requires custom Python code that has not been reviewed",
+                    severity=DiagnosticSeverity.WARNING,
+                    message=(
+                        "model metadata declares custom Python code; it is never imported and "
+                        "loading depends on a built-in architecture for this model type"
+                    ),
                     hint="Review it and enable a narrow isolated adapter for this exact fingerprint.",
+                    evidence={"model_type": str(config.get("model_type"))},
                 )
             )
         elif components.custom_code:

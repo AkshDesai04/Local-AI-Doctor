@@ -4,6 +4,13 @@ This project follows a Keep a Changelog-style structure. Versions and dates are 
 
 ## Unreleased
 
+### Fixed
+
+- A sliding attention window is no longer treated as a context-length candidate. Hybrid-attention checkpoints such as Gemma 3 and Phi-3 were assigned their attention window (512 and 2,047 positions) as the effective context limit, which left no prompt budget and failed every generation before the first token.
+- A checkpoint that declares `auto_map` is no longer blocked from loading. Repositories keep that key for older Transformers releases after a built-in class ships; the bundled code is still never imported, and the declaration is now recorded as a warning instead of a blocking error.
+- Image-text-to-text decoder checkpoints (for example Qwen3-VL) load through the matching Transformers auto class instead of failing, because Transformers does not register them for causal language modelling.
+- Worker tracebacks are written to the private backend log. Every unclassified worker failure previously surfaced only as "model worker operation failed" while its traceback was discarded, contradicting the hint that directs operators to the local log. Unsupported architectures and exceeded prompt limits also report their own codes.
+
 ### Added
 
 - Typed, schema-versioned configuration with local files, profiles, environment/CLI overrides, redacted effective views, and per-run inference snapshots.

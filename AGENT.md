@@ -327,7 +327,7 @@ Discovery scans each configured root to depth two without following directory sy
 - Detect required config, tokenizer, chat template, generation config, processor, pooling, and bundled custom-code components.
 - Infer task and modalities from architecture, tensor, and packaging evidence—not a marketing model name.
 - Identify MoE only through genuine router/expert evidence. Ordinary `gate_proj` tensors in a dense SwiGLU MLP are not experts.
-- Record every discovered context-length candidate and select a conservative minimum with the configured application limit.
+- Record every discovered context-length candidate and select a conservative minimum with the configured application limit. A sliding attention window (`config.sliding_window`) is recorded as evidence but is never eligible for selection: it bounds how far each layer attends, not how many positions the checkpoint accepts, and hybrid-attention models such as Gemma 3 and Phi-3 pair a small window with a much larger context.
 - Produce diagnostics for missing, malformed, contradictory, or unsupported components.
 - Produce a complete capability matrix. Every non-`full` state needs a reason.
 - Compute a stable manifest fingerprint. The default quick policy hashes metadata fully and SafeTensors headers/sizes, not every weight byte; it is identity evidence, not a full checkpoint-integrity digest.
