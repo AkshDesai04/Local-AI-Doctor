@@ -1,15 +1,20 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$ApplicationRoot
+)
 
 $ErrorActionPreference = "Stop"
 $DesktopRoot = Split-Path -Parent $PSScriptRoot
 $RepositoryRoot = Split-Path -Parent $DesktopRoot
-$UnpackedRoot = Join-Path $RepositoryRoot "release\win-unpacked"
+if ([string]::IsNullOrWhiteSpace($ApplicationRoot)) {
+    $ApplicationRoot = Join-Path $RepositoryRoot "release\win-unpacked"
+}
+$ApplicationRoot = [IO.Path]::GetFullPath($ApplicationRoot)
 $RequiredFiles = @(
-    (Join-Path $UnpackedRoot "Local AI Doctor.exe"),
-    (Join-Path $UnpackedRoot "resources\frontend\index.html"),
-    (Join-Path $UnpackedRoot "resources\config\default.yaml"),
-    (Join-Path $UnpackedRoot "resources\backend\local-ai-doctor-backend\local-ai-doctor-backend.exe")
+    (Join-Path $ApplicationRoot "Local AI Doctor.exe"),
+    (Join-Path $ApplicationRoot "resources\frontend\index.html"),
+    (Join-Path $ApplicationRoot "resources\config\default.yaml"),
+    (Join-Path $ApplicationRoot "resources\backend\local-ai-doctor-backend\local-ai-doctor-backend.exe")
 )
 
 $Missing = @($RequiredFiles | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })

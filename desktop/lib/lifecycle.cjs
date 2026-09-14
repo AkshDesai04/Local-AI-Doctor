@@ -7,7 +7,7 @@ const BACKEND_HOST = "127.0.0.1";
 const BACKEND_PORT = 6767;
 const FRONTEND_HOST = "127.0.0.1";
 const FRONTEND_PORT = 6969;
-const FRONTEND_DELAY_MS = 16_000;
+const PACKAGED_DEVICE_MODE = "auto";
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -28,6 +28,15 @@ function isPortAvailable(port, host = BACKEND_HOST) {
       server.close((error) => error ? reject(error) : resolve(true));
     });
   });
+}
+
+function isBackendReady(payload) {
+  return Boolean(
+    payload
+    && payload.status === "ok"
+    && payload.database === "ready"
+    && payload.worker === "ready"
+  );
 }
 
 function readHealth({ host = BACKEND_HOST, port = BACKEND_PORT, timeoutMs = 2_000 } = {}) {
@@ -53,8 +62,12 @@ function readHealth({ host = BACKEND_HOST, port = BACKEND_PORT, timeoutMs = 2_00
           }
           try {
             const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-            if (payload.status !== "ok") {
-              reject(new Error(`Backend reported ${String(payload.status ?? "unknown")} status.`));
+            if (!isBackendReady(payload)) {
+              reject(new Error(
+                `Backend is not ready (status=${String(payload.status ?? "unknown")}, `
+                + `database=${String(payload.database ?? "unknown")}, `
+                + `worker=${String(payload.worker ?? "unknown")}).`,
+              ));
               return;
             }
             resolve(payload);
@@ -97,8 +110,9 @@ module.exports = {
   BACKEND_PORT,
   FRONTEND_HOST,
   FRONTEND_PORT,
-  FRONTEND_DELAY_MS,
+  PACKAGED_DEVICE_MODE,
   delay,
+  isBackendReady,
   isPortAvailable,
   readHealth,
   waitForBackend,

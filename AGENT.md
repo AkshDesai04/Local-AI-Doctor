@@ -37,7 +37,7 @@ The product is intended to provide:
 - Persistent ChatGPT-style conversations with branching and replay.
 - Deep token, sampling, timing, context, hardware, reasoning, and optional routing observability.
 - CPU execution everywhere it is feasible and CUDA acceleration when genuinely available.
-- Native Windows/WSL execution, hardened WSL-hosted Docker deployment, and a portable Windows Electron application.
+- Native Windows/WSL execution, hardened WSL-hosted Docker deployment, and an installed Windows Electron application.
 - An adapter-oriented path for adding architectures without pretending that unknown models are supported.
 
 Normal inference must run locally. Never add a hidden or automatic external inference provider. Dependency installation and container/image downloads are build-time network activity; they are not permission to transmit prompts, outputs, uploads, telemetry, or model data during normal operation.
@@ -51,8 +51,8 @@ The following requirements came directly from the project conversation and are b
 - Docker and Electron production paths permanently use frontend `127.0.0.1:6969` and backend/API/WebSocket `127.0.0.1:6767`.
 - Do not make those production ports configurable and do not work around conflicts by selecting different ports.
 - Native CLI development may continue to use backend port `8000`; Vite development may continue to use frontend port `5173`.
-- The backend must become healthy first. After health succeeds, wait exactly 16,000 milliseconds, verify that the backend has not failed, and only then start the frontend.
-- Preserve both gates: Compose dependency health ordering and the frontend entrypoint's independent health check/16-second hold. Electron must perform the equivalent ordering before it opens its window.
+- The backend must become fully ready first. Require the health contract to report `status: ok`, `database: ready`, and `worker: ready`; only then start the frontend. Do not add a fixed stabilization timer after readiness.
+- Preserve both readiness gates: Compose dependency health ordering and the frontend entrypoint's independent complete-readiness check. Electron may show its native startup window immediately, but it must perform equivalent ordering before starting or displaying the production frontend.
 - If a WSL Docker container owns port 6767 or 6969, identify the exact owner and stop only that conflicting container before starting the requested profile. Do not kill an arbitrary process or change the ports.
 - Electron intentionally refuses to start if either port is occupied; it must not kill the owner automatically.
 
@@ -101,14 +101,14 @@ The following requirements came directly from the project conversation and are b
 
 ### 3.7 Desktop and releases
 
-- The desktop distribution is Electron and produces one portable Windows `.exe`, not an installer or a model bundle.
+- The desktop distribution is Electron and produces one per-user Windows installer `.exe`, not a model bundle. Installation extracts the runtime once; subsequent launches use the installed payload.
 - Root `VERSION` is the stable `X.Y.Z` source of truth. Python, frontend, desktop, and lock manifests must stay synchronized through `scripts/release-version.mjs`.
 - An ordinary completed feature or fix receives a patch bump. Use a minor or major bump only when the owner explicitly asks for that release level.
 - A successful `dev` push creates a beta prerelease `vX.Y.Z-beta.<workflow-run>` with a matching beta-suffixed EXE.
 - A successful `main` push creates the immutable stable `vX.Y.Z` release. Promotion normally occurs by merging the tested `dev` revision into `main`.
 - The release workflow uploads exactly one custom asset: `Local-AI-Doctor-<version>.exe`. GitHub's automatic source ZIP/TAR links cannot be removed and are not custom release assets.
-- The GitHub-built EXE is CPU-only because the complete CUDA runtime exceeds GitHub's 2 GiB asset limit. CUDA remains available through native and Docker paths.
-- The EXE is currently unsigned and may trigger SmartScreen. Its first portable launch can take time to extract its payload.
+- The GitHub-built EXE is CPU-only because the complete CUDA runtime exceeds GitHub's 2 GiB asset limit. A local EXE built from the pinned CUDA environment may use CUDA; native and Docker CUDA paths remain available.
+- The EXE is currently unsigned and may trigger SmartScreen. Installation can take time because the local CUDA payload is large, but normal launches must not re-extract it.
 
 ### 3.8 Git and delivery
 
@@ -117,6 +117,7 @@ The following requirements came directly from the project conversation and are b
 - Use only the owner's existing Git identity and authentication. Never change Git identity, expose credentials, add AI/generated-by text, or add co-author trailers.
 - Keep model weights, personal config, credentials, databases, uploads, caches, environments, logs, release artifacts, and large telemetry out of Git.
 - Do not select or add an open-source license without explicit owner instruction.
+- Update the root `README.md` in the same change whenever code, configuration, deployment, installation, startup behavior, user workflow, or release behavior changes. Keep its commands and user-facing claims synchronized with the implementation.
 
 ### 3.9 Docker/WSL storage hygiene
 
@@ -141,7 +142,7 @@ The current 0.1-series implementation includes:
 - Reasoning-tag segmentation and an extra-answer-window recovery path for supported tagged models.
 - SQLite chats, branches, runs, events, tokens, alternatives, attention data, attachments, and embedding records.
 - A responsive React workbench with chat, model registry, embeddings, live inspector, Nerd Mode, token branching, settings, and durable run restoration.
-- Hardened CPU/NVIDIA Compose profiles and an Electron portable build/release pipeline.
+- Hardened CPU/NVIDIA Compose profiles and an Electron installer build/release pipeline.
 
 Do not overstate these boundaries:
 
@@ -1143,17 +1144,15 @@ URLs:
 - Backend health: `http://127.0.0.1:6767/api/v1/health`
 - Frontend health: `http://127.0.0.1:6969/healthz`
 
-### 17.6 Backend-first 16-second gate
+### 17.6 Backend-first readiness gate
 
 Compose `frontend-*` depends on healthy `app-*`. `docker/frontend-entrypoint.sh` then:
 
 1. Polls the backend health URL.
-2. Starts an exact 16-second stabilization hold after success.
-3. Rechecks health after the hold.
-4. Restarts the gate if health was lost.
-5. Starts Nginx only when the second check succeeds.
+2. Requires `status: ok`, `database: ready`, and `worker: ready`.
+3. Starts Nginx immediately after that complete readiness contract succeeds.
 
-Preserve this behavior across daemon/container restarts. A frontend that appears 16 seconds after backend health is expected, not a performance bug.
+Preserve this behavior across daemon/container restarts. Worker readiness requires an IPC handshake from the spawned inference process; a live PID is insufficient. The health route is exposed only after database initialization, worker startup, model discovery, and incomplete-run recovery finish, so an additional timer is neither necessary nor authoritative.
 
 ### 17.7 NVIDIA profile and VRAM
 
@@ -1242,28 +1241,30 @@ Electron owns two loopback services:
 - Packaged Python/FastAPI backend at `127.0.0.1:6767`.
 - Electron static server/reverse proxy at `127.0.0.1:6969`.
 
-`desktop/lib/lifecycle.cjs` contains the port and delay constants. `desktop/main.cjs`:
+`desktop/lib/lifecycle.cjs` contains the port constants and readiness validation. `desktop/main.cjs`:
 
 1. Enforces a single instance.
 2. Checks both fixed ports are free.
 3. Starts the packaged backend.
-4. Polls `/api/v1/health` for `status: ok`.
-5. Waits `FRONTEND_DELAY_MS = 16_000`.
-6. Confirms the backend did not exit.
-7. Starts the frontend server/proxy.
-8. Creates the window.
+4. Polls `/api/v1/health` for `status: ok`, `database: ready`, and `worker: ready`.
+5. Confirms the backend did not exit after reporting ready.
+6. Starts the frontend server/proxy immediately.
+7. Navigates the already-visible native startup window to the production frontend.
 
-Do not move the delay to an arbitrary renderer timer or create the window before the gate.
+The lightweight native startup window may be created before the gate so users
+receive immediate feedback. Do not start or navigate to the production frontend
+before complete backend readiness, and do not replace the readiness contract
+with an arbitrary renderer timer.
 
-Desktop persistent state uses Electron `app.getPath('userData')`, including writable `config/local.yaml`, SQLite, uploads, exports, backups, caches, runtime shutdown marker, and backend log. Models remain external. Removing the portable EXE does not necessarily remove user data.
+Desktop persistent state uses Electron `app.getPath('userData')`, including writable `config/local.yaml`, SQLite, uploads, exports, backups, caches, runtime shutdown marker, and backend log. Models remain external. Uninstalling the application does not delete user data unless that behavior is explicitly changed.
 
 Packaged shutdown writes a private per-launch random marker so a backend watcher can trigger normal Uvicorn lifespan cleanup. A Windows `taskkill` fallback targets the exact child tree only after the 20-second grace. Preserve graceful cleanup.
 
-The packaged backend forces CPU and avoids CUDA initialization. Desktop CUDA is deliberately not promised.
+The desktop shell requests automatic device selection. Actual capability comes from the PyTorch runtime bundled at build time: GitHub releases bundle CPU PyTorch, while a local build from the pinned CUDA environment can select CUDA. Never force every packaged build to CPU, and never advertise CUDA when the bundled runtime cannot import or use it.
 
 ### 18.1 Local desktop build
 
-Use a Python 3.12 CPU environment with the locked base, CPU PyTorch/Torchvision, ML, desktop, and current project packages installed. Then:
+Use a Python 3.12 environment with the locked base, matching PyTorch/Torchvision flavor, ML, desktop, and current project packages installed. GitHub uses CPU wheels; a local CUDA-capable build uses the pinned CUDA wheels. Then:
 
 ```powershell
 node scripts/release-version.mjs check
@@ -1425,7 +1426,7 @@ Before every milestone commit:
 2. Confirm the backend health JSON rather than relying only on frontend text.
 3. Inspect failed preflight: model bind exists/readable/read-only, `local.yaml` exists and is atomically writable, volumes are writable, database migration succeeded.
 4. Use `UpCpu`/`UpNvidia` to rebuild/recreate updated source and establish the WSL keepalive.
-5. Account for backend boot plus the required 16-second frontend hold.
+5. Account for backend initialization; the frontend starts immediately after the complete readiness contract passes.
 6. If only an optional bootstrap endpoint failed, fix frontend offline-state classification instead of hiding backend health.
 
 ### 22.2 Port conflict
@@ -1455,7 +1456,7 @@ Use `UpCpu` or `UpNvidia`, which rebuilds/recreates; a plain restart can keep an
 
 ### 22.6 Frontend absent after backend health
 
-Inspect frontend logs for the health gate and 16-second hold. If backend health fails during the hold, restarting the gate is correct behavior.
+Inspect frontend logs for the complete readiness gate. If readiness never succeeds, inspect backend startup and health details rather than adding a timer.
 
 ### 22.7 Reasoning ends without an answer
 
@@ -1492,7 +1493,7 @@ The model-root update route uses HTTP `PUT`. Same-origin production does not req
 - No general document text extraction, PDF inference, remote URL fetch, or archive extraction.
 - No vector index/nearest-neighbor service or persisted dimensionality-reduction service.
 - No TLS, identity system, multi-tenancy, or production internet exposure.
-- CPU-only GitHub desktop binary; unsigned portable EXE.
+- CPU-only GitHub desktop binary; unsigned installer EXE.
 - No selected open-source license.
 
 If a UI section represents one of these goals, keep it disabled/explained. Never substitute fixture/demo values in a real session.
@@ -1549,7 +1550,7 @@ When changing UI:
 
 When changing deployment/release:
 
-1. Preserve fixed ports and the health-plus-16-second ordering in Docker and Electron.
+1. Preserve fixed ports and complete backend-readiness ordering in Docker and Electron.
 2. Preserve model read-only and data-volume persistence.
 3. Validate CPU and NVIDIA paths separately without silent fallback.
 4. Preserve WSL-only Docker execution and hardening.

@@ -48,13 +48,15 @@ a = Analysis(
     runtime_hooks=[],
     excludes=["pytest", "mypy", "ruff"],
     module_collection_mode={
-        # The application does not use TorchScript or torch.compile. Keeping
-        # these large packages in the PYZ avoids extracting thousands of source
-        # files on every Electron portable launch while retaining inference.
+        # Torch performs runtime source inspection even outside TorchScript and
+        # torch.compile. Keeping its Python modules only in the PYZ makes
+        # inspect.getsource() fail inside the frozen worker and can prevent a
+        # real model from loading. Keep importable bytecode in the PYZ for
+        # startup speed while also retaining source for runtime inspection.
         "accelerate": "pyz",
         "sentence_transformers": "pyz",
-        "torch": "pyz",
-        "torchvision": "pyz",
+        "torch": "pyz+py",
+        "torchvision": "pyz+py",
         "transformers": "pyz",
     },
     noarchive=False,

@@ -450,6 +450,7 @@ class WorkerRuntime:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        _send(self.output, "ready")
         while True:
             command = self.commands.get()
             operation = command.get("op")

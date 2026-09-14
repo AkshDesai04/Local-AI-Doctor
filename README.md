@@ -97,22 +97,40 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000). The first scan reads metada
 
 For a frontend development loop, keep the backend on port 8000 and run `npm run dev` in `frontend/`; Vite serves the UI at [http://127.0.0.1:5173](http://127.0.0.1:5173).
 
-### Portable Windows desktop release
+### Installed Windows desktop release
 
 The Electron desktop build starts its packaged backend on `127.0.0.1:6767`,
-waits for it to become healthy, waits another 16 seconds, and then opens the
-frontend on `127.0.0.1:6969`. Models remain external and are selected through
-the model-directory setting. Configuration, chats, uploads, and cache persist
-in Electron's user-data directory.
+shows a native startup window immediately, waits for the backend to become
+fully ready (database initialized, model-worker startup handshake received, and
+registry scan complete), holds for exactly 16 seconds, and only then starts and
+opens the frontend on `127.0.0.1:6969`.
+
+Beginning with `0.1.3`, the release EXE is a persistent per-user installer, not
+a portable self-extracting launcher. Run the downloaded EXE once and complete
+the installation; use the desktop or Start menu shortcut for every later
+session. The one-time installation can take several minutes while Windows
+extracts and scans the multi-gigabyte CUDA runtime, but it displays installer
+progress. Normal launches reuse those installed files and immediately show a
+native startup screen instead of extracting the runtime again. Do not keep
+opening the downloaded installer to start the application.
+
+The final `0.1.3` local CUDA build reached backend readiness in about 20 seconds
+and the complete interface in about 38 seconds on the validation machine; the
+latter includes the required 16-second hold. Actual timings depend on storage,
+antivirus scanning, and hardware. A single-instance lock focuses an existing
+application window when the installed shortcut is opened twice. Models remain
+external and are selected through the model-directory setting. Configuration,
+chats, uploads, and cache persist in Electron's user-data directory.
 
 Successful `dev` pushes publish beta prereleases and successful `main` pushes
 publish stable releases. Each release has one uploaded asset,
 `Local-AI-Doctor-<version>.exe`; GitHub's automatic source-code links cannot be
 removed. The GitHub-built EXE contains the CPU runtime because the pinned CUDA
-wheel alone exceeds GitHub's 2 GiB asset limit. Use the native or Docker NVIDIA
-workflow for CUDA. See [desktop/README.md](desktop/README.md) for local build
-instructions. The current executable is unsigned, so Windows SmartScreen may
-show a warning.
+wheel alone exceeds GitHub's 2 GiB asset limit. A local desktop build made from
+the pinned CUDA Python environment can use CUDA; the shell discovers the best
+runtime actually bundled into that EXE. See [desktop/README.md](desktop/README.md)
+for local build instructions. The current executable is unsigned, so Windows
+SmartScreen may show a warning.
 
 ## Native WSL quick start
 
@@ -147,7 +165,8 @@ read-only bind mount.
 The container ports are permanent and loopback-only: open the frontend at
 [http://127.0.0.1:6969](http://127.0.0.1:6969), while the REST API and WebSocket
 backend use [http://127.0.0.1:6767/api/v1](http://127.0.0.1:6767/api/v1). Compose
-waits for backend health, holds for 16 seconds, and only then starts serving the UI.
+starts serving the UI as soon as the backend readiness response confirms its
+database and model worker are ready. No fixed startup delay is used.
 
 `UpCpu` and `UpNvidia` switch profiles automatically, so only one pair can own the fixed ports. `UpNvidia`
 proves Docker-level CUDA access before stopping a working CPU profile, then verifies CUDA and both health

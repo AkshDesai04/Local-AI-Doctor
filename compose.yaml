@@ -128,7 +128,7 @@ x-app: &app
         u='http://127.0.0.1:'+os.environ.get('CONTAINER_LISTEN_PORT','6767')+'/api/v1/health';
         r=urllib.request.urlopen(u,timeout=3);
         p=json.load(r);
-        raise SystemExit(0 if r.status==200 and p.get('status')=='ok' else 1)
+        raise SystemExit(0 if r.status==200 and p.get('status')=='ok' and p.get('database')=='ready' and p.get('worker')=='ready' else 1)
     interval: 15s
     timeout: 5s
     start_period: 30s

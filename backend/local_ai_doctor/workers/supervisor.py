@@ -23,9 +23,15 @@ class WorkerFailure(RuntimeError):
 class ModelWorkerSupervisor:
     """Own a spawned worker; only serializable values cross this boundary."""
 
-    def __init__(self, *, queue_limit: int = 256) -> None:
+    def __init__(
+        self,
+        *,
+        queue_limit: int = 256,
+        startup_timeout_seconds: float = 120.0,
+    ) -> None:
         self._context = mp.get_context("spawn")
         self._queue_limit = max(1, queue_limit)
+        self._startup_timeout_seconds = max(0.1, float(startup_timeout_seconds))
         self._commands: Any
         self._output: Any
         self._cancel_event: Any
@@ -44,6 +50,8 @@ class ModelWorkerSupervisor:
         self._stopping = False
 
     def _build_worker(self) -> None:
+        self._ready = False
+        self._ready_event: asyncio.Event | None = None
         self._poisoned = False
         self._commands = self._context.Queue(maxsize=self._queue_limit)
         self._output = self._context.Queue(maxsize=max(16, self._queue_limit * 4))
@@ -68,7 +76,11 @@ class ModelWorkerSupervisor:
 
     @property
     def available(self) -> bool:
-        return self.alive and not getattr(self, "_poisoned", False)
+        return (
+            self.alive
+            and bool(getattr(self, "_ready", False))
+            and not getattr(self, "_poisoned", False)
+        )
 
     @staticmethod
     def _poisoned_error() -> dict[str, str]:
@@ -90,11 +102,23 @@ class ModelWorkerSupervisor:
                 )
             if getattr(self, "_poisoned", False) and self.alive:
                 raise WorkerFailure(self._poisoned_error())
-            if self.alive:
+            if self.available:
                 return
+            if self.alive:
+                with contextlib.suppress(AssertionError, OSError, ValueError):
+                    self._process.terminate()
+                await asyncio.to_thread(self._process.join, 5.0)
+                if self.alive:
+                    with contextlib.suppress(AssertionError, OSError, ValueError):
+                        self._process.kill()
+                    await asyncio.to_thread(self._process.join, 5.0)
+                await self._retire_dead_worker()
+                self._build_worker()
             if self._process.pid is not None:
                 await self._retire_dead_worker()
                 self._build_worker()
+            ready_event = asyncio.Event()
+            self._ready_event = ready_event
             self._process.start()
             output = self._output
             process = self._process
@@ -102,8 +126,46 @@ class ModelWorkerSupervisor:
             self._monitor_task = asyncio.create_task(
                 self._monitor(process), name="model-worker-monitor"
             )
+            try:
+                await asyncio.wait_for(
+                    ready_event.wait(),
+                    timeout=self._startup_timeout_seconds,
+                )
+            except TimeoutError as exc:
+                error = {
+                    "code": "model_worker_startup_timeout",
+                    "message": (
+                        "model worker did not finish startup within "
+                        f"{self._startup_timeout_seconds:g} seconds"
+                    ),
+                    "hint": "Inspect packaged dependencies and increase workers.startup_timeout_seconds only when startup is expected to be slower.",
+                }
+                if self.alive:
+                    with contextlib.suppress(AssertionError, OSError, ValueError):
+                        process.terminate()
+                    await asyncio.to_thread(process.join, 5.0)
+                if self.alive:
+                    with contextlib.suppress(AssertionError, OSError, ValueError):
+                        process.kill()
+                    await asyncio.to_thread(process.join, 5.0)
+                await self._retire_dead_worker()
+                self._build_worker()
+                raise WorkerFailure(error) from exc
+            if not self.available:
+                error = {
+                    "code": "model_worker_startup_failed",
+                    "message": "model worker exited before completing its startup handshake",
+                    "hint": "Inspect packaged dependencies and the private backend log.",
+                }
+                await self._retire_dead_worker()
+                self._build_worker()
+                raise WorkerFailure(error)
 
     async def _retire_dead_worker(self) -> None:
+        self._ready = False
+        ready_event = getattr(self, "_ready_event", None)
+        if ready_event is not None:
+            ready_event.set()
         process = self._process
         with contextlib.suppress(AssertionError, ValueError):
             if process.pid is not None and not process.is_alive():
@@ -193,6 +255,11 @@ class ModelWorkerSupervisor:
                 run_queue = self._run_queues.get(str(item.get("run_id")))
                 if run_queue is not None:
                     await run_queue.put(item)
+            elif kind == "ready":
+                self._ready = True
+                ready_event = getattr(self, "_ready_event", None)
+                if ready_event is not None:
+                    ready_event.set()
             # Diagnostics intentionally remain private to the supervisor. The
             # structured error reply is safe for the API; tracebacks may contain paths.
 
@@ -203,6 +270,10 @@ class ModelWorkerSupervisor:
                 return
             if process.is_alive():
                 continue
+            self._ready = False
+            ready_event = getattr(self, "_ready_event", None)
+            if ready_event is not None:
+                ready_event.set()
             self._loaded = None
             self._loaded_request = None
             error = {

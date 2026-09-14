@@ -5,15 +5,15 @@ const { spawn, spawnSync } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 
 const { createFrontendServer } = require("./lib/frontend-server.cjs");
 const {
   BACKEND_HOST,
   BACKEND_PORT,
-  FRONTEND_DELAY_MS,
   FRONTEND_HOST,
   FRONTEND_PORT,
-  delay,
+  PACKAGED_DEVICE_MODE,
   isPortAvailable,
   waitForBackend,
 } = require("./lib/lifecycle.cjs");
@@ -26,6 +26,17 @@ let frontendServer;
 let mainWindow;
 let shutdownComplete = false;
 let shutdownStarted;
+
+function writeStartupTrace(paths, launchId, event) {
+  if (process.env.LAD_DESKTOP_SMOKE_TRACE !== "1") return;
+  const runtimeDirectory = ensureDirectory(path.join(paths.userData, "runtime"));
+  const tracePath = path.join(runtimeDirectory, "startup-trace.jsonl");
+  fs.appendFileSync(
+    tracePath,
+    `${JSON.stringify({ launchId, event, monotonicMs: Number(process.hrtime.bigint() / 1_000_000n) })}\n`,
+    "utf8",
+  );
+}
 
 function clearBackendShutdownFile() {
   const shutdownFile = backendShutdownFile;
@@ -82,7 +93,7 @@ function backendEnvironment(paths, shutdownFile) {
     LAD_USER_CONFIG: paths.userConfig,
     LAD_PROFILE: "native-windows",
     LAD_DESKTOP_SHUTDOWN_FILE: shutdownFile,
-    ...(app.isPackaged ? { LAD_RUNTIME__DEVICE: "cpu" } : {}),
+    ...(app.isPackaged ? { LAD_RUNTIME__DEVICE: PACKAGED_DEVICE_MODE } : {}),
     LAD_SERVER__HOST: BACKEND_HOST,
     LAD_SERVER__PORT: String(BACKEND_PORT),
     LAD_SERVER__ALLOWED_ORIGINS: JSON.stringify([
@@ -245,7 +256,8 @@ async function shutdown() {
   return shutdownStarted;
 }
 
-function createWindow() {
+async function createWindow() {
+  const startupUrl = pathToFileURL(path.join(__dirname, "startup.html")).href;
   mainWindow = new BrowserWindow({
     width: 1500,
     height: 980,
@@ -266,16 +278,36 @@ function createWindow() {
     return { action: "deny" };
   });
   mainWindow.webContents.on("will-navigate", (event, url) => {
-    if (!url.startsWith(`http://${FRONTEND_HOST}:${FRONTEND_PORT}/`)) event.preventDefault();
+    if (
+      url !== startupUrl
+      && !url.startsWith(`http://${FRONTEND_HOST}:${FRONTEND_PORT}/`)
+    ) {
+      event.preventDefault();
+    }
   });
   mainWindow.once("ready-to-show", () => mainWindow.show());
   mainWindow.on("closed", () => {
     mainWindow = undefined;
   });
-  return mainWindow.loadURL(`http://${FRONTEND_HOST}:${FRONTEND_PORT}/`);
+  await mainWindow.loadFile(path.join(__dirname, "startup.html"));
+}
+
+async function showApplication() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    throw new Error("The startup window closed before the application became ready.");
+  }
+  await mainWindow.loadURL(`http://${FRONTEND_HOST}:${FRONTEND_PORT}/`);
+}
+
+function setStartupStatus(message) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const source = `document.getElementById("startup-status").textContent = ${JSON.stringify(message)}`;
+  void mainWindow.webContents.executeJavaScript(source, true).catch(() => {});
 }
 
 async function startApplication() {
+  const launchId = randomUUID();
+  await createWindow();
   const paths = locations();
   const availability = await Promise.all([
     isPortAvailable(BACKEND_PORT, BACKEND_HOST),
@@ -290,8 +322,10 @@ async function startApplication() {
   }
   startBackend(paths);
   await waitForBackend({ backendExited: () => backendExited });
-  await delay(FRONTEND_DELAY_MS);
-  if (backendExited) throw new Error("The backend exited during the required frontend startup delay.");
+  writeStartupTrace(paths, launchId, "backend_healthy");
+  setStartupStatus("The local backend is fully ready. Starting the interface…");
+  if (backendExited) throw new Error("The backend exited after reporting ready.");
+  writeStartupTrace(paths, launchId, "frontend_start_requested");
   frontendServer = createFrontendServer({
     frontendRoot: paths.frontendRoot,
     frontendHost: FRONTEND_HOST,
@@ -300,7 +334,8 @@ async function startApplication() {
     backendPort: BACKEND_PORT,
   });
   await frontendServer.start();
-  await createWindow();
+  writeStartupTrace(paths, launchId, "frontend_listening");
+  await showApplication();
 }
 
 if (!app.requestSingleInstanceLock()) {

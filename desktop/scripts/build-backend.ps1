@@ -17,6 +17,12 @@ if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller is not installed. Install the desktop build dependencies before packaging."
 }
 
+$TorchRuntime = (& $Python -c "import torch; print(str(torch.__version__)+'|'+str(torch.version.cuda or 'cpu')+'|'+str(torch.cuda.is_available()))" 2>$null)
+if ($LASTEXITCODE -ne 0) {
+    throw "PyTorch cannot be imported in the selected packaging environment."
+}
+Write-Host "Packaging PyTorch runtime: $(([string]$TorchRuntime).Trim())"
+
 $ExpectedVersion = (Get-Content -LiteralPath (Join-Path $RepositoryRoot "VERSION") -Raw).Trim()
 $InstalledVersion = (& $Python -c "import importlib.metadata as metadata; print(metadata.version('local-ai-doctor'))" 2>$null)
 if ($LASTEXITCODE -ne 0) {

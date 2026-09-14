@@ -14,6 +14,17 @@ from local_ai_doctor.workers.admission import SingleWorkerAdmission
 from local_ai_doctor.workers.supervisor import ModelWorkerSupervisor, WorkerFailure
 
 
+def test_worker_availability_requires_completed_startup_handshake() -> None:
+    supervisor = ModelWorkerSupervisor.__new__(ModelWorkerSupervisor)
+    supervisor._process = SimpleNamespace(is_alive=lambda: True)
+    supervisor._poisoned = False
+    supervisor._ready = False
+
+    assert supervisor.available is False
+    supervisor._ready = True
+    assert supervisor.available is True
+
+
 def test_queue_limit_counts_waiters_beyond_single_active_slot() -> None:
     admission = SingleWorkerAdmission(queue_limit=1)
     active = admission.reserve("active", "generation")

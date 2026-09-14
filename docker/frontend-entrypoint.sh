@@ -21,7 +21,9 @@ backend_is_healthy() {
             --header='Host: 127.0.0.1:6767' \
             "$backend_health_url" 2>/dev/null || true
     )"
-    printf '%s\n' "$response" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"'
+    printf '%s\n' "$response" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' &&
+        printf '%s\n' "$response" | grep -Eq '"database"[[:space:]]*:[[:space:]]*"ready"' &&
+        printf '%s\n' "$response" | grep -Eq '"worker"[[:space:]]*:[[:space:]]*"ready"'
 }
 
 wait_for_backend() {
@@ -36,15 +38,6 @@ wait_for_backend() {
     done
 }
 
-while :; do
-    wait_for_backend
-    echo "Backend healthy; holding frontend startup for 16 seconds"
-    sleep 16
-    if backend_is_healthy; then
-        break
-    fi
-    echo "Backend lost health during the startup hold; restarting the health gate" >&2
-done
-
-echo "Frontend startup hold complete; starting nginx"
+wait_for_backend
+echo "Backend database, model worker, and registry are ready; starting nginx"
 exec nginx -g 'daemon off;'

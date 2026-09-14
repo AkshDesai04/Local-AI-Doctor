@@ -414,7 +414,10 @@ def create_app(
             replay=repository.get_raw_events,
             subscriber_queue_size=256,
         )
-        worker = ModelWorkerSupervisor(queue_limit=effective_settings.runtime.queue_limit or 1)
+        worker = ModelWorkerSupervisor(
+            queue_limit=effective_settings.runtime.queue_limit or 1,
+            startup_timeout_seconds=effective_settings.workers.startup_timeout_seconds,
+        )
         await worker.start()
         registry = ModelRegistry(effective_settings, repository, worker)
         await registry.refresh()

@@ -35,10 +35,13 @@ config/tokenizer/processor/SafeTensors   SQLite/uploads/cache/exports/backups
 ```
 
 In the container deployment, Compose waits for the FastAPI health check before starting the separate
-frontend reverse proxy. Its entrypoint independently rechecks backend health and enforces a 16-second
-stabilization interval before Nginx begins listening, including after Docker daemon restarts. The browser
+frontend reverse proxy. Its entrypoint independently requires `status: ok`, `database: ready`, and
+`worker: ready` before Nginx begins listening, including after Docker daemon restarts. The browser
 uses that proxy for same-origin API and WebSocket traffic. Native profiles continue to let FastAPI serve
 the built static assets directly.
+
+Worker readiness is established by an IPC handshake from the spawned inference process after it has
+initialized and entered its command loop; a live process identifier alone is not considered ready.
 
 Only serializable commands and events cross the worker boundary. PyTorch modules, tokenizer instances, CUDA state, and raw logits stay inside the spawned child process. A Python exception or process exit is translated into a structured worker failure; it does not intentionally expose a traceback through the API.
 

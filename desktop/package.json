@@ -1,6 +1,6 @@
 {
   "name": "local-ai-doctor-desktop",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "private": true,
   "description": "Windows desktop distribution for Local AI Doctor",
   "main": "main.cjs",
@@ -12,7 +12,7 @@
     "build:frontend": "npm --prefix ../frontend run build",
     "build:backend": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-backend.ps1",
     "build:payload": "npm run build:frontend && npm run build:backend",
-    "dist": "npm run build:payload && electron-builder --win portable --x64 --publish never && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-packaged-layout.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/finalize-release.ps1",
+    "dist": "npm run build:payload && electron-builder --win nsis --x64 --publish never && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-packaged-layout.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/finalize-release.ps1",
     "dist:win": "npm run dist"
   },
   "devDependencies": {
@@ -23,12 +23,14 @@
     "appId": "dev.localaidoctor.desktop",
     "productName": "Local AI Doctor",
     "asar": true,
+    "compression": "normal",
     "npmRebuild": false,
     "directories": {
       "output": "../release"
     },
     "files": [
       "main.cjs",
+      "startup.html",
       "lib/**/*.cjs",
       "package.json"
     ],
@@ -49,13 +51,28 @@
     "win": {
       "target": [
         {
-          "target": "portable",
+          "target": "nsis",
           "arch": [
             "x64"
           ]
         }
       ],
       "artifactName": "Local-AI-Doctor-${version}.exe"
+    },
+    "nsis": {
+      "guid": "df0eb923-5a87-57ad-bb13-24a35a6c435a",
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": true,
+      "runAfterFinish": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Local AI Doctor",
+      "deleteAppDataOnUninstall": false,
+      "differentialPackage": false,
+      "useZip": false,
+      "include": "installer.nsh"
     }
   }
 }

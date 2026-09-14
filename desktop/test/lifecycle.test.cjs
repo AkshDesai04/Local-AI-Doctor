@@ -3,10 +3,20 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { FRONTEND_DELAY_MS, waitForBackend } = require("../lib/lifecycle.cjs");
+const {
+  PACKAGED_DEVICE_MODE,
+  isBackendReady,
+  waitForBackend,
+} = require("../lib/lifecycle.cjs");
 
-test("the frontend startup delay remains exactly sixteen seconds", () => {
-  assert.equal(FRONTEND_DELAY_MS, 16_000);
+test("backend readiness requires the API, database, and model worker", () => {
+  assert.equal(isBackendReady({ status: "ok", database: "ready", worker: "ready" }), true);
+  assert.equal(isBackendReady({ status: "ok", database: "ready", worker: "unavailable" }), false);
+  assert.equal(isBackendReady({ status: "ok", worker: "ready" }), false);
+});
+
+test("packaged builds discover the best usable local device", () => {
+  assert.equal(PACKAGED_DEVICE_MODE, "auto");
 });
 
 test("waitForBackend retries until the backend reports healthy", async () => {
@@ -18,13 +28,13 @@ test("waitForBackend retries until the backend reports healthy", async () => {
     healthCheck: async () => {
       attempts += 1;
       if (attempts < 3) throw new Error("not ready");
-      return { status: "ok" };
+      return { status: "ok", database: "ready", worker: "ready" };
     },
     sleep: async (milliseconds) => {
       sleeps += milliseconds;
     },
   });
-  assert.deepEqual(health, { status: "ok" });
+  assert.deepEqual(health, { status: "ok", database: "ready", worker: "ready" });
   assert.equal(attempts, 3);
   assert.equal(sleeps, 50);
 });

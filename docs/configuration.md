@@ -156,7 +156,7 @@ Declared `Content-Length` and streamed bytes are both checked. Oversized request
 | Field | Default | Notes |
 | --- | --- | --- |
 | `count` | `1` | Reserved; application composition currently starts exactly one spawned worker. |
-| `startup_timeout_seconds` | `120` | Reserved for a startup handshake. |
+| `startup_timeout_seconds` | `120` | Maximum wait for the spawned inference worker's IPC readiness handshake. |
 | `load_timeout_seconds` | `600` | Model-load request timeout. |
 | `inference_timeout_seconds` | `3600` | Generation, embedding, and prompt-score timeout. |
 | `shutdown_grace_seconds` | `15` | Worker unload/exit grace and model unload timeout. |
@@ -188,7 +188,8 @@ Declared `Content-Length` and streamed bytes are both checked. Oversized request
 
 Compose supplies additional deployment controls such as port publication, CPU/memory/PID limits, volume names, and NVIDIA device visibility. Those are documented in [deployment.md](deployment.md), not parsed as application settings.
 
-The portable Electron release overrides `runtime.device=cpu`. This avoids
-probing or advertising a CUDA runtime that cannot fit in GitHub's single-asset
-limit; native and Docker launches continue to use their configured device
-selection.
+The installed Electron application requests automatic device selection. The
+GitHub workflow bundles CPU-only PyTorch to remain within its release-asset
+limit, while a local installer built from the pinned CUDA environment can
+discover and use CUDA. Capability reporting always reflects the runtime that
+was actually packaged.

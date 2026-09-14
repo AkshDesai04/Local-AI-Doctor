@@ -42,7 +42,7 @@ $StartInfo.Environment["LAD_PROFILE"] = "native-windows"
 $StartInfo.Environment["LAD_SERVER__HOST"] = "127.0.0.1"
 $StartInfo.Environment["LAD_SERVER__PORT"] = [string]$Port
 $StartInfo.Environment["LAD_SERVER__ALLOWED_ORIGINS"] = ConvertTo-Json -InputObject @("http://127.0.0.1:16969") -Compress
-$StartInfo.Environment["LAD_RUNTIME__DEVICE"] = "cpu"
+$StartInfo.Environment["LAD_RUNTIME__DEVICE"] = "auto"
 $StartInfo.Environment["LAD_DESKTOP_SHUTDOWN_FILE"] = $ShutdownFile
 $StartInfo.Environment["LAD_PATHS__MODEL_ROOTS"] = ConvertTo-Json -InputObject @($ModelDirectory.FullName) -Compress
 $StartInfo.Environment["LAD_PATHS__DATABASE"] = (Join-Path $TemporaryRoot "workbench.sqlite3")
@@ -100,6 +100,15 @@ try {
     if ($OpenApi.info.version -ne $ExpectedVersion) {
         throw "Packaged backend reports version $($OpenApi.info.version); expected $ExpectedVersion."
     }
+    $Hardware = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/v1/hardware" -TimeoutSec 30
+    $TorchVersion = [string]$Hardware.inventory.software_versions.torch
+    $RuntimeImportFailure = @($Hardware.inventory.discovery_warnings) | Where-Object {
+        [string]$_ -like "PyTorch runtime unavailable*"
+    }
+    if ([string]::IsNullOrWhiteSpace($TorchVersion) -or $RuntimeImportFailure.Count -gt 0) {
+        throw "Packaged backend cannot import its bundled PyTorch runtime: $($RuntimeImportFailure -join '; ')"
+    }
+    Write-Host "Packaged PyTorch runtime is usable: $TorchVersion ($($Hardware.selection.selected_backend))."
     Write-Host "Packaged backend smoke passed on 127.0.0.1:$Port."
 } finally {
     if ($Started -and -not $Process.HasExited) {
