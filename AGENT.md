@@ -310,7 +310,7 @@ Several fields are forward-looking or only partially honored today, including ge
 
 Portable defaults worth knowing when reviewing limits are:
 
-- Conservative context limit 4,096; maximum prompt tokens 32,768; reserved output 512.
+- Fallback context limit 4,096, used only when a checkpoint declares no length; maximum prompt tokens 32,768; reserved output 512. Prompt size is bounded by `max_prompt_tokens`, not by the fallback.
 - Default output 512, temperature 0.7, top-k 50, top-p 0.95, min-p 0, penalties 1/0/0, and ten alternatives.
 - Default instrumentation `token` and queue limit 32.
 - Prompt body/content 4 MiB; upload 100 MiB; per-run trace 128 MiB; 100,000 token events; 16 attachments.
@@ -327,7 +327,7 @@ Discovery scans each configured root to depth two without following directory sy
 - Detect required config, tokenizer, chat template, generation config, processor, pooling, and bundled custom-code components.
 - Infer task and modalities from architecture, tensor, and packaging evidence—not a marketing model name.
 - Identify MoE only through genuine router/expert evidence. Ordinary `gate_proj` tensors in a dense SwiGLU MLP are not experts.
-- Record every discovered context-length candidate and select a conservative minimum with the configured application limit.
+- Record every discovered context-length candidate and select the most authoritative one: the sentence-transformers truncation length, then the architecture's declared positional capacity, then the tokenizer's `model_max_length`, and only then the configured application fallback. Never select a pre-scaling RoPE base length, a per-layer attention span, or an unbounded tokenizer sentinel; record them as evidence. Selecting a minimum across all candidates is a defect: it floors every checkpoint to the application value and hides the real context.
 - Produce diagnostics for missing, malformed, contradictory, or unsupported components.
 - Produce a complete capability matrix. Every non-`full` state needs a reason.
 - Compute a stable manifest fingerprint. The default quick policy hashes metadata fully and SafeTensors headers/sizes, not every weight byte; it is identity evidence, not a full checkpoint-integrity digest.
@@ -358,7 +358,7 @@ The current local model inventory is external and may change. Never commit its h
 - Dense BF16 causal text-generation checkpoint using `Qwen2ForCausalLM`.
 - Approximately 1.78B parameters; not MoE.
 - Emits reasoning text using `<think>...</think>` conventions.
-- Context sources and BOS guidance can disagree. Use the bundled tokenizer, chat template, and generation config, expose all candidates, and keep the conservative tested limit.
+- Context sources and BOS guidance can disagree. Use the bundled tokenizer, chat template, and generation config, expose all candidates, and select the most authoritative context source rather than the smallest.
 - System-prompt/template guidance may warrant a warning, not invented special-token reconstruction.
 
 **Qwen3-VL-Embedding-2B**

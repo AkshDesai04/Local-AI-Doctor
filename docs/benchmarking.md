@@ -96,7 +96,7 @@ For DeepSeek-R1-Distill-Qwen-1.5B, validate all of the following in one short ru
 - cancellation preserves partial message/token/event data;
 - unload reduces allocator ownership before loading the next model.
 
-Begin at the application's conservative context limit. A model-file maximum is not a tested hardware-safe limit. Increase prompt length in bounded steps while recording prefill time and peak VRAM; stop before the host is forced into unstable paging or OOM recovery.
+Begin well below the declared context length, at a bounded prompt size you know the host tolerates. A model-file maximum is not a tested hardware-safe limit, and discovery now reports what the checkpoint declares rather than a conservative floor, so `inference.max_prompt_tokens` is the knob that bounds the sweep. Increase prompt length in bounded steps while recording prefill time and peak VRAM; stop before the host is forced into unstable paging or OOM recovery.
 
 ## Embedding protocol
 
