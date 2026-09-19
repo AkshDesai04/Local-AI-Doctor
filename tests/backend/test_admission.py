@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from local_ai_doctor.domain.models import TrustDecision
 from local_ai_doctor.errors import LimitExceededError, WorkerBusyError
 from local_ai_doctor.services.runs import RunManager
 from local_ai_doctor.workers.admission import SingleWorkerAdmission
@@ -252,6 +253,7 @@ def test_supervisor_load_cache_is_bound_to_model_identity_and_runtime(
             model_type="test",
             effective_context_limit=1024,
             fingerprint=SimpleNamespace(value="a" * 64),
+            trust_decision=TrustDecision.BUILTIN_ONLY,
         )
         runtime = {
             "device": "cuda:0",

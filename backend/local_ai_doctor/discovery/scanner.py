@@ -23,7 +23,9 @@ from ..domain.models import (
 from ..hardware.models import BackendKind
 from .capabilities import ModelEvidence, build_capability_matrix
 from .fingerprint import FingerprintPolicy, fingerprint_model_directory
+from .reviewed_bundled_code import reviewed_reason
 from .safetensors import SafeTensorSummary, inspect_safetensors
+from .transformers_support import builtin_config_error, native_generation_task
 
 _MAX_JSON_BYTES: Final[int] = 32 * 1024**2
 _KNOWN_GENERATION_ARCHITECTURE_PARTS: Final[tuple[str, ...]] = (
@@ -37,6 +39,21 @@ _KNOWN_EMBEDDING_ARCHITECTURE_PARTS: Final[tuple[str, ...]] = (
     "sentence",
     "featureextraction",
 )
+_CHAT_TEMPLATE_FILES: Final[tuple[str, ...]] = ("chat_template.jinja", "chat_template.json")
+# Positional-capacity keys, in the order runtimes honour them. Families that predate
+# `max_position_embeddings` still ship their own spelling: MPT declares `max_seq_len`,
+# GPT-2 derivatives `n_positions`, ChatGLM/Baichuan `seq_length`.
+_CONTEXT_CAPACITY_KEYS: Final[tuple[str, ...]] = (
+    "max_position_embeddings",
+    "max_seq_len",
+    "n_positions",
+    "seq_length",
+    "max_sequence_length",
+    "n_ctx",
+)
+# Tokenizers routinely encode "unbounded" as a float sentinel (1e30) rather than omitting
+# the field, so any value beyond this ceiling is evidence, never a selectable length.
+_CONTEXT_SENTINEL_CEILING: Final[int] = 10_000_000
 _MOE_KEYS: Final[frozenset[str]] = frozenset(
     {
         "num_experts",
@@ -157,37 +174,70 @@ def _sentence_transformer_pooling(directory: Path) -> str | None:
     return enabled[0] if len(enabled) == 1 else None
 
 
+def _sentence_transformer_max_seq_length(directory: Path) -> int | None:
+    """Read the hard truncation length the sentence-transformers pipeline applies."""
+
+    payload, error = _safe_json(directory / "sentence_bert_config.json")
+    if error is not None:
+        return None
+    return _positive_int(payload.get("max_seq_length"))
+
+
 def _context_values(
     config: Mapping[str, Any],
     tokenizer: Mapping[str, Any],
     conservative_default: int,
+    sentence_transformer_max_seq_length: int | None = None,
 ) -> tuple[tuple[ContextValue, ...], int, list[Diagnostic]]:
-    candidates: list[ContextValue] = []
-    sources = (
-        ("config.max_position_embeddings", config.get("max_position_embeddings"), None),
+    """Select the context length the checkpoint itself declares.
+
+    Sources are ranked by authority instead of reduced to a minimum. Taking the minimum
+    silently floored every model to the application default, so a 131,072-token
+    checkpoint reported 4,096. Ranking matters because the sources mean different
+    things: the sentence-transformers pipeline truncates hard at its configured length,
+    the architecture's positional capacity is the field every runtime honours, and
+    `model_max_length` is a tokenizer hint that is frequently a sentinel or a stale copy.
+    Every discovered value is still recorded so disagreements stay visible.
+    """
+
+    ranked: tuple[tuple[int | None, str, Any, str | None], ...] = (
         (
-            "config.text_config.max_position_embeddings",
-            _nested_value(config, "text_config", "max_position_embeddings"),
+            0,
+            "sentence_bert_config.max_seq_length",
+            sentence_transformer_max_seq_length,
+            "the sentence-transformers pipeline truncates every input at this length",
+        ),
+        *((1, f"config.{key}", config.get(key), None) for key in _CONTEXT_CAPACITY_KEYS),
+        *(
+            (1, f"config.text_config.{key}", _nested_value(config, "text_config", key), None)
+            for key in _CONTEXT_CAPACITY_KEYS
+        ),
+        # `sliding_window` is a per-layer attention span, not a sequence limit: Gemma 3
+        # declares 512 with a 32768 context and Phi-3-mini-4k declares 2047 with 4096.
+        # Treating it as a context candidate under-reported the usable context badly.
+        # `original_max_position_embeddings` is the pre-scaling base for the same reason:
+        # Llama 3.2 declares 8192 there and reaches 131072 through RoPE scaling.
+        (
             None,
-        ),
-        (
-            "config.sliding_window",
-            config.get("sliding_window"),
-            "declared but disabled" if config.get("use_sliding_window") is False else None,
-        ),
-        (
             "config.rope_scaling.original_max_position_embeddings",
             _nested_value(config, "rope_scaling", "original_max_position_embeddings"),
-            None,
+            "pre-scaling base length; RoPE scaling extends it to the declared capacity",
         ),
-        ("tokenizer_config.model_max_length", tokenizer.get("model_max_length"), None),
+        (2, "tokenizer_config.model_max_length", tokenizer.get("model_max_length"), None),
     )
+
     diagnostics: list[Diagnostic] = []
-    for source, raw_value, note in sources:
+    candidates: list[ContextValue] = []
+    declared: set[int] = set()
+    selected: int | None = None
+    selected_source: str | None = None
+    selected_tier: int | None = None
+    for tier, source, raw_value, note in ranked:
         value = _positive_int(raw_value)
         if value is None:
             continue
-        if value > 10_000_000:
+        if value > _CONTEXT_SENTINEL_CEILING:
+            candidates.append(ContextValue(source=source, value=value, note=note))
             diagnostics.append(
                 Diagnostic(
                     code="context_sentinel_ignored",
@@ -196,24 +246,38 @@ def _context_values(
                     evidence={"source": source, "value": value},
                 )
             )
+            continue
         candidates.append(ContextValue(source=source, value=value, note=note))
+        if tier is None:
+            continue
+        declared.add(value)
+        if selected_tier is None or tier < selected_tier:
+            selected_tier, selected, selected_source = tier, value, source
+
     candidates.append(
         ContextValue(
             source="application.conservative_context_limit",
             value=conservative_default,
-            note="portable default until a larger limit is validated on this backend",
+            note="portable fallback used only when the checkpoint declares no context length",
         )
     )
-    plausible = [item.value for item in candidates if item.value <= 10_000_000]
-    selected = min(plausible)
-    discovered = {item.value for item in candidates if not item.source.startswith("application.")}
-    if len(discovered) > 1:
+    if selected is None:
+        selected = conservative_default
+        selected_source = "application.conservative_context_limit"
+    if len(declared) > 1:
         diagnostics.append(
             Diagnostic(
                 code="conflicting_context_metadata",
                 severity=DiagnosticSeverity.WARNING,
-                message="model files declare conflicting context limits; the conservative minimum is selected",
-                evidence={"discovered_values": sorted(discovered), "selected": selected},
+                message=(
+                    "model files declare conflicting context lengths; the most authoritative "
+                    "source was selected"
+                ),
+                evidence={
+                    "discovered_values": sorted(declared),
+                    "selected": selected,
+                    "selected_source": selected_source,
+                },
             )
         )
     return tuple(candidates), selected, diagnostics
@@ -281,6 +345,9 @@ def _detect_task(
         return ModelTask.ENCODER_DECODER_GENERATION, True, "encoder-decoder architecture metadata"
     if any(part in architecture_text for part in _KNOWN_GENERATION_ARCHITECTURE_PARTS):
         return ModelTask.TEXT_GENERATION, True, "generation architecture metadata"
+    native = native_generation_task(str(config.get("model_type") or "") or None)
+    if native is not None:
+        return native, True, "installed Transformers native architecture mapping"
     return ModelTask.UNKNOWN, False, "no recognized task metadata"
 
 
@@ -313,7 +380,7 @@ def _components(
         safetensors=any(_regular_file(path) for path in directory.glob("*.safetensors")),
         tokenizer=any(_regular_file(directory / name) for name in tokenizer_files),
         chat_template=bool(tokenizer.get("chat_template"))
-        or _regular_file(directory / "chat_template.jinja"),
+        or any(_regular_file(directory / name) for name in _CHAT_TEMPLATE_FILES),
         generation_config=_regular_file(directory / "generation_config.json"),
         processor=any(_regular_file(directory / name) for name in processor_files),
         pooling=_regular_file(directory / "modules.json")
@@ -324,10 +391,11 @@ def _components(
 
 def _reasoning_delimiters(tokenizer: Mapping[str, Any], directory: Path) -> tuple[str, str] | None:
     text = json.dumps(tokenizer, ensure_ascii=False)
-    template_path = directory / "chat_template.jinja"
-    if _regular_file(template_path) and template_path.stat().st_size <= _MAX_JSON_BYTES:
-        with contextlib.suppress(OSError, UnicodeDecodeError):
-            text += template_path.read_text(encoding="utf-8")
+    for name in _CHAT_TEMPLATE_FILES:
+        template_path = directory / name
+        if _regular_file(template_path) and template_path.stat().st_size <= _MAX_JSON_BYTES:
+            with contextlib.suppress(OSError, UnicodeDecodeError):
+                text += template_path.read_text(encoding="utf-8")
     if "<think>" in text and "</think>" in text:
         return ("<think>", "</think>")
     return None
@@ -551,18 +619,55 @@ class ModelScanner:
                 )
             )
 
+        # Computed here, ahead of the trust decision below, because the reviewed-bundled-
+        # code exception is pinned to this exact fingerprint: a changed checkpoint at the
+        # same path must not silently inherit a review that covered different bytes.
+        fingerprint = fingerprint_model_directory(directory, self._fingerprint_policy)
+
+        model_type = str(config.get("model_type")) if config.get("model_type") else None
         auto_map = config.get("auto_map")
         trust_decision = TrustDecision.BUILTIN_ONLY
         if isinstance(auto_map, Mapping) and auto_map:
-            trust_decision = TrustDecision.REJECTED_CUSTOM_CODE
-            diagnostics.append(
-                Diagnostic(
-                    code="custom_code_not_trusted",
-                    severity=DiagnosticSeverity.ERROR,
-                    message="model metadata requires custom Python code that has not been reviewed",
-                    hint="Review it and enable a narrow isolated adapter for this exact fingerprint.",
+            # Many published checkpoints still carry an `auto_map` written before the
+            # family was upstreamed (Phi-3). When the reviewed built-in configuration
+            # reads the checkpoint, the bundled code is redundant rather than blocking.
+            builtin_error = builtin_config_error(directory, model_type)
+            if builtin_error is None:
+                diagnostics.append(
+                    Diagnostic(
+                        code="bundled_custom_code_superseded",
+                        severity=DiagnosticSeverity.INFO,
+                        message="metadata points at bundled custom code; the reviewed built-in Transformers implementation is used instead",
+                        evidence={"model_type": model_type},
+                    )
                 )
-            )
+            else:
+                review_reason = reviewed_reason(fingerprint.value, directory.name)
+                if review_reason is not None:
+                    trust_decision = TrustDecision.REVIEWED_BUNDLED_CODE
+                    diagnostics.append(
+                        Diagnostic(
+                            code="bundled_custom_code_reviewed",
+                            severity=DiagnosticSeverity.INFO,
+                            message="the built-in Transformers implementation cannot read this checkpoint; a fingerprint-pinned review approved the bundled code instead",
+                            evidence={
+                                "model_type": model_type,
+                                "builtin_reason": builtin_error,
+                                "review": review_reason,
+                            },
+                        )
+                    )
+                else:
+                    trust_decision = TrustDecision.REJECTED_CUSTOM_CODE
+                    diagnostics.append(
+                        Diagnostic(
+                            code="custom_code_not_trusted",
+                            severity=DiagnosticSeverity.ERROR,
+                            message=f"model metadata requires custom Python code that has not been reviewed: {builtin_error}",
+                            hint="Review it and enable a narrow isolated adapter for this exact fingerprint.",
+                            evidence={"model_type": model_type, "builtin_reason": builtin_error},
+                        )
+                    )
         elif components.custom_code:
             diagnostics.append(
                 Diagnostic(
@@ -573,12 +678,14 @@ class ModelScanner:
             )
 
         context_values, context_limit, context_diagnostics = _context_values(
-            config, tokenizer, self._conservative_context_limit
+            config,
+            tokenizer,
+            self._conservative_context_limit,
+            _sentence_transformer_max_seq_length(directory),
         )
         diagnostics.extend(context_diagnostics)
         diagnostics.extend(_metadata_diagnostics(config, tokenizer, generation))
 
-        fingerprint = fingerprint_model_directory(directory, self._fingerprint_policy)
         capabilities = build_capability_matrix(
             ModelEvidence(
                 task=task,
@@ -619,7 +726,7 @@ class ModelScanner:
             fingerprint=fingerprint,
             task=task,
             architectures=architectures,
-            model_type=str(config.get("model_type")) if config.get("model_type") else None,
+            model_type=model_type,
             dtype=str(dtype) if dtype else None,
             parameter_count=summary.parameter_count or None,
             weight_dtypes=summary.dtype_parameter_counts,

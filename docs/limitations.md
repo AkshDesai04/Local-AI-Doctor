@@ -10,7 +10,8 @@ This page describes the implemented 0.1-series workbench, not the eventual adapt
 - CPU and CUDA are selectable. ROCm, MPS, multi-GPU placement, and device maps are not implemented runtime paths. CPU offload and non-`none` weight quantization are typed configuration choices but are explicitly rejected by the reference loader.
 - Extracted-document inference and hidden-state trace capture are not registered adapters. Causal self-attention attribution is implemented only as a partial capability for compatible decoder-only text-generation models at `full`/`expert`; encoder-decoder generation and embedding models do not expose the combined view.
 - RAM/VRAM budget preflight compares discovered checkpoint weight bytes with the selected backend's configured budget. It does not estimate or cap parameters after dtype conversion, activations, KV cache, allocator overhead, or peak runtime memory, so a later backend OOM remains possible.
-- Custom checkpoint code is not supported. `trust_remote_code=true` is globally rejected.
+- Custom checkpoint code is not supported. `trust_remote_code=true` is globally rejected. A bundled `auto_map` is only blocking when the installed Transformers build cannot read the configuration with `trust_remote_code=false`; when a reviewed built-in implementation reads it, discovery records that the bundled code is superseded and the model stays loadable.
+- The generation loader resolves the Auto class from the loaded configuration, so causal, image-text-to-text, and vision-to-sequence decoder families the installed Transformers build registers are all reachable. A family the installed build does not register is reported, not worked around.
 
 ## Observability gaps
 
@@ -30,7 +31,10 @@ This page describes the implemented 0.1-series workbench, not the eventual adapt
 ## Generation behavior
 
 - Generation uses batch size one and a reference loop. It prioritizes observability over optimized continuous batching or serving throughput.
-- The selected conservative context is the minimum plausible discovered/configured value, currently capped by the application default. It is not proof that the limit is safe on every device.
+- The selected context is the length the checkpoint's own metadata declares, chosen by source authority rather than by taking a minimum. It is what the files claim, not a tested hardware-safe limit on this device, and not a guarantee that the model was trained or evaluated at that length. Several published checkpoints declare a positional capacity larger than the window their model card documents as supported (Mistral-NeMo derivatives declare 1,024,000 against a documented 128K; Qwen3 declares 40,960 against a documented 32,768). Where local metadata and the published card disagree, `conflicting_context_metadata` records every declared value, and `inference.max_prompt_tokens` remains the enforced prompt bound.
+- A documented context window that appears only in a checkpoint's prose model card is not read. Discovery parses metadata, never README text, because comparison tables in those files routinely describe other models in the same family.
+- `application.conservative_context_limit` is a fallback for checkpoints that declare no length at all, not a ceiling. Raising it does not restrict a model, and lowering it does not protect the host.
+- `sliding_window` is deliberately excluded from context evidence. It is a per-layer attention span, not a sequence limit, and treating it as one under-reported the usable context for sliding-window families such as Gemma 3 and Phi-3-mini-4k.
 - `max_prompt_tokens` is enforced after rendering/tokenization. Causal generation also subtracts `reserved_output_tokens` when admitting the prompt and clips output to remaining context. Encoder-decoder source and decoder lengths are treated separately; this is a conservative generic policy, not an architecture-specific memory guarantee.
 - Prompt scoring enforces `limits.prompt_bytes` but does not separately apply `inference.max_prompt_tokens`; an over-context scoring input is left to the tokenizer/model path to reject.
 - Stop-sequence detection occurs after a token has been selected and decoded. The matching text remains in the stored/displayed output.

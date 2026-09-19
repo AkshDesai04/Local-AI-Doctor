@@ -123,7 +123,7 @@ Non-loopback configuration is rejected unless external access and a token are bo
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `conservative_context_limit` | `4096` | Included among discovered context candidates; the minimum plausible value is enforced for generation. |
+| `conservative_context_limit` | `4096` | Fallback context length used only when a checkpoint declares none. It is recorded among the discovered candidates but no longer caps a checkpoint that declares its own capacity; bound prompt size with `max_prompt_tokens` instead. |
 | `reserved_output_tokens` | `512` | For causal generation, subtracted from the effective context when computing the maximum admitted rendered-prompt length. Encoder-decoder source and decoder lengths are treated separately, so it is not subtracted from the source limit. |
 | `max_prompt_tokens` | `32768` | Enforced for generation after chat rendering/tokenization. The prompt limit is the minimum of this value and the architecture-specific context allowance. Requested output is also clipped to remaining context. |
 | `local_files_only` | `true` | The worker currently enforces local-only loading regardless of override. |
