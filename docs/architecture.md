@@ -82,7 +82,7 @@ Discovery walks each configured root to a bounded depth without following model 
 - detects tokenizer, template, generation, processor, pooling, and custom-code components;
 - infers task and modalities from architecture and packaging evidence;
 - detects MoE only from explicit expert/router evidence, never from ordinary `gate_proj` tensors;
-- records every discovered context value and chooses the conservative minimum, including the configured application limit;
+- records every discovered context value and selects the most authoritative one: the sentence-transformers truncation length, then the architecture's declared positional capacity, then `tokenizer_config.model_max_length`, and only then the configured application fallback. Pre-scaling RoPE base lengths, per-layer attention spans, and unbounded tokenizer sentinels are recorded as evidence but never selected;
 - creates a SHA-256 manifest fingerprint and a stable ID containing its prefix. The default quick policy hashes metadata files fully and SafeTensors headers plus file sizes (or bounded endpoint samples for other weight formats), not every weight byte.
 
 A changed fingerprint represents a new model identity, but an unchanged quick fingerprint is not proof that every weight byte is unchanged. Refresh replaces the registry row for the same canonical path while historical runs retain their stored fingerprint. Deleting metadata never deletes a model file.

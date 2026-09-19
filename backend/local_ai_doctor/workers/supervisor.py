@@ -10,7 +10,7 @@ import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
-from ..domain.models import ModelDescriptor
+from ..domain.models import ModelDescriptor, TrustDecision
 from .runtime import worker_main
 
 
@@ -349,6 +349,7 @@ class ModelWorkerSupervisor:
             "fingerprint": descriptor.fingerprint.value,
             "embedding_pooling": metadata.get("pooling"),
             "joint_embedding_space": metadata.get("joint_embedding_space", False),
+            "trust_remote_code": descriptor.trust_decision is TrustDecision.REVIEWED_BUNDLED_CODE,
         }
         requested = {"model": model, "runtime": dict(runtime)}
         if (

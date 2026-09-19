@@ -360,6 +360,28 @@ def _eos_token_ids(model: Any, tokenizer: Any) -> set[int]:
     return result
 
 
+def _generation_loader(model_path: Path, common: Mapping[str, Any]) -> Any:
+    """Pick the Auto class the installed Transformers build maps this checkpoint to.
+
+    Decoder-only checkpoints are registered under ``AutoModelForCausalLM``, but
+    multimodal generators (Qwen3-VL and every other ``*ForConditionalGeneration``
+    family) are only registered under the image-text-to-text head. Resolving through
+    the loaded configuration keeps new families working without a code change and
+    without enabling repository code.
+    """
+
+    import transformers
+
+    config = transformers.AutoConfig.from_pretrained(model_path, **common)
+    for name in ("AutoModelForCausalLM", "AutoModelForImageTextToText", "AutoModelForVision2Seq"):
+        loader = getattr(transformers, name, None)
+        mapping = getattr(loader, "_model_mapping", None)
+        if mapping is not None and type(config) in mapping:
+            return loader
+    # Fall through to the causal head so Transformers raises its own exact message.
+    return transformers.AutoModelForCausalLM
+
+
 def _embedding_model_kwargs(model_path: Path, kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Return loader kwargs required by reviewed built-in embedding architectures.
 
@@ -520,9 +542,12 @@ class WorkerRuntime:
             if attention in {None, "auto"}
             else attention.replace("flash-attention-2", "flash_attention_2")
         )
+        # Only True when discovery matched this exact manifest fingerprint against a
+        # human-reviewed entry in discovery/reviewed_bundled_code.py; never client-set.
+        trust_remote_code = bool(model.get("trust_remote_code", False))
         common: dict[str, Any] = {
             "local_files_only": True,
-            "trust_remote_code": False,
+            "trust_remote_code": trust_remote_code,
         }
         model_kwargs = dict(common)
         if dtype is not None:
@@ -532,14 +557,14 @@ class WorkerRuntime:
         task = str(model["task"])
         started = time.monotonic()
         if task in {"text_generation", "encoder_decoder_generation"}:
-            from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
+            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
             tokenizer_loader: Any = AutoTokenizer
             self.tokenizer = tokenizer_loader.from_pretrained(model_path, **common)
             loader: Any = (
                 AutoModelForSeq2SeqLM
                 if task == "encoder_decoder_generation"
-                else AutoModelForCausalLM
+                else _generation_loader(model_path, common)
             )
             self.model = loader.from_pretrained(
                 model_path,
@@ -568,7 +593,7 @@ class WorkerRuntime:
             sentence_kwargs: dict[str, Any] = {
                 "device": self.device,
                 "local_files_only": True,
-                "trust_remote_code": False,
+                "trust_remote_code": trust_remote_code,
             }
             if model_kwargs:
                 embedding_model_kwargs = {
@@ -592,7 +617,7 @@ class WorkerRuntime:
             "dtype": self.dtype,
             "load_seconds": time.monotonic() - started,
             "memory": memory,
-            "trust_remote_code": False,
+            "trust_remote_code": trust_remote_code,
             "local_files_only": True,
             "decoder_start_token_id": self.decoder_start_token_id,
             "decoder_start_token_source": self.decoder_start_token_source,
