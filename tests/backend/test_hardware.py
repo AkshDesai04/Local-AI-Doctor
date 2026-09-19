@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
+
 import pytest
 
 from local_ai_doctor.config import DeviceMode, DType
@@ -80,3 +83,45 @@ def test_explicit_cpu_probe_does_not_import_accelerator_runtime(
 
     assert discovered.accelerators == ()
     assert "CPU execution is configured" in discovered.discovery_warnings[0]
+
+
+def _nvidia_smi_reports_a_gpu() -> bool:
+    path = shutil.which("nvidia-smi")
+    if path is None:
+        return False
+    try:
+        result = subprocess.run(
+            [path, "--query-gpu=index", "--format=csv,noheader"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+@pytest.mark.skipif(
+    not _nvidia_smi_reports_a_gpu(), reason="requires a real machine with a working nvidia-smi"
+)
+def test_real_hardware_detects_gpu_when_nvidia_smi_works() -> None:
+    """Regression guard: a machine where nvidia-smi sees a GPU must end up with a
+
+    usable CUDA device and an auto selection that actually picks it. This catches
+    silent GPU loss (e.g. a CPU-only torch build shadowing a CUDA one) that unit
+    tests with fixture inventories can't see.
+    """
+
+    discovered = SystemHardwareProbe().discover()
+    cuda_devices = discovered.usable(BackendKind.CUDA)
+    assert cuda_devices, (
+        f"nvidia-smi reports a GPU but no usable CUDA device was discovered: "
+        f"accelerators={discovered.accelerators!r} "
+        f"warnings={discovered.discovery_warnings!r} "
+        f"software_versions={discovered.software_versions!r}"
+    )
+
+    selected = select_hardware(discovered, DeviceMode.AUTO)
+    assert selected.selected_backend is BackendKind.CUDA
+    assert not selected.used_fallback
