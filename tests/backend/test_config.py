@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 import local_ai_doctor.config as config_module
 from local_ai_doctor.config import (
@@ -214,3 +214,17 @@ def test_model_root_update_tolerates_combined_bind_mount_denials(
         environ={},
     )
     assert saved.paths.model_roots == (model_root.resolve(),)
+
+
+def test_unload_timeout_is_separate_from_the_shutdown_grace() -> None:
+    assert AppSettings().workers.unload_timeout_seconds == 60.0
+    assert AppSettings().workers.shutdown_grace_seconds == 15.0
+
+    portable = Path(__file__).parents[2] / "config" / "default.yaml"
+    loaded = SettingsLoader().load(default_path=portable, environ={})
+    assert loaded.workers.unload_timeout_seconds == 60.0
+
+    override = AppSettings.model_validate({"workers": {"unload_timeout_seconds": 5}})
+    assert override.workers.unload_timeout_seconds == 5.0
+    with pytest.raises(ValidationError):
+        AppSettings.model_validate({"workers": {"unload_timeout_seconds": 0.5}})

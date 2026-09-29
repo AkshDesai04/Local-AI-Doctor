@@ -744,3 +744,25 @@ def test_unknown_browser_settings_key_is_a_422_invalid_request(api_client: TestC
     error = response.json()["error"]
     assert error["code"] == "invalid_request"
     assert "top_k" in error["details"]["issues"][0]["message"]
+
+
+def test_unload_uses_its_own_timeout_not_the_shutdown_grace(
+    api_client: TestClient,
+    api_settings: AppSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = api_client.app.state.services
+    observed: list[float] = []
+
+    async def fake_unload(*, timeout_seconds: float) -> dict[str, object]:
+        observed.append(timeout_seconds)
+        return {"unloaded_model_id": None}
+
+    monkeypatch.setattr(services.worker, "unload", fake_unload)
+
+    response = api_client.post("/api/v1/models/unload", headers=API_HEADERS)
+
+    assert response.status_code == 200
+    assert api_settings.workers.shutdown_grace_seconds == 1.0
+    assert observed == [api_settings.workers.unload_timeout_seconds]
+    assert observed == [60.0]

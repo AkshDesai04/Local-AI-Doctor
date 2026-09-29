@@ -36,6 +36,7 @@ This project follows a Keep a Changelog-style structure. Versions and dates are 
 - Abandoning a generation stream before its terminal event (the consumer closing it, raising, or being cancelled) now cancels the worker and waits for it to stop, instead of leaving an orphaned run generating in the background and blocking the next run. The run manager now closes the worker stream explicitly when the streaming loop fails.
 - Editing a user message (a new user message under the same parent) now gets the next `branch_index` among its siblings instead of always `0`, matching how replay numbers assistant branches. Root messages are numbered per chat.
 - The browser-shaped `settings` object on `POST /runs` no longer overwrites an explicit `sampling` object or the top-level `deterministic_reference_mode` (`settings` now only fills fields that are not already set), and unknown or snake_case keys inside `settings` are rejected with 422 `invalid_request` instead of being silently dropped.
+- Unloading a model uses its own `workers.unload_timeout_seconds` (default 60, minimum 1) instead of `workers.shutdown_grace_seconds` (15). A slow unload previously timed out early, which recycled the whole worker process.
 
 ### Security
 

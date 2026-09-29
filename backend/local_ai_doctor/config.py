@@ -282,6 +282,7 @@ class WorkerSettings(BaseModel):
     count: int = Field(default=1, ge=1, le=128)
     startup_timeout_seconds: float = Field(default=120.0, gt=0.0, le=3600.0)
     load_timeout_seconds: float = Field(default=600.0, gt=0.0, le=86_400.0)
+    unload_timeout_seconds: float = Field(default=60.0, ge=1.0, le=3600.0)
     inference_timeout_seconds: float = Field(default=3600.0, gt=0.0, le=7 * 86_400.0)
     shutdown_grace_seconds: float = Field(default=15.0, ge=0.0, le=600.0)
 
