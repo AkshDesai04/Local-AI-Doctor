@@ -7,7 +7,7 @@ import json
 import logging
 import secrets
 import uuid
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
@@ -387,6 +387,7 @@ class RunManager:
         persisted_token_count = 0
         persisted_trace_bytes = 0
         persistence_limit_reported = False
+        stream: AsyncGenerator[dict[str, Any], None] | None = None
         try:
             await self.events.publish(
                 run_id,
@@ -403,7 +404,7 @@ class RunManager:
             started = _now()
             await self.repository.update_run(run_id, status="running", started_at=started)
             await self.repository.update_message(message_id, content="", status="streaming")
-            async for worker_event in self.worker.generate(
+            stream = self.worker.generate(
                 run_id=run_id,
                 messages=messages,
                 sampling=sampling,
@@ -415,7 +416,8 @@ class RunManager:
                 timeout_seconds=self.settings.workers.inference_timeout_seconds,
                 forced_prefix_token_ids=forced_prefix_token_ids or (),
                 reasoning=reasoning,
-            ):
+            )
+            async for worker_event in stream:
                 event_type = str(worker_event["event_type"])
                 payload = dict(worker_event.get("payload", {}))
                 if event_type == "stage" and payload.get("stage") == "prefill":
@@ -583,6 +585,12 @@ class RunManager:
             with suppress(Exception):
                 await self.events.publish(run_id, "error", error)
         finally:
+            # Close the worker stream before freeing the lease so a failure in the
+            # loop above stops the worker at once instead of when the generator is
+            # garbage collected.
+            if stream is not None:
+                with suppress(Exception):
+                    await stream.aclose()
             reservation.release()
 
     async def cancel(self, run_id: str) -> bool:

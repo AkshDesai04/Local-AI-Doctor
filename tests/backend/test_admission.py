@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -424,6 +424,97 @@ def test_generation_timeout_recycles_worker_and_cleans_registered_channels(
         assert observed == [(process, caught.value.error)]
         assert supervisor._reply_futures == {}
         assert supervisor._run_queues == {}
+        assert supervisor._active_run_id is None
+
+    asyncio.run(scenario())
+
+
+def _streaming_supervisor() -> tuple[ModelWorkerSupervisor, list[str | None]]:
+    """A supervisor whose fake worker acknowledges a cancel request at once."""
+
+    supervisor = ModelWorkerSupervisor.__new__(ModelWorkerSupervisor)
+    cancel_requests: list[str | None] = []
+
+    class CancelEvent:
+        @staticmethod
+        def clear() -> None:
+            return None
+
+        @staticmethod
+        def set() -> None:
+            cancel_requests.append(supervisor._active_run_id)
+            for future in supervisor._reply_futures.values():
+                future.set_result({"ok": True})
+
+    supervisor._process = SimpleNamespace(is_alive=lambda: True)
+    supervisor._commands = SimpleNamespace(put=lambda *_args: None)
+    supervisor._cancel_event = CancelEvent()
+    supervisor._cancelled_run_ids = set()
+    supervisor._run_lock = asyncio.Lock()
+    supervisor._active_run_id = None
+    supervisor._reply_futures = {}
+    supervisor._run_queues = {}
+    return supervisor, cancel_requests
+
+
+async def _open_stream_with_one_event(
+    supervisor: ModelWorkerSupervisor, event_type: str
+) -> AsyncGenerator[dict[str, Any], None]:
+    loop = asyncio.get_running_loop()
+
+    def worker_receives_command(*_args: object) -> None:
+        # Runs in a helper thread, like the real queue put; the fake worker answers
+        # with one event on the loop thread.
+        loop.call_soon_threadsafe(
+            supervisor._run_queues["run"].put_nowait, {"event_type": event_type, "payload": {}}
+        )
+
+    supervisor._commands = SimpleNamespace(put=worker_receives_command)
+    stream = supervisor.generate(
+        run_id="run",
+        messages=[{"role": "user", "content": "hello"}],
+        sampling={},
+        effective_seed=0,
+        instrumentation="off",
+        deterministic_reference_mode=False,
+        max_prompt_tokens=32,
+        reserved_output_tokens=8,
+        timeout_seconds=30.0,
+    )
+    assert (await anext(stream))["event_type"] == event_type
+    return stream
+
+
+@pytest.mark.parametrize("abandon", ["close", "consumer_error"])
+def test_abandoned_generation_stream_cancels_the_worker(abandon: str) -> None:
+    async def scenario() -> None:
+        supervisor, cancel_requests = _streaming_supervisor()
+        stream = await _open_stream_with_one_event(supervisor, "token")
+        assert cancel_requests == []
+
+        if abandon == "close":
+            await stream.aclose()
+        else:
+            with pytest.raises(RuntimeError, match="consumer failed"):
+                await stream.athrow(RuntimeError("consumer failed"))
+
+        assert cancel_requests == ["run"]
+        assert supervisor._reply_futures == {}
+        assert supervisor._run_queues == {}
+        assert supervisor._active_run_id is None
+        assert not supervisor._run_lock.locked()
+
+    asyncio.run(scenario())
+
+
+def test_generation_stream_closed_after_terminal_event_does_not_cancel() -> None:
+    async def scenario() -> None:
+        supervisor, cancel_requests = _streaming_supervisor()
+        stream = await _open_stream_with_one_event(supervisor, "completed")
+
+        await stream.aclose()
+
+        assert cancel_requests == []
         assert supervisor._active_run_id is None
 
     asyncio.run(scenario())

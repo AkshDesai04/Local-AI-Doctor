@@ -7,7 +7,7 @@ import contextlib
 import multiprocessing as mp
 import queue
 import uuid
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from typing import Any
 
 from ..domain.models import ModelDescriptor, TrustDecision
@@ -408,7 +408,7 @@ class ModelWorkerSupervisor:
         timeout_seconds: float,
         forced_prefix_token_ids: Sequence[int] = (),
         reasoning: bool | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
+    ) -> AsyncGenerator[dict[str, Any], None]:
         if getattr(self, "_poisoned", False) or not self.alive:
             await self.start()
         async with self._run_lock:
@@ -421,9 +421,13 @@ class ModelWorkerSupervisor:
             run_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=512)
             self._reply_futures[request_id] = future
             self._run_queues[run_id] = run_queue
-            self._cancel_event.clear()
+            cancel_event = self._cancel_event
+            cancel_event.clear()
             process = self._process
             deadline = loop.time() + timeout_seconds
+            # True once the worker is known to be finished with this run, either
+            # because a terminal event arrived or because a timeout replaced it.
+            settled = False
             if run_id in self._cancelled_run_ids:
                 self._cancel_event.set()
             try:
@@ -451,8 +455,9 @@ class ModelWorkerSupervisor:
                     if remaining <= 0:
                         raise TimeoutError
                     event = await asyncio.wait_for(run_queue.get(), timeout=remaining)
+                    settled = event.get("event_type") in {"completed", "cancelled", "error"}
                     yield event
-                    if event.get("event_type") in {"completed", "cancelled", "error"}:
+                    if settled:
                         break
                 remaining = deadline - loop.time()
                 if remaining <= 0:
@@ -461,6 +466,7 @@ class ModelWorkerSupervisor:
                 if not reply.get("ok") and event.get("event_type") != "error":
                     raise WorkerFailure(reply.get("error", {"message": "generation failed"}))
             except (OSError, TimeoutError, ValueError, queue.Full) as exc:
+                settled = True
                 self._cancel_event.set()
                 error = {
                     "code": "inference_timeout",
@@ -470,6 +476,15 @@ class ModelWorkerSupervisor:
                 await self._recycle_timed_out_worker(process, error)
                 raise WorkerFailure(error) from exc
             finally:
+                if not settled and process is self._process and self._active_run_id == run_id:
+                    # The consumer abandoned the stream (closed it, raised, or was
+                    # cancelled) before a terminal event, so the worker would keep
+                    # generating an orphaned run. Stop it, and wait for its reply
+                    # while still holding the run lock so the next run's
+                    # cancel_event.clear() cannot swallow this request.
+                    cancel_event.set()
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(future, timeout=5.0)
                 self._reply_futures.pop(request_id, None)
                 self._run_queues.pop(run_id, None)
                 self._cancelled_run_ids.discard(run_id)
