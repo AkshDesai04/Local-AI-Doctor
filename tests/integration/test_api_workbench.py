@@ -731,3 +731,16 @@ def test_resource_and_conflict_errors_use_the_error_envelope(
     monkeypatch.setattr(services.worker, "_loaded", {"model_id": "some-other-model"})
     other = api_client.post(f"/api/v1/models/{model_id}/unload", headers=API_HEADERS)
     error_of(other, 409, "model_not_loaded")
+
+
+def test_unknown_browser_settings_key_is_a_422_invalid_request(api_client: TestClient) -> None:
+    response = api_client.post(
+        "/api/v1/runs",
+        headers=API_HEADERS,
+        json={"chatId": "c", "modelId": "m", "content": "hi", "settings": {"top_k": 3}},
+    )
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "invalid_request"
+    assert "top_k" in error["details"]["issues"][0]["message"]

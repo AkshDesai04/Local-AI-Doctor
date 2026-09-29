@@ -35,6 +35,7 @@ This project follows a Keep a Changelog-style structure. Versions and dates are 
 - Chat and run 404s, run-cancel and confirmation 409s, unloading a model by ID while a different model is resident, the embedding attachment-count 413, and unknown `/api` paths now return the standard `{"error": {...}}` envelope with stable codes (`chat_not_found`, `run_not_found`, `run_not_cancellable`, `confirmation_required`, `model_not_loaded`, `not_found`). They previously returned FastAPI's `{"detail": "..."}` shape. Status codes are unchanged.
 - Abandoning a generation stream before its terminal event (the consumer closing it, raising, or being cancelled) now cancels the worker and waits for it to stop, instead of leaving an orphaned run generating in the background and blocking the next run. The run manager now closes the worker stream explicitly when the streaming loop fails.
 - Editing a user message (a new user message under the same parent) now gets the next `branch_index` among its siblings instead of always `0`, matching how replay numbers assistant branches. Root messages are numbered per chat.
+- The browser-shaped `settings` object on `POST /runs` no longer overwrites an explicit `sampling` object or the top-level `deterministic_reference_mode` (`settings` now only fills fields that are not already set), and unknown or snake_case keys inside `settings` are rejected with 422 `invalid_request` instead of being silently dropped.
 
 ### Security
 

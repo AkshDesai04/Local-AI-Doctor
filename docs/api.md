@@ -135,6 +135,8 @@ Canonical generation request:
 }
 ```
 
+The endpoint also accepts a browser-shaped body: `chatId`, `modelId`, `content`, `parentMessageId`, `attachmentIds`, and a nested `settings` object with `device`, `dtype`, `instrumentation`, `reasoning`, `seed`, `deterministic`, `temperature`, `alternatives`, `maxOutputTokens`, `topK`, `topP`, `minP`, `repetitionPenalty`, `frequencyPenalty`, `presencePenalty`, and `stopSequences`. Canonical top-level fields (including `deterministic_reference_mode`) and an explicit `sampling` object always win; `settings` only fills what is not already set. An unrecognized key inside `settings` (including a snake_case one) or a `settings` value that is not an object is rejected with 422 `invalid_request`.
+
 The response includes camel-case convenience fields and canonical objects:
 
 ```json
