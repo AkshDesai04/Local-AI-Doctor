@@ -1,4 +1,4 @@
-import { ArrowUp, BrainCircuit, FileText, Image, Mic, Paperclip, SlidersHorizontal, Square, Video, X } from "lucide-react";
+import { ArrowUp, BrainCircuit, FileText, Image, Mic, Paperclip, ScrollText, SlidersHorizontal, Square, Video, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { Attachment, GenerationSettings, ModelSummary } from "../api/types";
 import { capabilityReason, generationCapabilityReason, isUsable, supportsGeneration } from "../domain/capabilities";
@@ -16,7 +16,12 @@ interface ComposerProps {
   onStop: () => void;
   onAttach: (file: File) => void;
   onRemoveAttachment: (id: string) => void;
+  systemPrompt: string;
+  onSystemPromptChange: (value: string) => void;
 }
+
+// UI-only soft cap; the backend bounds the prompt by limits.prompt_bytes.
+const SYSTEM_PROMPT_MAX_CHARACTERS = 32_000;
 
 function PromptRange({
   label,
@@ -43,7 +48,7 @@ function PromptRange({
   );
 }
 
-export function Composer({ model, connected, busy, running, attachments, settings, onSettingsChange, onSubmit, onStop, onAttach, onRemoveAttachment }: ComposerProps): React.ReactNode {
+export function Composer({ model, connected, busy, running, attachments, settings, onSettingsChange, onSubmit, onStop, onAttach, onRemoveAttachment, systemPrompt, onSystemPromptChange }: ComposerProps): React.ReactNode {
   const [value, setValue] = useState("");
   const [attachmentMenu, setAttachmentMenu] = useState(false);
   const [promptControlsOpen, setPromptControlsOpen] = useState(false);
@@ -145,6 +150,7 @@ export function Composer({ model, connected, busy, running, attachments, setting
           rows={1}
           value={value}
         />
+        {systemPrompt.trim() && <span aria-label="System prompt active" className="composer-tool active" role="img" title="System prompt active: applied to every response in this chat"><ScrollText size={16} /></span>}
         <div className="composer-settings-wrap">
           <button
             aria-expanded={promptControlsOpen}
@@ -168,6 +174,10 @@ export function Composer({ model, connected, busy, running, attachments, setting
               <PromptRange hint="Higher values make token selection more varied; zero uses greedy decoding." label="Temperature" max={5} min={0} onChange={(next) => updateSetting("temperature", next)} step={0.05} value={settings.temperature} />
               <PromptRange hint="Keep only the K highest-scoring tokens. Zero disables this filter." label="Top K" max={Math.max(200, settings.topK)} min={0} onChange={(next) => updateSetting("topK", next)} step={1} value={settings.topK} />
               <PromptRange hint="Keep the smallest token set whose cumulative probability reaches this value." label="Top P" max={1} min={0.01} onChange={(next) => updateSetting("topP", next)} step={0.01} value={settings.topP} />
+              <label className="edit-message" title="Sent as the first message of every response in this chat. Templates without a system role receive it inside the first user message.">
+                <span className="prompt-controls-heading"><strong>System prompt</strong><small>{String(systemPrompt.length)} / {String(SYSTEM_PROMPT_MAX_CHARACTERS)}</small></span>
+                <textarea aria-label="System prompt" maxLength={SYSTEM_PROMPT_MAX_CHARACTERS} onChange={(event) => onSystemPromptChange(event.target.value)} placeholder="Optional instructions applied to every response in this chat" value={systemPrompt} />
+              </label>
             </div>
           )}
         </div>

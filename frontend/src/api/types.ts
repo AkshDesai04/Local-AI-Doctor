@@ -89,6 +89,7 @@ export interface ChatSummary {
   archived: boolean;
   preview?: string;
   messageCount?: number;
+  systemPrompt?: string | null;
 }
 
 export interface Attachment {

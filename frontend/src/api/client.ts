@@ -478,6 +478,7 @@ function toChat(chat: ChatSummary & Record<string, unknown>): ChatSummary {
     updatedAt: String(chat.updatedAt ?? chat.updated_at ?? chat.createdAt ?? new Date(0).toISOString()),
     pinned: Boolean(chat.pinned ?? chat.is_pinned),
     archived: Boolean(chat.archived ?? chat.is_archived),
+    systemPrompt: [chat.systemPrompt, chat.system_prompt].find((value): value is string => typeof value === "string") ?? null,
   };
 }
 
@@ -725,10 +726,10 @@ export const api = {
     const value = await request<ChatSummary[] | { items?: ChatSummary[]; chats?: ChatSummary[] }>(`/chats?archived=${String(archived)}`);
     return unwrapList(value).map((chat) => toChat(chat as ChatSummary & Record<string, unknown>));
   },
-  async createChat(): Promise<ChatSummary> {
-    return toChat(await request<ChatSummary & Record<string, unknown>>("/chats", { method: "POST", body: "{}" }));
+  async createChat(systemPrompt?: string): Promise<ChatSummary> {
+    return toChat(await request<ChatSummary & Record<string, unknown>>("/chats", { method: "POST", body: JSON.stringify(systemPrompt?.trim() ? { systemPrompt } : {}) }));
   },
-  async updateChat(id: string, changes: Partial<Pick<ChatSummary, "title" | "pinned" | "archived">>): Promise<ChatSummary> {
+  async updateChat(id: string, changes: Partial<Pick<ChatSummary, "title" | "pinned" | "archived" | "systemPrompt">>): Promise<ChatSummary> {
     return toChat(await request<ChatSummary & Record<string, unknown>>(`/chats/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(changes) }));
   },
   deleteChat: (id: string): Promise<void> => request(`/chats/${encodeURIComponent(id)}`, { method: "DELETE" }),

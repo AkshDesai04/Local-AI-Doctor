@@ -270,8 +270,10 @@ export interface WorkbenchState {
   settings: GenerationSettings;
   defaultSettings: GenerationSettings;
   attachments: Attachment[];
+  systemPrompt: string;
   error: string | null;
   notice: string | null;
+  setSystemPrompt: (value: string) => void;
   setSelectedModelId: (id: string) => void;
   setSettings: React.Dispatch<React.SetStateAction<GenerationSettings>>;
   setError: (message: string | null) => void;
@@ -317,6 +319,7 @@ export function useWorkbench(): WorkbenchState {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [authRevision, setAuthRevision] = useState(0);
+  const [systemPromptDraft, setSystemPromptDraft] = useState<{ chatId: string | null; value: string } | null>(null);
   const streamCleanup = useRef<(() => void) | null>(null);
   const branchPending = useRef(false);
   const activeChatIdRef = useRef<string | null>(null);
@@ -325,11 +328,51 @@ export function useWorkbench(): WorkbenchState {
   const clientRequestStarted = useRef<number | null>(null);
   const lastClientReceipt = useRef<number | null>(null);
   const streamVisibility = useRef(new Map<string, StreamVisibilityBuffer>());
+  const systemPromptTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const systemPromptPending = useRef<{ chatId: string; value: string } | null>(null);
+  const systemPromptSave = useRef<Promise<void>>(Promise.resolve());
 
   const selectedModel = useMemo(
     () => models.find((model) => model.id === selectedModelId) ?? (selectedModelId ? null : models[0] ?? null),
     [models, selectedModelId],
   );
+
+  // An unsaved edit wins over the stored value; a brand-new chat keeps its draft locally
+  // (chatId null) and sends it with the create request.
+  const activeChat = useMemo(
+    () => chats.find((chat) => chat.id === activeChatId) ?? archivedChats.find((chat) => chat.id === activeChatId) ?? null,
+    [activeChatId, archivedChats, chats],
+  );
+  const systemPrompt = systemPromptDraft?.chatId === activeChatId ? systemPromptDraft.value : activeChat?.systemPrompt ?? "";
+
+  const flushSystemPrompt = useCallback((): Promise<void> => {
+    if (systemPromptTimer.current) clearTimeout(systemPromptTimer.current);
+    systemPromptTimer.current = null;
+    const pending = systemPromptPending.current;
+    systemPromptPending.current = null;
+    if (!pending) return systemPromptSave.current;
+    systemPromptSave.current = systemPromptSave.current.then(async () => {
+      try {
+        const updated = await api.updateChat(pending.chatId, { systemPrompt: pending.value.trim() ? pending.value : null });
+        const store = (chat: ChatSummary): ChatSummary => chat.id === updated.id ? { ...chat, systemPrompt: updated.systemPrompt } : chat;
+        setChats((current) => current.map(store));
+        setArchivedChats((current) => current.map(store));
+        setSystemPromptDraft((current) => current?.chatId === pending.chatId && current.value === pending.value ? null : current);
+      } catch (cause) {
+        if (!(cause instanceof ApiError && cause.status === 404)) setError(readableError(cause));
+      }
+    });
+    return systemPromptSave.current;
+  }, []);
+
+  const setSystemPrompt = useCallback((value: string): void => {
+    const chatId = activeChatIdRef.current;
+    setSystemPromptDraft({ chatId, value });
+    if (chatId === null) return;
+    systemPromptPending.current = { chatId, value };
+    if (systemPromptTimer.current) clearTimeout(systemPromptTimer.current);
+    systemPromptTimer.current = setTimeout(() => void flushSystemPrompt(), 500);
+  }, [flushSystemPrompt]);
 
   useEffect(() => {
     const refreshAfterAuthentication = (): void => setAuthRevision((current) => current + 1);
@@ -448,15 +491,17 @@ export function useWorkbench(): WorkbenchState {
   }, [activeChatId]);
 
   const selectChat = useCallback((id: string): Promise<void> => {
+    void flushSystemPrompt();
     runSelectionEpoch.current += 1;
     locallyCreatedChat.current = null;
     activeChatIdRef.current = id;
     setActiveChatId(id);
     setSelectedRun(null);
     return Promise.resolve();
-  }, []);
+  }, [flushSystemPrompt]);
 
   const createChat = useCallback(async (): Promise<void> => {
+    void flushSystemPrompt();
     runSelectionEpoch.current += 1;
     locallyCreatedChat.current = null;
     try {
@@ -470,7 +515,7 @@ export function useWorkbench(): WorkbenchState {
     } catch (cause) {
       setError(readableError(cause));
     }
-  }, []);
+  }, [flushSystemPrompt]);
 
   const updateChat = useCallback(async (id: string, changes: Partial<Pick<ChatSummary, "title" | "pinned" | "archived">>): Promise<void> => {
     try {
@@ -707,9 +752,12 @@ export function useWorkbench(): WorkbenchState {
     let chatId = activeChatId;
     let temporaryUserId: string | null = null;
     try {
-      if (!chatId) {
-        const chat = await api.createChat();
+      if (chatId) {
+        await flushSystemPrompt();
+      } else {
+        const chat = await api.createChat(systemPrompt);
         chatId = chat.id;
+        setSystemPromptDraft(null);
         setChats((current) => [chat, ...current]);
         locallyCreatedChat.current = chat.id;
         activeChatIdRef.current = chat.id;
@@ -794,7 +842,7 @@ export function useWorkbench(): WorkbenchState {
       if (temporaryUserId) setMessages((current) => current.filter((message) => message.id !== temporaryUserId));
       setError(readableError(cause));
     }
-  }, [activeChatId, attachments, handleStreamEvent, messages, runningRunId, selectedModel, settings]);
+  }, [activeChatId, attachments, flushSystemPrompt, handleStreamEvent, messages, runningRunId, selectedModel, settings, systemPrompt]);
 
   const stop = useCallback(async (): Promise<void> => {
     if (!runningRunId) return;
@@ -1020,10 +1068,12 @@ export function useWorkbench(): WorkbenchState {
     settings,
     defaultSettings: configuredDefaults,
     attachments,
+    systemPrompt,
     error,
     notice,
     setSelectedModelId,
     setSettings,
+    setSystemPrompt,
     setError,
     selectChat,
     createChat,

@@ -47,6 +47,7 @@ interface ChatViewProps {
   onRetry: (message: Message) => void;
   onBranch: (content: string, parentMessageId: string | null) => void;
   onNavigate: (view: "embeddings" | "models") => void;
+  systemPrompt: string;
 }
 
 function nerdValue(token: TokenEvent, metric: NerdMetric, classification: TokenEvent["reasoningSegment"] = token.reasoningSegment): number | undefined {
@@ -581,6 +582,7 @@ export function ChatView({
   onRetry,
   onBranch,
   onNavigate,
+  systemPrompt,
 }: ChatViewProps): React.ReactNode {
   const bottom = useRef<HTMLDivElement>(null);
   const graph = useMemo(() => buildMessageGraph(messages), [messages]);
@@ -654,6 +656,12 @@ export function ChatView({
       <div className="messages-scroll">
         {messagesLoading ? <div className="messages-loading"><LoaderCircle className="spin" size={20} /> Loading conversation…</div> : messages.length === 0 ? <EmptyChat booting={booting} connected={connected} model={model} onNavigate={onNavigate} /> : (
           <div className="messages-list">
+            {systemPrompt.trim() && (
+              <details className="reasoning-disclosure system-prompt-card">
+                <summary className="reasoning-summary">System prompt<small>applies to every response in this chat</small></summary>
+                <div className="reasoning-content"><pre className="nerd-raw-fallback">{systemPrompt}</pre></div>
+              </details>
+            )}
             {lineage.map(({ message, parentKey, siblings }, index) => (
               <MessageRow
                 branchControl={siblings.length > 1 ? {

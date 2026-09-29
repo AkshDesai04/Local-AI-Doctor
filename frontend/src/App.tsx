@@ -132,6 +132,7 @@ export default function App(): React.ReactNode {
                   runningRunId={workbench.runningRunId}
                   selectedToken={selectedToken}
                   streamConnected={workbench.streamConnected}
+                  systemPrompt={workbench.systemPrompt}
                 />
                 <Composer
                   attachments={workbench.attachments}
@@ -143,8 +144,10 @@ export default function App(): React.ReactNode {
                   onSettingsChange={workbench.setSettings}
                   onStop={() => void workbench.stop()}
                   onSubmit={(content) => void workbench.submit(content)}
+                  onSystemPromptChange={workbench.setSystemPrompt}
                   running={Boolean(workbench.runningRunId)}
                   settings={workbench.settings}
+                  systemPrompt={workbench.systemPrompt}
                 />
               </>
             )}
