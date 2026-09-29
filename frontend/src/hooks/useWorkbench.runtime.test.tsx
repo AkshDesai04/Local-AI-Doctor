@@ -21,6 +21,7 @@ vi.mock("../api/client", async (importOriginal) => {
       models: vi.fn(),
       run: vi.fn(),
       runEvents: vi.fn(),
+      updateChat: vi.fn(),
     },
     subscribeToRun: vi.fn(),
   };
@@ -93,6 +94,11 @@ describe("runtime lifecycle synchronization", () => {
       id: "chat-new",
       title: "New chat",
     });
+    mockedApi.updateChat.mockReset().mockImplementation((id, changes) => Promise.resolve({
+      ...chat,
+      id,
+      systemPrompt: changes.systemPrompt ?? null,
+    }));
     mockedApi.generate.mockReset().mockResolvedValue({
       runId: "run-fixture",
       messageId: "assistant-fixture",
@@ -454,5 +460,56 @@ describe("runtime lifecycle synchronization", () => {
 
     expect(result.current.selectedRun?.metrics?.timing).toMatchObject({ clientTtftMs: 25, firstVisibleTextMs: 25 });
     now.mockRestore();
+  });
+  describe("system prompt", () => {
+    it("debounces PATCH requests and shows the stored value on the active chat", async () => {
+      const { result } = renderHook(() => useWorkbench());
+      await waitFor(() => expect(result.current.activeChatId).toBe(chat.id));
+
+      act(() => result.current.setSystemPrompt("Be"));
+      act(() => result.current.setSystemPrompt("Be brief."));
+      expect(result.current.systemPrompt).toBe("Be brief.");
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(mockedApi.updateChat.mock.calls).toHaveLength(0);
+      await waitFor(() => expect(mockedApi.updateChat.mock.calls).toHaveLength(1), { timeout: 2_000 });
+      expect(mockedApi.updateChat.mock.calls[0]).toEqual([chat.id, { systemPrompt: "Be brief." }]);
+      await waitFor(() => expect(result.current.chats[0]?.systemPrompt).toBe("Be brief."));
+      expect(result.current.systemPrompt).toBe("Be brief.");
+
+      act(() => result.current.setSystemPrompt("   "));
+      await waitFor(() => expect(mockedApi.updateChat.mock.calls).toHaveLength(2), { timeout: 2_000 });
+      expect(mockedApi.updateChat.mock.calls.at(-1)).toEqual([chat.id, { systemPrompt: null }]);
+    });
+
+    it("flushes a pending edit before the generation request", async () => {
+      const { result } = renderHook(() => useWorkbench());
+      await waitFor(() => expect(result.current.activeChatId).toBe(chat.id));
+      await waitFor(() => expect(result.current.selectedModel).not.toBeNull());
+
+      act(() => result.current.setSystemPrompt("Latest instructions"));
+      await act(async () => {
+        await result.current.submit("Hello");
+      });
+
+      expect(mockedApi.updateChat.mock.calls[0]).toEqual([chat.id, { systemPrompt: "Latest instructions" }]);
+      expect(mockedApi.updateChat.mock.invocationCallOrder[0]).toBeLessThan(mockedApi.generate.mock.invocationCallOrder[0] ?? 0);
+    });
+
+    it("keeps a draft locally for a chat that does not exist yet and sends it on creation", async () => {
+      mockedApi.chats.mockReset().mockResolvedValue([]);
+      const { result } = renderHook(() => useWorkbench());
+      await waitFor(() => expect(result.current.booting).toBe(false));
+      expect(result.current.activeChatId).toBeNull();
+
+      act(() => result.current.setSystemPrompt("Draft rules"));
+      expect(result.current.systemPrompt).toBe("Draft rules");
+      expect(mockedApi.updateChat.mock.calls).toHaveLength(0);
+      await act(async () => {
+        await result.current.submit("Hello");
+      });
+
+      expect(mockedApi.createChat.mock.calls[0]).toEqual(["Draft rules"]);
+      expect(mockedApi.updateChat.mock.calls).toHaveLength(0);
+    });
   });
 });

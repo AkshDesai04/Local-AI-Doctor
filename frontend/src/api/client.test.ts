@@ -104,6 +104,27 @@ describe("API boundary normalization", () => {
     });
   });
 
+  it("normalizes and sends the per-chat system prompt", async () => {
+    const stored = { id: "chat-1", title: "Chat", created_at: "a", updated_at: "b", pinned: 0, archived: 0 };
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse([{ ...stored, system_prompt: "Be brief." }, stored]))
+      .mockResolvedValueOnce(jsonResponse({ ...stored, system_prompt: "Created." }))
+      .mockResolvedValueOnce(jsonResponse(stored))
+      .mockResolvedValueOnce(jsonResponse({ ...stored, system_prompt: null }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const chats = await api.chats();
+    expect(chats.map((chat) => chat.systemPrompt)).toEqual(["Be brief.", null]);
+
+    expect((await api.createChat("Created.")).systemPrompt).toBe("Created.");
+    await api.createChat("   ");
+    expect(fetchMock.mock.calls[1]?.[1]?.body).toBe(JSON.stringify({ systemPrompt: "Created." }));
+    expect(fetchMock.mock.calls[2]?.[1]?.body).toBe("{}");
+
+    expect((await api.updateChat("chat-1", { systemPrompt: null })).systemPrompt).toBeNull();
+    expect(fetchMock.mock.calls[3]?.[1]?.body).toBe(JSON.stringify({ systemPrompt: null }));
+  });
+
   it("replays an assistant run without resubmitting its user prompt", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
       runId: "run-replay",

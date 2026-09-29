@@ -35,8 +35,10 @@ describe("prompt controls", () => {
         onSettingsChange={onSettingsChange}
         onStop={vi.fn()}
         onSubmit={vi.fn()}
+        onSystemPromptChange={vi.fn()}
         running={false}
         settings={defaultGenerationSettings}
+        systemPrompt=""
       />,
     );
 
@@ -68,8 +70,10 @@ describe("prompt controls", () => {
       onSettingsChange: vi.fn(),
       onStop: vi.fn(),
       onSubmit: vi.fn(),
+      onSystemPromptChange: vi.fn(),
       running: false,
       settings: defaultGenerationSettings,
+      systemPrompt: "",
     };
     const { rerender } = render(<Composer {...props} />);
     await user.click(screen.getByRole("button", { name: "Prompt controls" }));
@@ -92,8 +96,10 @@ describe("prompt controls", () => {
         onSettingsChange={vi.fn()}
         onStop={vi.fn()}
         onSubmit={vi.fn()}
+        onSystemPromptChange={vi.fn()}
         running={false}
         settings={defaultGenerationSettings}
+        systemPrompt=""
       />,
     );
 
@@ -122,13 +128,51 @@ describe("prompt controls", () => {
         onSettingsChange={vi.fn()}
         onStop={vi.fn()}
         onSubmit={vi.fn()}
+        onSystemPromptChange={vi.fn()}
         running={false}
         settings={defaultGenerationSettings}
+        systemPrompt=""
       />,
     );
 
     await user.click(screen.getByRole("button", { name: "Prompt controls" }));
     expect(screen.getByRole("checkbox", { name: "Reason before answering" })).toBeDisabled();
     expect(screen.getByTitle("Sampling settings for the next response")).toHaveTextContent("Reasoning unavailable");
+  });
+
+  it("edits the system prompt from the prompt controls and flags it while active", async () => {
+    const user = userEvent.setup();
+    const onSystemPromptChange = vi.fn();
+    const props = {
+      attachments: [],
+      busy: false,
+      connected: true,
+      model,
+      onAttach: vi.fn(),
+      onRemoveAttachment: vi.fn(),
+      onSettingsChange: vi.fn(),
+      onStop: vi.fn(),
+      onSubmit: vi.fn(),
+      onSystemPromptChange,
+      running: false,
+      settings: defaultGenerationSettings,
+      systemPrompt: "",
+    };
+    const { rerender } = render(<Composer {...props} />);
+    expect(screen.queryByRole("img", { name: "System prompt active" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Prompt controls" }));
+    const field = screen.getByRole("textbox", { name: "System prompt" });
+    expect(field).toHaveAttribute("placeholder", "Optional instructions applied to every response in this chat");
+    expect(field).toHaveAttribute("maxlength", "32000");
+    fireEvent.change(field, { target: { value: "Answer briefly." } });
+    expect(onSystemPromptChange).toHaveBeenLastCalledWith("Answer briefly.");
+
+    rerender(<Composer {...props} systemPrompt="Answer briefly." />);
+    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue("Answer briefly.");
+    expect(screen.getByRole("img", { name: "System prompt active" })).toBeInTheDocument();
+
+    rerender(<Composer {...props} systemPrompt="   " />);
+    expect(screen.queryByRole("img", { name: "System prompt active" })).not.toBeInTheDocument();
   });
 });

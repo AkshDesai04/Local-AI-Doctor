@@ -30,6 +30,7 @@ function conversation(
     runningRunId?: string | null;
     selectedToken?: number | null;
     streamConnected?: boolean;
+    systemPrompt?: string;
   } = {},
 ): React.ReactElement {
   return (
@@ -52,6 +53,7 @@ function conversation(
       runningRunId={options.runningRunId ?? null}
       selectedToken={options.selectedToken ?? null}
       streamConnected={options.streamConnected ?? false}
+      systemPrompt={options.systemPrompt ?? ""}
     />
   );
 }
@@ -68,6 +70,16 @@ describe("chat response rendering", () => {
     expect(screen.getByLabelText("Start reasoning token")).toHaveTextContent("<think>");
     expect(screen.getByLabelText("End reasoning token")).toHaveTextContent("</think>");
     expect(screen.getByLabelText("Termination tokens")).toHaveTextContent("<｜end▁of▁sentence｜>");
+  });
+
+  it("shows an active system prompt in a collapsed card above the conversation", () => {
+    const { rerender } = render(conversation([message]));
+    expect(screen.queryByText("System prompt")).not.toBeInTheDocument();
+
+    rerender(conversation([message], { systemPrompt: "Answer in French." }));
+    const card = screen.getByText("System prompt").closest("details");
+    expect(card).not.toHaveAttribute("open");
+    expect(card).toHaveTextContent("Answer in French.");
   });
 
   it("explains a persisted completed reasoning-only response instead of leaving a blank answer", () => {
@@ -467,6 +479,7 @@ describe("chat response rendering", () => {
         runningRunId={null}
         selectedToken={null}
         streamConnected={false}
+        systemPrompt=""
       />,
     );
     await user.click(screen.getByRole("button", { name: "Edit and retry" }));
