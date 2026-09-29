@@ -5,9 +5,11 @@ import hashlib
 import json
 from functools import partial
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import Response
 from starlette.websockets import WebSocketDisconnect
 
 from local_ai_doctor.config import AppSettings, ProfileName, SettingsLoader
@@ -669,3 +671,63 @@ def test_generating_into_a_missing_chat_returns_404(api_client: TestClient) -> N
     error = response.json()["error"]
     assert error["code"] == "chat_not_found"
     assert error["details"] == {"chat_id": "no-such-chat"}
+
+
+def test_resource_and_conflict_errors_use_the_error_envelope(
+    api_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    services = api_client.app.state.services
+    model_id = api_client.get("/api/v1/models", headers=API_HEADERS).json()["models"][0]["id"]
+
+    def error_of(response: Response, status: int, code: str) -> dict[str, Any]:
+        assert response.status_code == status
+        payload = response.json()
+        assert set(payload) == {"error"}
+        assert payload["error"]["code"] == code
+        assert payload["error"]["retryable"] is False
+        return cast(dict[str, Any], payload["error"])
+
+    for method, path in (
+        ("get", "/chats/missing"),
+        ("get", "/chats/missing/export"),
+        ("get", "/chats/missing/messages"),
+        ("patch", "/chats/missing"),
+        ("delete", "/chats/missing"),
+    ):
+        kwargs = {"json": {"title": "x"}} if method == "patch" else {}
+        response = getattr(api_client, method)(f"/api/v1{path}", headers=API_HEADERS, **kwargs)
+        error = error_of(response, 404, "chat_not_found")
+        assert error["details"] == {"chat_id": "missing"}
+
+    for path in ("/runs/missing", "/runs/missing/events", "/runs/missing/export"):
+        response = api_client.get(f"/api/v1{path}", headers=API_HEADERS)
+        assert error_of(response, 404, "run_not_found")["details"] == {"run_id": "missing"}
+
+    error_of(
+        api_client.post("/api/v1/runs/missing/cancel", headers=API_HEADERS),
+        409,
+        "run_not_cancellable",
+    )
+    error_of(
+        api_client.delete("/api/v1/chats", headers=API_HEADERS, params={"confirm": "false"}),
+        409,
+        "confirmation_required",
+    )
+    error_of(api_client.get("/api/v1/does-not-exist", headers=API_HEADERS), 404, "not_found")
+
+    too_many = api_client.post(
+        "/api/v1/embeddings",
+        headers=API_HEADERS,
+        json={
+            "model_id": model_id,
+            "inputs": [
+                {"modality": "image", "attachment_id": f"a{index}"}
+                for index in range(services.settings.limits.attachment_count + 1)
+            ],
+        },
+    )
+    error_of(too_many, 413, "limit_exceeded")
+
+    monkeypatch.setattr(services.worker, "_loaded", {"model_id": "some-other-model"})
+    other = api_client.post(f"/api/v1/models/{model_id}/unload", headers=API_HEADERS)
+    error_of(other, 409, "model_not_loaded")

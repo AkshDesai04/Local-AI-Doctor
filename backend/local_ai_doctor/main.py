@@ -27,7 +27,6 @@ from fastapi import (
     FastAPI,
     File,
     Form,
-    HTTPException,
     Query,
     Request,
     Response,
@@ -58,9 +57,15 @@ from .api.schemas import (
 from .config import AppSettings, ProfileName, SettingsLoader, persist_user_model_roots
 from .errors import (
     CapabilityUnavailableError,
+    ChatNotFoundError,
     ConfigurationError,
+    ConfirmationRequiredError,
     InvalidRequestError,
+    ModelNotLoadedError,
+    NotFoundError,
     PayloadTooLargeError,
+    RunNotCancellableError,
+    RunNotFoundError,
     WorkbenchError,
     worker_failure_response,
 )
@@ -699,7 +704,11 @@ def create_app(
         descriptor = services.registry.get(model_id)
         loaded = services.worker.loaded
         if loaded is not None and loaded.get("model_id") != model_id:
-            raise HTTPException(status_code=409, detail="a different model is loaded")
+            raise ModelNotLoadedError(
+                "a different model is loaded",
+                hint="Only the resident model can be unloaded by ID; use POST /models/unload instead.",
+                details={"model_id": model_id},
+            )
         unload = await services.registry.unload()
         return {
             **descriptor.public_dict(reveal_path=False),
@@ -761,14 +770,14 @@ def create_app(
     async def get_chat(request: Request, chat_id: str) -> dict[str, Any]:
         chat = await _services(request).repository.get_chat(chat_id)
         if chat is None:
-            raise HTTPException(status_code=404, detail="chat not found")
+            raise ChatNotFoundError("chat not found", details={"chat_id": chat_id})
         return chat
 
     @api.get("/chats/{chat_id}/export")
     async def export_chat(request: Request, chat_id: str) -> Response:
         document = await _services(request).workspace.export_chat(chat_id)
         if document is None:
-            raise HTTPException(status_code=404, detail="chat not found")
+            raise ChatNotFoundError("chat not found", details={"chat_id": chat_id})
         return JSONResponse(
             document,
             headers={"Content-Disposition": 'attachment; filename="chat-workspace.json"'},
@@ -778,7 +787,7 @@ def create_app(
     async def get_chat_messages(request: Request, chat_id: str) -> list[dict[str, Any]]:
         chat = await _services(request).repository.get_chat(chat_id)
         if chat is None:
-            raise HTTPException(status_code=404, detail="chat not found")
+            raise ChatNotFoundError("chat not found", details={"chat_id": chat_id})
         return cast(list[dict[str, Any]], chat["messages"])
 
     @api.patch("/chats/{chat_id}")
@@ -787,14 +796,14 @@ def create_app(
             chat_id, title=body.title, pinned=body.pinned, archived=body.archived
         )
         if chat is None:
-            raise HTTPException(status_code=404, detail="chat not found")
+            raise ChatNotFoundError("chat not found", details={"chat_id": chat_id})
         return chat
 
     @api.delete("/chats/{chat_id}", status_code=204)
     async def delete_chat(request: Request, chat_id: str) -> Response:
         deleted = await _services(request).repository.delete_chat(chat_id)
         if not deleted:
-            raise HTTPException(status_code=404, detail="chat not found")
+            raise ChatNotFoundError("chat not found", details={"chat_id": chat_id})
         return Response(status_code=204)
 
     @api.delete("/chats")
@@ -802,7 +811,10 @@ def create_app(
         request: Request, confirm: bool, include_archived: bool = False
     ) -> dict[str, Any]:
         if not confirm:
-            raise HTTPException(status_code=409, detail="explicit confirmation is required")
+            raise ConfirmationRequiredError(
+                "explicit confirmation is required",
+                hint="Repeat the request with confirm=true after reviewing what will be deleted.",
+            )
         count = await _services(request).repository.clear_chats(include_archived=include_archived)
         return {"deleted": count}
 
@@ -844,7 +856,7 @@ def create_app(
         services = _services(request)
         run = await services.repository.get_run(run_id)
         if run is None:
-            raise HTTPException(status_code=404, detail="run not found")
+            raise RunNotFoundError("run not found", details={"run_id": run_id})
         tokens = await services.repository.list_run_tokens(run_id)
         run["tokens"] = tokens
         branchable_through = -1
@@ -866,14 +878,18 @@ def create_app(
     async def get_run_events(request: Request, run_id: str) -> dict[str, Any]:
         services = _services(request)
         if await services.repository.get_run(run_id) is None:
-            raise HTTPException(status_code=404, detail="run not found")
+            raise RunNotFoundError("run not found", details={"run_id": run_id})
         return {"events": await services.repository.get_raw_events(run_id)}
 
     @api.post("/runs/{run_id}/cancel")
     async def cancel_run(request: Request, run_id: str) -> dict[str, Any]:
         accepted = await _services(request).runs.cancel(run_id)
         if not accepted:
-            raise HTTPException(status_code=409, detail="run is not cancellable")
+            raise RunNotCancellableError(
+                "run is not cancellable",
+                hint="Only queued, loading, or running runs can be cancelled.",
+                details={"run_id": run_id},
+            )
         return {"accepted": True}
 
     @api.post("/runs/{run_id}/replay", status_code=202)
@@ -908,7 +924,7 @@ def create_app(
         services = _services(request)
         run = await services.repository.get_run(run_id)
         if run is None:
-            raise HTTPException(status_code=404, detail="run not found")
+            raise RunNotFoundError("run not found", details={"run_id": run_id})
         tokens = await services.repository.list_run_tokens(run_id)
         if format == "json":
             return JSONResponse({"schema_version": 1, "run": run, "tokens": tokens})
@@ -1007,9 +1023,9 @@ def create_app(
         services = _services(request)
         attachment_count = sum(1 for item in body.inputs if item.attachment_id is not None)
         if attachment_count > services.settings.limits.attachment_count:
-            raise HTTPException(
-                status_code=413,
-                detail="attachment count exceeds the configured per-request limit",
+            raise PayloadTooLargeError(
+                "attachment count exceeds the configured per-request limit",
+                details={"maximum_count": services.settings.limits.attachment_count},
             )
         resolved: list[dict[str, Any]] = []
         for item in body.inputs:
@@ -1145,6 +1161,6 @@ def create_app(
         index = frontend / "index.html"
         if index.is_file() and not path.startswith(("api/", "ws/")):
             return FileResponse(index)
-        raise HTTPException(status_code=404, detail="not found")
+        raise NotFoundError("not found")
 
     return app

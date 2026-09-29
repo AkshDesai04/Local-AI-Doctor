@@ -21,6 +21,8 @@ class ErrorCode(StrEnum):
     PATH_OUTSIDE_ROOT = "path_outside_root"
     MODEL_NOT_FOUND = "model_not_found"
     CHAT_NOT_FOUND = "chat_not_found"
+    RUN_NOT_FOUND = "run_not_found"
+    NOT_FOUND = "not_found"
     ATTACHMENT_NOT_FOUND = "attachment_not_found"
     MODEL_INVALID = "model_invalid"
     MODEL_CORRUPT = "model_corrupt"
@@ -39,6 +41,8 @@ class ErrorCode(StrEnum):
     LIMIT_EXCEEDED = "limit_exceeded"
     WORKER_BUSY = "worker_busy"
     ACTIVE_RUN_CONFLICT = "active_run_conflict"
+    RUN_NOT_CANCELLABLE = "run_not_cancellable"
+    CONFIRMATION_REQUIRED = "confirmation_required"
     CANCELLED = "cancelled"
     INTERNAL = "internal"
 
@@ -119,6 +123,16 @@ class ModelNotFoundError(WorkbenchError):
 
 class ChatNotFoundError(WorkbenchError):
     code = ErrorCode.CHAT_NOT_FOUND
+    http_status = 404
+
+
+class RunNotFoundError(WorkbenchError):
+    code = ErrorCode.RUN_NOT_FOUND
+    http_status = 404
+
+
+class NotFoundError(WorkbenchError):
+    code = ErrorCode.NOT_FOUND
     http_status = 404
 
 
@@ -209,6 +223,21 @@ class ActiveRunConflictError(WorkbenchError):
     code = ErrorCode.ACTIVE_RUN_CONFLICT
     http_status = 409
     default_retryable = True
+
+
+class ModelNotLoadedError(WorkbenchError):
+    code = ErrorCode.MODEL_NOT_LOADED
+    http_status = 409
+
+
+class RunNotCancellableError(WorkbenchError):
+    code = ErrorCode.RUN_NOT_CANCELLABLE
+    http_status = 409
+
+
+class ConfirmationRequiredError(WorkbenchError):
+    code = ErrorCode.CONFIRMATION_REQUIRED
+    http_status = 409
 
 
 class CancelledError(WorkbenchError):

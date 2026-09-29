@@ -28,7 +28,7 @@ Structured application errors use:
 }
 ```
 
-Validation errors use code `invalid_request` with a bounded `details.issues` array. Some direct HTTP resource/conflict errors use FastAPI's `{"detail":"..."}` shape. Clients should handle both.
+Validation errors use code `invalid_request` with a bounded `details.issues` array. Resource and conflict errors use the same envelope: `chat_not_found` and `run_not_found` (404), `not_found` for an unknown `/api` path (404), `run_not_cancellable`, `confirmation_required`, and `model_not_loaded` (409, unloading a model by ID while a different model is resident), and `limit_exceeded` (413). Only errors raised by the framework itself before a route runs, such as 405 for an unsupported method, still use FastAPI's `{"detail":"..."}` shape, so clients should handle both.
 
 Failures reported by the model worker (model load and unload, embeddings, prompt scoring) use the same envelope with the worker's error code and a status chosen from it. The message and hint are the worker's fixed, redacted text; exception text and paths never appear.
 
