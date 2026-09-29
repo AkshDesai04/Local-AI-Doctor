@@ -2,6 +2,7 @@ import { ArrowUp, BrainCircuit, FileText, Image, Mic, Paperclip, ScrollText, Sli
 import { useEffect, useRef, useState } from "react";
 import type { Attachment, GenerationSettings, ModelSummary } from "../api/types";
 import { capabilityReason, generationCapabilityReason, isUsable, supportsGeneration } from "../domain/capabilities";
+import { SAMPLING_LIMITS } from "../domain/sampling";
 import { formatBytes } from "../utils/format";
 
 interface ComposerProps {
@@ -172,9 +173,9 @@ export function Composer({ model, connected, busy, running, attachments, setting
                 <span><BrainCircuit size={15} /><span><strong>Reasoning</strong><small>{reasoningSupported ? "Use the model's thinking mode" : "Not exposed by this model"}</small></span></span>
                 <input aria-label="Reason before answering" checked={reasoningSupported && settings.reasoning !== false} disabled={!reasoningSupported} onChange={(event) => updateSetting("reasoning", event.target.checked)} type="checkbox" />
               </label>
-              <PromptRange hint="Higher values make token selection more varied; zero uses greedy decoding." label="Temperature" max={5} min={0} onChange={(next) => updateSetting("temperature", next)} step={0.05} value={settings.temperature} />
-              <PromptRange hint="Keep only the K highest-scoring tokens. Zero disables this filter." label="Top K" max={Math.max(200, settings.topK)} min={0} onChange={(next) => updateSetting("topK", next)} step={1} value={settings.topK} />
-              <PromptRange hint="Keep the smallest token set whose cumulative probability reaches this value." label="Top P" max={1} min={0.01} onChange={(next) => updateSetting("topP", next)} step={0.01} value={settings.topP} />
+              <PromptRange hint="Higher values make token selection more varied; zero uses greedy decoding." label="Temperature" {...SAMPLING_LIMITS.temperature} onChange={(next) => updateSetting("temperature", next)} value={settings.temperature} />
+              <PromptRange hint="Keep only the K highest-scoring tokens. Zero disables this filter." label="Top K" {...SAMPLING_LIMITS.topK} onChange={(next) => updateSetting("topK", next)} value={settings.topK} />
+              <PromptRange hint="Keep the smallest token set whose cumulative probability reaches this value." label="Top P" {...SAMPLING_LIMITS.topP} onChange={(next) => updateSetting("topP", next)} value={settings.topP} />
               <label className="edit-message" title="Sent as the first message of every response in this chat. Templates without a system role receive it inside the first user message.">
                 <span className="prompt-controls-heading"><strong>System prompt</strong><small>{String(systemPrompt.length)} / {String(SYSTEM_PROMPT_MAX_CHARACTERS)}</small></span>
                 <textarea aria-label="System prompt" maxLength={SYSTEM_PROMPT_MAX_CHARACTERS} onChange={(event) => onSystemPromptChange(event.target.value)} placeholder="Optional instructions applied to every response in this chat" value={systemPrompt} />

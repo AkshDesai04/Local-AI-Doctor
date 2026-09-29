@@ -2,6 +2,7 @@ import { AlertTriangle, ChevronDown, Gauge, KeyRound, RotateCcw, SlidersHorizont
 import { useEffect, useState } from "react";
 import { AUTH_CHANGED_EVENT, clearSessionAuthToken, hasSessionAuthToken, saveSessionAuthToken } from "../api/auth";
 import type { GenerationSettings, ModelSummary } from "../api/types";
+import { SAMPLING_LIMITS } from "../domain/sampling";
 
 interface GenerationControlsProps {
   open: boolean;
@@ -107,15 +108,15 @@ export function GenerationControls({ open, model, settings, defaultSettings, aut
         <section className="control-section">
           <div className="control-section-title"><SlidersHorizontal size={15} /><span>Sampling pipeline</span></div>
           <div className="control-grid two">
-            <NumberControl label="Maximum output" max={32768} min={1} onChange={(value) => update("maxOutputTokens", value)} step={1} value={settings.maxOutputTokens} />
-            <NumberControl label="Temperature" max={5} min={0} onChange={(value) => update("temperature", value)} step={0.05} value={settings.temperature} />
-            <NumberControl label="Top-K" max={1000} min={0} onChange={(value) => update("topK", value)} step={1} value={settings.topK} />
-            <NumberControl label="Top-P" max={1} min={0} onChange={(value) => update("topP", value)} step={0.01} value={settings.topP} />
-            <NumberControl hint="adapter-dependent" label="Min-P" max={1} min={0} onChange={(value) => update("minP", value)} step={0.01} value={settings.minP} />
-            <NumberControl label="Repetition penalty" max={3} min={0} onChange={(value) => update("repetitionPenalty", value)} step={0.05} value={settings.repetitionPenalty} />
-            <NumberControl label="Frequency penalty" max={2} min={-2} onChange={(value) => update("frequencyPenalty", value)} step={0.05} value={settings.frequencyPenalty} />
-            <NumberControl label="Presence penalty" max={2} min={-2} onChange={(value) => update("presencePenalty", value)} step={0.05} value={settings.presencePenalty} />
-            <NumberControl hint="per distribution" label="Alternatives" max={1000} min={0} onChange={(value) => update("alternatives", value)} step={1} value={settings.alternatives} />
+            <NumberControl label="Maximum output" {...SAMPLING_LIMITS.maxOutputTokens} onChange={(value) => update("maxOutputTokens", value)} value={settings.maxOutputTokens} />
+            <NumberControl label="Temperature" {...SAMPLING_LIMITS.temperature} onChange={(value) => update("temperature", value)} value={settings.temperature} />
+            <NumberControl label="Top-K" {...SAMPLING_LIMITS.topK} onChange={(value) => update("topK", value)} value={settings.topK} />
+            <NumberControl label="Top-P" {...SAMPLING_LIMITS.topP} onChange={(value) => update("topP", value)} value={settings.topP} />
+            <NumberControl hint="adapter-dependent" label="Min-P" {...SAMPLING_LIMITS.minP} onChange={(value) => update("minP", value)} value={settings.minP} />
+            <NumberControl label="Repetition penalty" {...SAMPLING_LIMITS.repetitionPenalty} onChange={(value) => update("repetitionPenalty", value)} value={settings.repetitionPenalty} />
+            <NumberControl label="Frequency penalty" {...SAMPLING_LIMITS.frequencyPenalty} onChange={(value) => update("frequencyPenalty", value)} value={settings.frequencyPenalty} />
+            <NumberControl label="Presence penalty" {...SAMPLING_LIMITS.presencePenalty} onChange={(value) => update("presencePenalty", value)} value={settings.presencePenalty} />
+            <NumberControl hint="per distribution" label="Alternatives" {...SAMPLING_LIMITS.alternatives} onChange={(value) => update("alternatives", value)} value={settings.alternatives} />
           </div>
           <label className="control-field full"><span>Stop sequences <small>one per line</small></span><textarea onChange={(event) => update("stopSequences", event.target.value.split("\n").filter(Boolean))} placeholder="Optional" rows={3} value={settings.stopSequences.join("\n")} /></label>
           <label className="switch-row">
