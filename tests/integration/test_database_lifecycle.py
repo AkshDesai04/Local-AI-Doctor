@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -178,6 +179,50 @@ async def test_generation_setup_rolls_back_messages_when_run_insert_fails(tmp_pa
         assert await database.fetch_one("SELECT COUNT(*) AS count FROM environment_snapshots") == {
             "count": 0
         }
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_sibling_user_messages_get_increasing_branch_indexes(tmp_path: Path) -> None:
+    database = Database(tmp_path / "siblings.sqlite3", tmp_path / "backups")
+    await database.initialize()
+    repository = WorkspaceRepository(database)
+    try:
+        chat = await repository.create_chat("siblings")
+        other_chat = await repository.create_chat("other")
+
+        async def send(
+            chat_id: str, parent_id: str | None, run_id: str
+        ) -> dict[str, dict[str, Any]]:
+            return await repository.create_generation_setup(
+                chat_id=chat_id,
+                user_content=run_id,
+                parent_message_id=parent_id,
+                run={"id": run_id, "effective_seed": 0},
+                hardware={},
+                software={},
+                backend={},
+            )
+
+        # Two roots in one chat, then two edits under the same parent.
+        first_root = await send(chat["id"], None, "root-1")
+        second_root = await send(chat["id"], None, "root-2")
+        await send(other_chat["id"], None, "other-root")
+        parent_id = first_root["assistant_message"]["id"]
+        first_edit = await send(chat["id"], parent_id, "edit-1")
+        second_edit = await send(chat["id"], parent_id, "edit-2")
+
+        assert first_root["user_message"]["branch_index"] == 0
+        assert second_root["user_message"]["branch_index"] == 1
+        assert first_edit["user_message"]["branch_index"] == 0
+        assert second_edit["user_message"]["branch_index"] == 1
+        # The assistant reply to a fresh user message is always that message's first child.
+        assert second_edit["assistant_message"]["branch_index"] == 0
+        assert (await repository.next_branch_index(parent_id)) == 2
+        other = await repository.get_chat(other_chat["id"])
+        assert other is not None
+        assert other["messages"][0]["branch_index"] == 0
     finally:
         await database.close()
 

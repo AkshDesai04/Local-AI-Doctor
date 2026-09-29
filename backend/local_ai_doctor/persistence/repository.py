@@ -503,9 +503,25 @@ class WorkspaceRepository:
                 INSERT INTO messages(
                     id, chat_id, parent_id, role, content, status, branch_index,
                     metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, 'user', ?, 'complete', 0, '{}', ?, ?)
+                ) VALUES (
+                    ?, ?, ?, 'user', ?, 'complete',
+                    (
+                        SELECT COALESCE(MAX(branch_index), -1) + 1 FROM messages
+                        WHERE chat_id = ? AND parent_id IS ?
+                    ),
+                    '{}', ?, ?
+                )
                 """,
-                (user_message_id, chat_id, parent_message_id, user_content, now, now),
+                (
+                    user_message_id,
+                    chat_id,
+                    parent_message_id,
+                    user_content,
+                    chat_id,
+                    parent_message_id,
+                    now,
+                    now,
+                ),
             )
             await connection.execute(
                 """
