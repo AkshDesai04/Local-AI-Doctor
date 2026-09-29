@@ -99,9 +99,22 @@ def test_generic_sentence_transformer_does_not_inherit_qwen_matryoshka_claims(
 
     assert model.task is ModelTask.EMBEDDING
     assert model.metadata["pooling"] == "last-token"
+    assert model.metadata["embedding_dimension"] == 128
     assert model.metadata["supports_dimension_truncation"] is False
     assert model.metadata["minimum_embedding_dimension"] is None
     assert model.metadata["joint_embedding_space"] is False
+
+
+def test_classic_pooling_config_width_is_read(embedding_model_dir: Path) -> None:
+    """Vyakyarth (XLM-R) spells the pooled width `word_embedding_dimension`."""
+
+    (embedding_model_dir / "1_Pooling" / "config.json").write_text(
+        json.dumps({"word_embedding_dimension": 768, "pooling_mode_mean_tokens": True}),
+        encoding="utf-8",
+    )
+    model = ModelScanner([embedding_model_dir.parent]).scan().models[0]
+    assert model.metadata["embedding_dimension"] == 768
+    assert model.metadata["pooling"] == "mean"
 
 
 def test_corrupt_shard_is_registered_with_actionable_error(tmp_path: Path) -> None:

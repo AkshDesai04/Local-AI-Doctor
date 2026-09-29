@@ -169,7 +169,11 @@ def _sentence_transformer_embedding_dimension(directory: Path) -> int | None:
     pooling, error = _safe_json(directory / "1_Pooling" / "config.json")
     if error is not None:
         return None
-    return _positive_int(pooling.get("embedding_dimension"))
+    # Classic sentence-transformers Pooling configs (XLM-R, BERT) name the width
+    # `word_embedding_dimension`; newer packaging (Qwen3-VL-Embedding) uses the short key.
+    return _positive_int(pooling.get("embedding_dimension")) or _positive_int(
+        pooling.get("word_embedding_dimension")
+    )
 
 
 def _sentence_transformer_pooling(directory: Path) -> str | None:
