@@ -324,6 +324,9 @@ export function Inspector({ open, model, run, health, configuration, activeTab, 
   const activeCapabilityDisabled = activeDefinition?.id === "timing"
     ? !supportsGeneration(model)
     : activeCapability !== null && activeCapability.state !== "full" && activeCapability.state !== "partial";
+  // Never render (or fetch for) a tab the selected model cannot support, even for the
+  // single render before the parent state falls back to the overview.
+  const visibleTab: InspectorTab = activeCapabilityDisabled ? "overview" : activeTab;
 
   useEffect(() => {
     if (activeCapabilityDisabled) onTabChange("overview");
@@ -345,7 +348,7 @@ export function Inspector({ open, model, run, health, configuration, activeTab, 
   }, [run]);
 
   const panel = useMemo((): React.ReactNode => {
-    switch (activeTab) {
+    switch (visibleTab) {
       case "overview": return <OverviewPanel model={model} run={run} />;
       case "tokens": {
         const runComplete = run?.status === "complete";
@@ -385,7 +388,7 @@ export function Inspector({ open, model, run, health, configuration, activeTab, 
         ? <div className="inspector-stack"><div className="raw-events-heading"><span>{String(run?.rawEvents?.length ?? 0)} live events</span>{run && <div className="server-export-actions"><button disabled={exporting !== null} onClick={() => void exportRun("json")} type="button">{exporting === "json" ? "Exporting…" : "JSON"}</button><button disabled={exporting !== null} onClick={() => void exportRun("jsonl")} type="button">{exporting === "jsonl" ? "Exporting…" : "JSONL"}</button><button disabled={exporting !== null} onClick={() => void exportRun("csv")} type="button">{exporting === "csv" ? "Exporting…" : "Token CSV"}</button></div>}</div>{exportError && <p className="inline-error" role="alert">{exportError}</p>}{run?.rawEvents?.length ? <pre className="event-log">{run.rawEvents.map((event) => JSON.stringify(event)).join("\n")}</pre> : <EmptyInspector body="Raw protocol events appear here as they arrive. Use the server export above for the complete persisted trace." title="No live events captured" />}</div>
         : <EmptyInspector body="Enable Nerd Mode to inspect raw protocol events and export token-level traces." icon={FileJson} title="Raw events are hidden" />;
     }
-  }, [activeTab, branching, configuration, exportError, exportRun, exporting, health, model, nerdMode, onBranchAlternative, onSelectToken, run, selected, selectedToken]);
+  }, [visibleTab, branching, configuration, exportError, exportRun, exporting, health, model, nerdMode, onBranchAlternative, onSelectToken, run, selected, selectedToken]);
 
   return (
     <aside className={`inspector ${open ? "open" : ""}`} aria-label="Run inspector">
@@ -404,8 +407,8 @@ export function Inspector({ open, model, run, health, configuration, activeTab, 
           return (
             <button
               aria-disabled={disabled}
-              aria-selected={activeTab === tab.id}
-              className={`${activeTab === tab.id ? "selected" : ""} ${disabled ? "disabled" : ""}`}
+              aria-selected={visibleTab === tab.id}
+              className={`${visibleTab === tab.id ? "selected" : ""} ${disabled ? "disabled" : ""}`}
               key={tab.id}
               onClick={() => { if (!disabled) { onTabChange(tab.id); setMobileTabsOpen(false); } }}
               role="tab"

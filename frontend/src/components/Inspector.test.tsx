@@ -170,4 +170,13 @@ describe("alternative-token branching", () => {
     expect(screen.getByRole("note")).toHaveTextContent("not causal contribution scores");
     expect(screen.getByRole("note")).toHaveTextContent("do not prove grounding or hallucination");
   });
+
+  it("falls back to the overview instead of rendering a capability-disabled tab", () => {
+    const onTabChange = vi.fn();
+    render(<Inspector activeTab="experts" branching={false} configuration={null} health={null} model={model} nerdMode onBranchAlternative={vi.fn()} onClose={vi.fn()} onSelectToken={vi.fn()} onTabChange={onTabChange} open run={run} selectedToken={4} />);
+
+    expect(screen.queryByText("No expert route events")).not.toBeInTheDocument();
+    expect(screen.getByText("Reproducibility")).toBeInTheDocument();
+    expect(onTabChange).toHaveBeenCalledWith("overview");
+  });
 });
