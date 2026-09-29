@@ -781,6 +781,105 @@ def test_prompt_rendering_does_not_rewrite_a_literal_user_suffix() -> None:
     assert rendered == "literal <think>"
 
 
+class TemplateWithoutSystemRole:
+    """Chat template that either rejects the system role or silently drops it."""
+
+    chat_template = "fixture"
+
+    def __init__(self, *, raises: bool) -> None:
+        self.raises = raises
+        self.calls: list[list[dict[str, Any]]] = []
+
+    def apply_chat_template(self, messages: Any, **_options: Any) -> str:
+        self.calls.append([dict(message) for message in messages])
+        if any(message["role"] == "system" for message in messages):
+            if self.raises:
+                raise ValueError("System role not supported")
+            messages = [message for message in messages if message["role"] != "system"]
+        return "".join(f"<{message['role']}>{message['content']}" for message in messages)
+
+
+@pytest.mark.parametrize("raises", [True, False])
+def test_prompt_rendering_merges_system_prompt_when_template_has_no_system_role(
+    raises: bool,
+) -> None:
+    tokenizer = TemplateWithoutSystemRole(raises=raises)
+    messages = [
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi"},
+        {"role": "user", "content": "again"},
+    ]
+
+    rendered, renderer = _render_messages(tokenizer, messages)
+
+    assert renderer == "chat_template_system_merged"
+    assert rendered == "<user>Be brief.\n\nhello<assistant>hi<user>again"
+    assert tokenizer.calls[-1][0] == {"role": "user", "content": "Be brief.\n\nhello"}
+    assert messages[0] == {"role": "system", "content": "Be brief."}
+
+
+def test_prompt_rendering_keeps_the_system_role_when_the_template_renders_it() -> None:
+    class SystemAwareTokenizer:
+        chat_template = "fixture"
+
+        @staticmethod
+        def apply_chat_template(messages: Any, **_options: Any) -> str:
+            return "".join(f"<{message['role']}>{message['content']}" for message in messages)
+
+    rendered, renderer = _render_messages(
+        SystemAwareTokenizer(),
+        [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "hello"}],
+    )
+
+    assert (rendered, renderer) == ("<system>Be brief.<user>hello", "chat_template")
+
+
+def test_prompt_rendering_does_not_hide_template_errors_it_cannot_repair() -> None:
+    tokenizer = TemplateWithoutSystemRole(raises=True)
+
+    with pytest.raises(ValueError, match="System role not supported"):
+        _render_messages(tokenizer, [{"role": "system", "content": "Be brief."}])
+    without_system = TemplateWithoutSystemRole(raises=True)
+    rendered, renderer = _render_messages(without_system, [{"role": "user", "content": "hi"}])
+    assert (rendered, renderer) == ("<user>hi", "chat_template")
+
+
+def test_generation_warns_when_the_system_prompt_is_merged_into_the_first_user_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MergingTokenizer(TemplateWithoutSystemRole, FakeTokenizer):
+        def __init__(self) -> None:
+            TemplateWithoutSystemRole.__init__(self, raises=True)
+            self.prompts: list[str] = []
+
+        def __call__(self, text: str, **kwargs: Any) -> dict[str, FakeTensor]:
+            self.prompts.append(text)
+            return {"input_ids": FakeTensor([[5, 6]]), "attention_mask": FakeTensor([[1, 1]])}
+
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, _model, output = configured_encoder_decoder_runtime()
+    tokenizer = MergingTokenizer()
+    runtime.tokenizer = tokenizer
+    command = generation_command()
+    command["messages"] = [
+        {"role": "system", "content": "Answer in French."},
+        {"role": "user", "content": "summarize this"},
+    ]
+
+    runtime._generate(command)
+
+    events = [item for item in output.items if item["kind"] == "run_event"]
+    warnings = [item["payload"] for item in events if item["event_type"] == "warning"]
+    merged = [item for item in warnings if item["code"] == "system_prompt_merged"]
+    assert len(merged) == 1
+    assert "prepended to the first user message" in merged[0]["message"]
+    expected_prompt = "<user>Answer in French.\n\nsummarize this"
+    assert tokenizer.prompts == [expected_prompt]
+    stage = next(item["payload"] for item in events if item["event_type"] == "stage")
+    assert stage["rendered_prompt"] == expected_prompt
+
+
 def test_runtime_reasoning_segmenter_uses_only_model_declared_delimiters() -> None:
     unknown, primed = _reasoning_segmenter({}, "Assistant: <think>\n")
     tagged, tagged_primed = _reasoning_segmenter(
