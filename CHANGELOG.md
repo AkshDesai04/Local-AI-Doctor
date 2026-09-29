@@ -40,6 +40,7 @@ This project follows a Keep a Changelog-style structure. Versions and dates are 
 - Uploads rejected because of the file itself (unrecognized signature, invalid filename, MIME type that contradicts the signature, invalid UTF-8, or media that fails decoding) now return HTTP 415 `unsupported_media_type` or 422 `invalid_upload` in the standard error envelope; they previously surfaced as a generic 500.
 - `POST /runs/{run_id}/cancel` on a run that does not exist now returns 404 `run_not_found`; it returned 409 `run_not_cancellable`, which is still used for a run that exists but has already finished.
 - `POST /chats/{chat_id}/messages` for a chat that does not exist now returns 404 `chat_not_found`; it returned 422 `invalid_request`.
+- Errors raised by the router itself (405 for an unsupported method, including unknown non-GET `/api` paths, and a missing static asset 404) now return the standard error envelope (`method_not_allowed`, `not_found`, `http_error`) instead of FastAPI's `{"detail": "..."}` shape. The frontend shell fallback for client-side routes is unchanged.
 
 ### Security
 

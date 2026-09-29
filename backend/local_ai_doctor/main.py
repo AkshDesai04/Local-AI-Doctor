@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from http import HTTPStatus
 from pathlib import Path
 from typing import Annotated, Any, cast
 from urllib.parse import urlsplit
@@ -39,6 +40,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
 from .api.body_limit import RequestBodyLimitMiddleware
@@ -556,6 +558,20 @@ def create_app(
     async def worker_failure(_request: Request, exc: WorkerFailure) -> JSONResponse:
         http_status, payload = worker_failure_response(exc.error)
         return JSONResponse({"error": payload}, status_code=http_status)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def framework_http_error(_request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        # Raised by the router itself (405 for an unsupported method, 404 for a
+        # missing static file). The canned status phrase is used instead of
+        # `exc.detail` so no framework or request text reaches the client.
+        try:
+            message = HTTPStatus(exc.status_code).phrase.lower()
+        except ValueError:
+            message = "request failed"
+        code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "http_error")
+        return JSONResponse(
+            _json_error(code, message), status_code=exc.status_code, headers=exc.headers
+        )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:

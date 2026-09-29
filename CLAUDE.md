@@ -201,7 +201,7 @@ Error shapes:
 - Validation → 422 `invalid_request` with `details.issues`.
 - Uncaught errors → 500 `internal_error` with no text.
 - `WorkerFailure` (from load, unload, embeddings, prompt scoring) → the same envelope with the worker's code: out-of-memory → 507 `out_of_memory` (original code kept in `details.worker_code`), timeouts → 504, `model_worker_state_mismatch` → 409, anything else → 502 (`errors.worker_failure_response`).
-- Routes raise `WorkbenchError` subclasses (`ChatNotFoundError`, `RunNotFoundError`, `RunNotCancellableError`, `ConfirmationRequiredError`, `ModelNotLoadedError`, `NotFoundError`), so they return the envelope too. Only framework-level errors raised before a route runs (for example 405) still use `{"detail": …}`; clients handle both shapes.
+- Routes raise `WorkbenchError` subclasses (`ChatNotFoundError`, `RunNotFoundError`, `RunNotCancellableError`, `ConfirmationRequiredError`, `ModelNotLoadedError`, `NotFoundError`), so they return the envelope too. Router-level `StarletteHTTPException`s (405 `method_not_allowed`, missing static asset 404 `not_found`, other statuses `http_error`) are mapped to the envelope by `framework_http_error`; the client still tolerates the older `{"detail": …}` shape.
 
 The WebSocket `/ws/v1/runs/{run_id}?after=N` checks Host (close 4403), auth via the `lad.auth.<base64url>` subprotocol or Bearer (close 4401), and Origin (4403). It then accepts with subprotocol `lad.events.v1`. A disconnect does **not** cancel the run.
 
