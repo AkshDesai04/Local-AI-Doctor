@@ -21,7 +21,12 @@ from ..api.schemas import (
 )
 from ..config import AppSettings, DeviceMode, DType, InstrumentationLevel
 from ..domain.models import ModelDescriptor, ModelTask
-from ..errors import CapabilityUnavailableError, InvalidRequestError, WorkbenchError
+from ..errors import (
+    CapabilityUnavailableError,
+    ChatNotFoundError,
+    InvalidRequestError,
+    WorkbenchError,
+)
 from ..persistence import TelemetryWriter, WorkspaceRepository
 from ..workers import InferenceReservation, ModelWorkerSupervisor, WorkerFailure
 from .events import EventBroker
@@ -149,7 +154,7 @@ class RunManager:
             )
         chat = await self.repository.get_chat(request.chat_id)
         if chat is None:
-            raise WorkbenchError("chat not found", details={"chat_id": request.chat_id})
+            raise ChatNotFoundError("chat not found", details={"chat_id": request.chat_id})
         lineage: list[dict[str, Any]] = []
         if request.parent_message_id is not None:
             lineage = await self.repository.get_message_lineage(request.parent_message_id)

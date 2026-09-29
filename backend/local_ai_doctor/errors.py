@@ -20,6 +20,7 @@ class ErrorCode(StrEnum):
     CONFIGURATION_VERSION = "configuration_version"
     PATH_OUTSIDE_ROOT = "path_outside_root"
     MODEL_NOT_FOUND = "model_not_found"
+    CHAT_NOT_FOUND = "chat_not_found"
     ATTACHMENT_NOT_FOUND = "attachment_not_found"
     MODEL_INVALID = "model_invalid"
     MODEL_CORRUPT = "model_corrupt"
@@ -113,6 +114,11 @@ class PathSecurityError(WorkbenchError):
 
 class ModelNotFoundError(WorkbenchError):
     code = ErrorCode.MODEL_NOT_FOUND
+    http_status = 404
+
+
+class ChatNotFoundError(WorkbenchError):
+    code = ErrorCode.CHAT_NOT_FOUND
     http_status = 404
 
 

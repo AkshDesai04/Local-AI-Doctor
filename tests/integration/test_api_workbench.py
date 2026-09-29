@@ -654,3 +654,18 @@ def test_worker_failures_return_the_error_envelope_with_the_worker_code(
         assert "RuntimeError" not in response.text
         if worker_error.get("code") == "model_out_of_memory":
             assert body["details"]["worker_code"] == "model_out_of_memory"
+
+
+def test_generating_into_a_missing_chat_returns_404(api_client: TestClient) -> None:
+    model_id = api_client.get("/api/v1/models", headers=API_HEADERS).json()["models"][0]["id"]
+
+    response = api_client.post(
+        "/api/v1/runs",
+        headers=API_HEADERS,
+        json={"chat_id": "no-such-chat", "model_id": model_id, "prompt": "hello"},
+    )
+
+    assert response.status_code == 404
+    error = response.json()["error"]
+    assert error["code"] == "chat_not_found"
+    assert error["details"] == {"chat_id": "no-such-chat"}

@@ -31,6 +31,7 @@ This project follows a Keep a Changelog-style structure. Versions and dates are 
 - `chat_template.json` is read alongside `chat_template.jinja` for chat-template presence and reasoning-delimiter discovery.
 - CORS preflights for `PUT` are now answered, so saving model roots from the Vite dev origin (`:5173` to `:8000`) no longer fails; `PUT` was missing from the allowed methods.
 - Worker failures on model load and unload, embeddings, and prompt scoring now return the standard error envelope with the worker's error code instead of a generic HTTP 500: out-of-memory is 507 (`out_of_memory`), timeouts are 504, a load state mismatch is 409, and any other worker failure is 502.
+- Starting a generation in a chat that does not exist now returns HTTP 404 with code `chat_not_found`; it previously fell through to a generic 500.
 
 ### Security
 
