@@ -270,6 +270,19 @@ def test_http_origin_and_websocket_authentication_are_enforced(api_client: TestC
     assert preflight.status_code == 200
     assert preflight.headers["access-control-allow-origin"] == "http://vite.test"
 
+    # Saving model roots from the Vite dev origin uses PUT.
+    put_preflight = api_client.options(
+        "/api/v1/configuration/model-roots",
+        headers={
+            "Origin": "http://vite.test",
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+    assert put_preflight.status_code == 200
+    assert put_preflight.headers["access-control-allow-origin"] == "http://vite.test"
+    assert "PUT" in put_preflight.headers["access-control-allow-methods"]
+
     malformed_preflight = api_client.options(
         "/api/v1/chats",
         headers={

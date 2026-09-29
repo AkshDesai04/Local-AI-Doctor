@@ -29,6 +29,7 @@ This project follows a Keep a Changelog-style structure. Versions and dates are 
 - Task detection falls back to the installed Transformers auto mappings when the architecture name is unfamiliar, so a natively supported family is no longer reported as an unsupported architecture.
 - The worker resolves the generation Auto class from the loaded configuration instead of always using `AutoModelForCausalLM`. Multimodal generators registered only under the image-text-to-text head, such as Qwen3-VL, now load and generate.
 - `chat_template.json` is read alongside `chat_template.jinja` for chat-template presence and reasoning-delimiter discovery.
+- CORS preflights for `PUT` are now answered, so saving model roots from the Vite dev origin (`:5173` to `:8000`) no longer fails; `PUT` was missing from the allowed methods.
 
 ### Security
 

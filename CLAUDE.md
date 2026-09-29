@@ -482,7 +482,6 @@ Inside the worker (`_generate_impl`):
 - Never destructively reset or clean a dirty worktree. Preserve unrelated user changes.
 
 ## 11. Known discrepancies / open issues found while reviewing (verify before relying)
-- **CORS lacks `PUT`.** `main.py` has `CORSMiddleware(allow_methods=["GET","POST","PATCH","DELETE"])`, but `PUT /configuration/model-roots` exists. AGENT.md §22.11 says `PUT` must be allowed and covered by a preflight test, yet `tests/integration/test_api_workbench.py` only preflights `POST`. The likely symptom is that saving model roots from Vite dev (`:5173` → `:8000`) fails CORS preflight, while same-origin production works.
 - **Distribution naming.** AGENT.md §9.7 says the branch `distribution` is `raw` or `sampler`, but the code, DB CHECK constraint, and TS type all use `"raw" | "sampling"`. The code is authoritative.
 - **`AdapterRegistry` and the adapter ABCs are contracts only.** `WorkerRuntime` hard-codes the Transformers and SentenceTransformers paths.
 - `test` profile model roots point at `tests/fixtures/models`, which does not exist. Tests build their own fixtures in `tmp_path` via conftest.
