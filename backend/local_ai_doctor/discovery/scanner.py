@@ -21,6 +21,7 @@ from ..domain.models import (
     TrustDecision,
 )
 from ..hardware.models import BackendKind
+from .bundled_imports import check_bundled_imports
 from .capabilities import ModelEvidence, build_capability_matrix
 from .fingerprint import FingerprintPolicy, fingerprint_model_directory
 from .reviewed_bundled_code import reviewed_reason
@@ -54,6 +55,15 @@ _CONTEXT_CAPACITY_KEYS: Final[tuple[str, ...]] = (
 # Tokenizers routinely encode "unbounded" as a float sentinel (1e30) rather than omitting
 # the field, so any value beyond this ceiling is evidence, never a selectable length.
 _CONTEXT_SENTINEL_CEILING: Final[int] = 10_000_000
+_SAFETENSORS_DTYPE_NAMES: Final[dict[str, str]] = {
+    "F64": "float64",
+    "F32": "float32",
+    "F16": "float16",
+    "BF16": "bfloat16",
+}
+# Pickle-based checkpoint formats. They are recognized only to explain why the
+# folder cannot load; the workbench never unpickles weights.
+_PICKLE_WEIGHT_SUFFIXES: Final[frozenset[str]] = frozenset({".bin", ".pt", ".pth", ".ckpt"})
 _MOE_KEYS: Final[frozenset[str]] = frozenset(
     {
         "num_experts",
@@ -82,6 +92,18 @@ class ModelScanReport(BaseModel):
     @property
     def by_id(self) -> dict[str, ModelDescriptor]:
         return {model.id: model for model in self.models}
+
+    def public_roots(self) -> list[dict[str, Any]]:
+        """Root results without host paths; diagnostics carry only relative names."""
+
+        return [
+            {
+                "root": f"<model-root:{index}>",
+                "discovered_count": result.discovered_count,
+                "diagnostics": [item.model_dump(mode="json") for item in result.diagnostics],
+            }
+            for index, result in enumerate(self.roots)
+        ]
 
 
 def _safe_json(path: Path) -> tuple[dict[str, Any], str | None]:
@@ -389,14 +411,34 @@ def _components(
     )
 
 
+def _template_strings(value: Any) -> list[str]:
+    """Normalize a chat template field: one string, or a list of named templates."""
+
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [
+            item["template"]
+            for item in value
+            if isinstance(item, Mapping) and isinstance(item.get("template"), str)
+        ]
+    return []
+
+
 def _reasoning_delimiters(tokenizer: Mapping[str, Any], directory: Path) -> tuple[str, str] | None:
-    text = json.dumps(tokenizer, ensure_ascii=False)
-    for name in _CHAT_TEMPLATE_FILES:
-        template_path = directory / name
-        if _regular_file(template_path) and template_path.stat().st_size <= _MAX_JSON_BYTES:
-            with contextlib.suppress(OSError, UnicodeDecodeError):
-                text += template_path.read_text(encoding="utf-8")
-    if "<think>" in text and "</think>" in text:
+    # Only chat-template text proves the model emits reasoning markers. The rest of
+    # tokenizer_config.json (notably `added_tokens_decoder`) lists `<think>` for every
+    # tokenizer in a family, including embedding checkpoints that never generate.
+    templates = _template_strings(tokenizer.get("chat_template"))
+    jinja_path = directory / "chat_template.jinja"
+    if _regular_file(jinja_path) and jinja_path.stat().st_size <= _MAX_JSON_BYTES:
+        with contextlib.suppress(OSError, UnicodeDecodeError):
+            templates.append(jinja_path.read_text(encoding="utf-8"))
+    if _regular_file(directory / "chat_template.json"):
+        payload, error = _safe_json(directory / "chat_template.json")
+        if error is None:
+            templates.extend(_template_strings(payload.get("chat_template")))
+    if any("<think>" in text and "</think>" in text for text in templates):
         return ("<think>", "</think>")
     return None
 
@@ -434,6 +476,63 @@ def _metadata_diagnostics(
             )
         )
     return diagnostics
+
+
+def _skipped_directory_diagnostic(directory: Path, root: Path) -> Diagnostic | None:
+    """Explain a folder that looks like a model location but can never be a candidate.
+
+    Without this an empty download or a GGUF-only export was silently invisible, so
+    the registry gave no hint why a model the user placed in the root did not appear.
+    """
+
+    try:
+        entries = [item for item in directory.iterdir() if not item.name.startswith(".")]
+    except OSError:
+        return None  # The caller reports unreadable directories when it lists them.
+    relative = directory.relative_to(root).as_posix()
+    if not entries:
+        return Diagnostic(
+            code="empty_model_directory",
+            severity=DiagnosticSeverity.WARNING,
+            message=f"model directory {relative!r} is empty",
+            hint="Finish the download or remove the folder from the model root.",
+            evidence={"directory": relative},
+        )
+    if any(item.suffix.lower() == ".gguf" and _regular_file(item) for item in entries):
+        return Diagnostic(
+            code="gguf_only_directory",
+            severity=DiagnosticSeverity.WARNING,
+            message=f"model directory {relative!r} contains GGUF weights, which this workbench does not load",
+            hint="Use the original Transformers SafeTensors release of the model (config.json, tokenizer, *.safetensors).",
+            evidence={"directory": relative},
+        )
+    return None
+
+
+def _size_note(weight_bytes: int) -> str:
+    gib = weight_bytes / 1024**3
+    if gib <= 8:
+        return ""
+    return f" For reference, the weights total {gib:.1f} GiB, more than a typical 8 GiB GPU holds."
+
+
+def _declared_dtype(config: Mapping[str, Any]) -> str | None:
+    value = (
+        config.get("dtype")
+        or config.get("torch_dtype")
+        or _nested_value(config, "text_config", "dtype")
+        or _nested_value(config, "text_config", "torch_dtype")
+    )
+    return str(value) if value else None
+
+
+def _stored_dtype(dtype_parameter_counts: Mapping[str, int]) -> str | None:
+    """Name the dtype that stores most parameters, in the configuration's spelling."""
+
+    if not dtype_parameter_counts:
+        return None
+    dominant = max(dtype_parameter_counts.items(), key=lambda item: item[1])[0]
+    return _SAFETENSORS_DTYPE_NAMES.get(dominant, dominant.lower())
 
 
 def _safe_identifier(name: str, fingerprint: str) -> str:
@@ -477,6 +576,11 @@ class ModelScanner:
             if self._is_candidate(directory):
                 candidates.append(directory)
                 return
+            if depth > 0:
+                skipped = _skipped_directory_diagnostic(directory, root)
+                if skipped is not None:
+                    diagnostics.append(skipped)
+                    return
             if depth >= self._max_depth:
                 return
             try:
@@ -484,7 +588,9 @@ class ModelScanner:
                     (
                         item
                         for item in directory.iterdir()
-                        if item.is_dir() and not item.is_symlink()
+                        # Dot-directories are VCS, cache, or staging state (`.git`,
+                        # `.cache`), never a model folder.
+                        if item.is_dir() and not item.is_symlink() and not item.name.startswith(".")
                     ),
                     key=lambda item: item.name.casefold(),
                 )
@@ -555,7 +661,35 @@ class ModelScanner:
             )
         )
         summary: SafeTensorSummary = inspect_safetensors(weights)
-        if not weights:
+        # Computed early: the fingerprint pins reviewed bundled code below, and its
+        # loader-weight byte total sizes the informational notes in blocking hints.
+        fingerprint = fingerprint_model_directory(directory, self._fingerprint_policy)
+        pickle_weights = sorted(
+            path.name
+            for path in directory.iterdir()
+            if path.suffix.lower() in _PICKLE_WEIGHT_SUFFIXES and _regular_file(path)
+        )
+        if not weights and pickle_weights:
+            diagnostics.append(
+                Diagnostic(
+                    code="pickle_weights_only",
+                    severity=DiagnosticSeverity.ERROR,
+                    message=(
+                        f"weights are stored only as pickle checkpoints ({len(pickle_weights)} "
+                        f"file(s), for example {pickle_weights[0]}); the workbench never "
+                        "unpickles weights because loading a pickle can execute code"
+                    ),
+                    hint=(
+                        "Convert the checkpoint to SafeTensors offline with a trusted tool in an "
+                        "isolated environment, write the result to a new folder with the same "
+                        "config and tokenizer files, and add that folder to a model root. The "
+                        "original folder is never modified."
+                        + _size_note(fingerprint.total_weight_bytes)
+                    ),
+                    evidence={"pickle_files": len(pickle_weights)},
+                )
+            )
+        elif not weights:
             diagnostics.append(
                 Diagnostic(
                     code="safetensors_missing",
@@ -619,11 +753,9 @@ class ModelScanner:
                 )
             )
 
-        # Computed here, ahead of the trust decision below, because the reviewed-bundled-
-        # code exception is pinned to this exact fingerprint: a changed checkpoint at the
-        # same path must not silently inherit a review that covered different bytes.
-        fingerprint = fingerprint_model_directory(directory, self._fingerprint_policy)
-
+        # The reviewed-bundled-code exception below is pinned to the fingerprint computed
+        # above: a changed checkpoint at the same path must not silently inherit a review
+        # that covered different bytes.
         model_type = str(config.get("model_type")) if config.get("model_type") else None
         auto_map = config.get("auto_map")
         trust_decision = TrustDecision.BUILTIN_ONLY
@@ -657,6 +789,35 @@ class ModelScanner:
                             },
                         )
                     )
+                    imports = check_bundled_imports(directory, auto_map)
+                    if not imports.ok:
+                        declared = config.get("transformers_version")
+                        written_for = (
+                            f" (it was written for Transformers {declared})" if declared else ""
+                        )
+                        diagnostics.append(
+                            Diagnostic(
+                                code="bundled_code_incompatible",
+                                severity=DiagnosticSeverity.ERROR,
+                                message=(
+                                    "the reviewed bundled code cannot be imported with the "
+                                    f"installed packages: {imports.describe()}"
+                                ),
+                                hint=(
+                                    "The workbench does not patch checkpoint code or install "
+                                    f"packages for it{written_for}. Use a SafeTensors export of "
+                                    "this model for an architecture the installed Transformers "
+                                    "implements, or review an updated revision of the bundled "
+                                    "code pinned to its new fingerprint."
+                                    + _size_note(fingerprint.total_weight_bytes)
+                                ),
+                                evidence={
+                                    "missing_files": imports.missing_files,
+                                    "missing_modules": imports.missing_modules,
+                                    "missing_names": imports.missing_names,
+                                },
+                            )
+                        )
                 else:
                     trust_decision = TrustDecision.REJECTED_CUSTOM_CODE
                     diagnostics.append(
@@ -696,18 +857,34 @@ class ModelScanner:
                 is_moe=is_moe,
                 architecture_known=architecture_known,
                 available_backends=self._available_backends,
+                blocking_diagnostics=tuple(
+                    dict.fromkeys(
+                        item.code
+                        for item in diagnostics
+                        if item.severity is DiagnosticSeverity.ERROR
+                    )
+                ),
             )
         )
-        dtype = (
-            config.get("dtype")
-            or config.get("torch_dtype")
-            or _nested_value(config, "text_config", "dtype")
-        )
+        # Report what the headers store, not what config.json claims: the two disagree
+        # in real checkpoints, and pickle-only folders have no verifiable dtype at all.
+        declared_dtype = _declared_dtype(config)
+        dtype = _stored_dtype(summary.dtype_parameter_counts)
+        if declared_dtype and dtype and declared_dtype != dtype:
+            diagnostics.append(
+                Diagnostic(
+                    code="dtype_metadata_mismatch",
+                    severity=DiagnosticSeverity.INFO,
+                    message=f"config.json declares {declared_dtype} but the SafeTensors headers store {dtype}",
+                    evidence={"declared": declared_dtype, "stored": dtype},
+                )
+            )
         qwen_vl_embedding = (
             task is ModelTask.MULTIMODAL_EMBEDDING and config.get("model_type") == "qwen3_vl"
         )
         metadata: dict[str, Any] = {
             "task_evidence": task_evidence,
+            "declared_dtype": declared_dtype,
             "transformers_version": config.get("transformers_version"),
             "vocab_size": config.get("vocab_size")
             or _nested_value(config, "text_config", "vocab_size"),
@@ -727,7 +904,7 @@ class ModelScanner:
             task=task,
             architectures=architectures,
             model_type=model_type,
-            dtype=str(dtype) if dtype else None,
+            dtype=dtype,
             parameter_count=summary.parameter_count or None,
             weight_dtypes=summary.dtype_parameter_counts,
             modalities=modalities,

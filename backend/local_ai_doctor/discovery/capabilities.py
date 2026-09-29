@@ -24,6 +24,9 @@ class ModelEvidence:
     is_moe: bool
     architecture_known: bool
     available_backends: frozenset[BackendKind] = frozenset({BackendKind.CPU})
+    # Codes of error-severity discovery diagnostics. Any one of them means the
+    # checkpoint cannot be loaded, so no capability may be advertised.
+    blocking_diagnostics: tuple[str, ...] = ()
 
 
 def _full() -> CapabilitySupport:
@@ -57,6 +60,11 @@ def _backend(evidence: ModelEvidence, backend: BackendKind) -> CapabilitySupport
 
 
 def build_capability_matrix(evidence: ModelEvidence) -> CapabilityMatrix:
+    if evidence.blocking_diagnostics:
+        return CapabilityMatrix.all_unsupported(
+            "the model is not loadable; blocking discovery diagnostic: "
+            + ", ".join(evidence.blocking_diagnostics)
+        )
     generation = evidence.task in {
         ModelTask.TEXT_GENERATION,
         ModelTask.ENCODER_DECODER_GENERATION,

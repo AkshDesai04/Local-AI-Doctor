@@ -432,6 +432,10 @@ def test_fingerprint_pinned_review_admits_bundled_code_that_builtin_cannot_read(
             "auto_map": {"AutoModelForCausalLM": "modeling_mpt.MPTForCausalLM"},
         },
     )
+    # Bundled code whose imports all resolve against the installed packages.
+    (directory / "modeling_mpt.py").write_text(
+        "import torch\nfrom transformers import PreTrainedModel\n", encoding="utf-8"
+    )
     fingerprint = fingerprint_model_directory(directory)
     reviewed = (
         reviewed_bundled_code.ReviewedCheckpoint(
@@ -471,3 +475,182 @@ def test_task_falls_back_to_the_installed_transformers_mapping(tmp_path: Path) -
     model = ModelScanner([tmp_path]).scan().models[0]
     assert model.task is ModelTask.TEXT_GENERATION
     assert model.loadable
+
+
+def _review(monkeypatch: pytest.MonkeyPatch, directory: Path) -> None:
+    from local_ai_doctor.discovery import reviewed_bundled_code
+    from local_ai_doctor.discovery import scanner as scanner_module
+
+    reviewed = (
+        reviewed_bundled_code.ReviewedCheckpoint(
+            fingerprint=fingerprint_model_directory(directory).value,
+            directory_name=directory.name,
+            reason="test-only synthetic review",
+        ),
+    )
+    monkeypatch.setattr(reviewed_bundled_code, "_REVIEWED", reviewed)
+    monkeypatch.setattr(scanner_module, "reviewed_reason", reviewed_bundled_code.reviewed_reason)
+
+
+def test_reviewed_code_that_no_longer_imports_blocks_loading(
+    reviewed_code_model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Krutrim-1's reviewed MPT code references helpers Transformers 4.57 removed."""
+
+    _review(monkeypatch, reviewed_code_model_dir)
+    model = ModelScanner([reviewed_code_model_dir.parent]).scan().models[0]
+
+    assert model.trust_decision is TrustDecision.REVIEWED_BUNDLED_CODE
+    assert not model.loadable
+    blocked = next(item for item in model.diagnostics if item.code == "bundled_code_incompatible")
+    assert blocked.severity is DiagnosticSeverity.ERROR
+    assert blocked.evidence["missing_names"] == {
+        "transformers.models.llama.modeling_llama": ["LlamaDynamicNTKScalingRotaryEmbedding"]
+    }
+    # Guarded and function-local imports never fail at import time.
+    assert blocked.evidence["missing_modules"] == ["lad_fixture_package_that_is_not_installed"]
+    assert "4.37.2" in (blocked.hint or "")
+    assert str(reviewed_code_model_dir) not in blocked.message
+    assert model.capabilities.support(Capability.TEXT_GENERATION).state is (
+        CapabilityState.UNSUPPORTED
+    )
+
+
+def test_bundled_import_check_reports_a_missing_auto_map_module(
+    reviewed_code_model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (reviewed_code_model_dir / "modeling_mpt.py").unlink()
+    _review(monkeypatch, reviewed_code_model_dir)
+    model = ModelScanner([reviewed_code_model_dir.parent]).scan().models[0]
+
+    blocked = next(item for item in model.diagnostics if item.code == "bundled_code_incompatible")
+    assert blocked.evidence["missing_files"] == ["modeling_mpt.py"]
+
+
+def test_bundled_import_check_never_resolves_path_like_auto_map_entries(tmp_path: Path) -> None:
+    from local_ai_doctor.discovery.bundled_imports import check_bundled_imports
+
+    (tmp_path / "inside").mkdir()
+    (tmp_path / "outside.py").write_text("import lad_missing_package\n", encoding="utf-8")
+    report = check_bundled_imports(tmp_path / "inside", {"AutoModel": "../outside.Class"})
+    assert not report.ok
+    assert report.missing_files == ["../outside"]
+    assert report.missing_modules == []
+
+
+def test_pickle_only_checkpoint_is_blocked_with_conversion_guidance(
+    pickle_only_model_dir: Path,
+) -> None:
+    """Krutrim-2 ships only pytorch_model-*.bin shards; nothing may be advertised."""
+
+    model = ModelScanner([pickle_only_model_dir.parent]).scan().models[0]
+
+    assert not model.loadable
+    codes = {item.code for item in model.diagnostics}
+    assert "pickle_weights_only" in codes
+    assert "safetensors_missing" not in codes
+    blocked = next(item for item in model.diagnostics if item.code == "pickle_weights_only")
+    assert "SafeTensors" in (blocked.hint or "")
+    for capability, support in model.capabilities.entries.items():
+        assert support.state is CapabilityState.UNSUPPORTED, capability
+        assert "pickle_weights_only" in (support.reason or "")
+    # No header proves the stored dtype; the config claim is kept as evidence only.
+    assert model.dtype is None
+    assert model.metadata["declared_dtype"] == "bfloat16"
+    # Index-listed shards only: stray pickled training state is not model weight.
+    assert model.fingerprint.total_weight_bytes == 300
+
+
+def test_weight_bytes_count_only_the_files_the_loader_reads(base_model_dir: Path) -> None:
+    """Llama 3.2 also ships original/consolidated.00.pth, which was double counted."""
+
+    model = ModelScanner([base_model_dir.parent]).scan().models[0]
+    assert (
+        model.fingerprint.total_weight_bytes
+        == (base_model_dir / "model.safetensors").stat().st_size
+    )
+
+
+def test_sharded_weight_bytes_follow_the_index(reviewed_code_model_dir: Path) -> None:
+    shards = sorted(reviewed_code_model_dir.glob("model-*.safetensors"))
+    (reviewed_code_model_dir / "consolidated.safetensors").write_bytes(shards[0].read_bytes())
+    fingerprint = fingerprint_model_directory(reviewed_code_model_dir)
+    assert fingerprint.total_weight_bytes == sum(path.stat().st_size for path in shards)
+
+
+def test_header_dtype_is_reported_over_the_config_claim(tmp_path: Path) -> None:
+    _minimal_checkpoint(
+        tmp_path / "f32",
+        {"architectures": ["LlamaForCausalLM"], "model_type": "llama", "torch_dtype": "bfloat16"},
+    )
+    model = ModelScanner([tmp_path]).scan().models[0]
+    assert model.dtype == "float32"
+    assert model.metadata["declared_dtype"] == "bfloat16"
+    mismatch = next(item for item in model.diagnostics if item.code == "dtype_metadata_mismatch")
+    assert mismatch.severity is DiagnosticSeverity.INFO
+    assert model.loadable
+
+
+def test_reasoning_markers_come_only_from_chat_templates(embedding_model_dir: Path) -> None:
+    """Qwen tokenizers list `<think>` as added tokens even in embedding checkpoints."""
+
+    (embedding_model_dir / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "added_tokens_decoder": {
+                    "151667": {"content": "<think>"},
+                    "151668": {"content": "</think>"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (embedding_model_dir / "chat_template.jinja").write_text(
+        "{{ messages[0]['content'] }}", encoding="utf-8"
+    )
+    model = ModelScanner([embedding_model_dir.parent]).scan().models[0]
+    assert model.reasoning_delimiters is None
+    assert (
+        model.capabilities.support(Capability.REASONING_CHANNEL).state
+        is CapabilityState.UNSUPPORTED
+    )
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        (
+            "tokenizer_config.json",
+            {"chat_template": [{"name": "default", "template": "<think></think>"}]},
+        ),
+        ("chat_template.json", {"chat_template": "{{ '<think>' }}...</think>"}),
+    ],
+)
+def test_reasoning_markers_are_read_from_every_template_form(
+    causal_model_dir: Path, filename: str, payload: dict[str, object]
+) -> None:
+    (causal_model_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    (causal_model_dir / filename).write_text(json.dumps(payload), encoding="utf-8")
+    model = ModelScanner([causal_model_dir.parent]).scan().models[0]
+    assert model.reasoning_delimiters == ("<think>", "</think>")
+
+
+def test_empty_and_gguf_only_folders_get_root_diagnostics(
+    causal_model_dir: Path, tmp_path: Path
+) -> None:
+    (tmp_path / "Empty-Download").mkdir()
+    (tmp_path / "Empty-Download" / ".gitattributes").write_text("", encoding="utf-8")
+    (tmp_path / "Quantized-GGUF").mkdir()
+    (tmp_path / "Quantized-GGUF" / "model-Q4_K_M.gguf").write_bytes(b"GGUF")
+    (tmp_path / ".cache" / "nested").mkdir(parents=True)
+
+    report = ModelScanner([tmp_path]).scan()
+
+    assert [model.display_name for model in report.models] == [causal_model_dir.name]
+    diagnostics = {item.code: item for item in report.roots[0].diagnostics}
+    assert set(diagnostics) == {"empty_model_directory", "gguf_only_directory"}
+    assert diagnostics["empty_model_directory"].evidence == {"directory": "Empty-Download"}
+    assert diagnostics["gguf_only_directory"].severity is DiagnosticSeverity.WARNING
+    public = json.dumps(report.public_roots())
+    assert str(tmp_path).replace("\\", "\\\\") not in public
+    assert "Quantized-GGUF" in public

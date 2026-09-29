@@ -21,6 +21,7 @@ _METADATA_SUFFIXES: Final[frozenset[str]] = frozenset(
 )
 _SAMPLE_BYTES: Final[int] = 1024 * 1024
 _MAX_HEADER_BYTES: Final[int] = 256 * 1024**2
+_MAX_INDEX_BYTES: Final[int] = 32 * 1024**2
 
 
 class FingerprintMode(StrEnum):
@@ -102,6 +103,48 @@ def _candidate_files(root: Path, policy: FingerprintPolicy) -> tuple[list[Path],
     return sorted(metadata, key=key), sorted(weights, key=key)
 
 
+def _index_shards(index_path: Path) -> frozenset[str] | None:
+    if not index_path.is_file() or index_path.is_symlink():
+        return None
+    try:
+        if index_path.stat().st_size > _MAX_INDEX_BYTES:
+            return None
+        weight_map = json.loads(index_path.read_bytes()).get("weight_map")
+    except (OSError, UnicodeDecodeError, ValueError, AttributeError):
+        return None
+    if not isinstance(weight_map, dict):
+        return None
+    return frozenset(str(name) for name in weight_map.values())
+
+
+def _loader_weight_files(root: Path, weights: list[Path]) -> list[Path]:
+    """Return the weight files a Transformers ``from_pretrained`` load actually reads.
+
+    Checkpoints often ship alternate formats beside the Transformers weights, such as
+    Llama's ``original/consolidated.00.pth`` or Mistral's ``consolidated.safetensors``.
+    Summing every weight-like file in the tree reported those checkpoints at roughly
+    twice their real size, which also inflated the RAM/VRAM budget preflight. The
+    loader prefers SafeTensors and reads an index's shards when one exists.
+    """
+
+    top_level = [path for path in weights if path.parent == root]
+    for suffix, single, index in (
+        (".safetensors", "model.safetensors", "model.safetensors.index.json"),
+        (".bin", "pytorch_model.bin", "pytorch_model.bin.index.json"),
+    ):
+        candidates = [path for path in top_level if path.suffix.lower() == suffix]
+        if not candidates:
+            continue
+        listed = _index_shards(root / index)
+        if listed:
+            return [path for path in candidates if path.name in listed]
+        named = [path for path in candidates if path.name == single]
+        # Only unnamed SafeTensors are plausible weights; stray `.bin` files are
+        # usually pickled training state such as `training_args.bin`.
+        return named or (candidates if suffix == ".safetensors" else [])
+    return []
+
+
 def _manifest_digest(
     root: Path, files: list[Path], policy: FingerprintPolicy, *, weight: bool
 ) -> str:
@@ -151,7 +194,11 @@ def fingerprint_model_directory(
         if policy.mode is FingerprintMode.FULL
         else "metadata-and-weight-headers",
         file_count=len(metadata) + len(weights),
-        total_weight_bytes=sum(path.stat().st_size for path in weights),
+        # The identity above still hashes every weight file in the tree, so existing
+        # fingerprints are unchanged; only the loaded size is narrowed.
+        total_weight_bytes=sum(
+            path.stat().st_size for path in _loader_weight_files(resolved, weights)
+        ),
         metadata_digest=metadata_digest,
         weights_digest=weights_digest,
     )
