@@ -37,14 +37,26 @@ class ModelRootsUpdate(StrictRequest):
         return normalized
 
 
-class ChatCreate(StrictRequest):
+class _SystemPromptRequest(StrictRequest):
+    @field_validator("system_prompt", check_fields=False)
+    @classmethod
+    def blank_system_prompt_clears(cls, value: str | None) -> str | None:
+        """Whitespace-only clears the prompt; otherwise the author's text is kept verbatim."""
+
+        return value if value is not None and value.strip() else None
+
+
+class ChatCreate(_SystemPromptRequest):
     title: str = Field(default="New chat", max_length=200)
+    system_prompt: str | None = Field(default=None, alias="systemPrompt")
 
 
-class ChatUpdate(StrictRequest):
+class ChatUpdate(_SystemPromptRequest):
     title: str | None = Field(default=None, max_length=200)
     pinned: bool | None = None
     archived: bool | None = None
+    # Absent leaves the prompt unchanged (see model_fields_set); null or blank clears it.
+    system_prompt: str | None = Field(default=None, alias="systemPrompt")
 
 
 class MessageCreate(StrictRequest):
@@ -249,10 +261,11 @@ class PromptScoreRequest(StrictRequest):
     dtype: DType | None = None
 
 
-class ChatExportDescriptor(StrictRequest):
+class ChatExportDescriptor(_SystemPromptRequest):
     title: str = Field(max_length=200)
     pinned: bool = False
     archived: bool = False
+    system_prompt: str | None = None
 
 
 class ChatExportMessage(StrictRequest):

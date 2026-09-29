@@ -151,6 +151,7 @@ class WorkspaceService:
                     "title": chat["title"],
                     "pinned": bool(chat["pinned"]),
                     "archived": bool(chat["archived"]),
+                    "system_prompt": chat.get("system_prompt"),
                 },
                 "messages": [
                     {
@@ -262,6 +263,7 @@ class WorkspaceService:
                 "title": document.chat.title,
                 "pinned": document.chat.pinned,
                 "archived": document.chat.archived,
+                "system_prompt": document.chat.system_prompt,
             },
             messages=remapped_messages,
             runs=remapped_runs,

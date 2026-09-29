@@ -72,6 +72,7 @@ from .errors import (
     worker_failure_response,
 )
 from .persistence import Database, TelemetryWriter, WorkspaceRepository
+from .persistence.repository import UNSET
 from .services.events import EventBroker
 from .services.models import ModelRegistry
 from .services.runs import RunManager
@@ -247,6 +248,14 @@ def _is_frontend_shell_request(request: Request) -> bool:
 
 def _services(request: Request) -> ApplicationServices:
     return cast(ApplicationServices, request.app.state.services)
+
+
+def _check_system_prompt_size(services: ApplicationServices, value: str | None) -> None:
+    if value is not None and len(value.encode("utf-8")) > services.settings.limits.prompt_bytes:
+        raise PayloadTooLargeError(
+            "system prompt exceeds the configured byte limit",
+            details={"maximum_bytes": services.settings.limits.prompt_bytes},
+        )
 
 
 def _public_hardware(services: ApplicationServices) -> dict[str, Any]:
@@ -768,11 +777,15 @@ def create_app(
 
     @api.post("/chats", status_code=201)
     async def create_chat(request: Request, body: ChatCreate) -> dict[str, Any]:
-        return await _services(request).repository.create_chat(body.title)
+        services = _services(request)
+        _check_system_prompt_size(services, body.system_prompt)
+        return await services.repository.create_chat(body.title, body.system_prompt)
 
     @api.post("/chats/import", status_code=201)
     async def import_chat(request: Request, body: ChatWorkspaceDocument) -> dict[str, Any]:
-        return await _services(request).workspace.import_chat(body)
+        services = _services(request)
+        _check_system_prompt_size(services, body.chat.system_prompt)
+        return await services.workspace.import_chat(body)
 
     @api.get("/chats")
     async def list_chats(
@@ -808,8 +821,16 @@ def create_app(
 
     @api.patch("/chats/{chat_id}")
     async def update_chat(request: Request, chat_id: str, body: ChatUpdate) -> dict[str, Any]:
-        chat = await _services(request).repository.update_chat(
-            chat_id, title=body.title, pinned=body.pinned, archived=body.archived
+        services = _services(request)
+        _check_system_prompt_size(services, body.system_prompt)
+        chat = await services.repository.update_chat(
+            chat_id,
+            title=body.title,
+            pinned=body.pinned,
+            archived=body.archived,
+            system_prompt=(
+                body.system_prompt if "system_prompt" in body.model_fields_set else UNSET
+            ),
         )
         if chat is None:
             raise ChatNotFoundError("chat not found", details={"chat_id": chat_id})

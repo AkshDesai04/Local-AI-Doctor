@@ -71,6 +71,21 @@ def _generation_messages(lineage: list[dict[str, Any]]) -> list[dict[str, str]]:
     ]
 
 
+def _with_system_prompt(
+    messages: list[dict[str, str]], system_prompt: object
+) -> tuple[list[dict[str, str]], str | None]:
+    """Prepend the chat-level system prompt unless the lineage already opens with one.
+
+    Returns the messages plus the prompt that was actually applied (the run snapshot).
+    """
+
+    if not isinstance(system_prompt, str) or not system_prompt.strip():
+        return messages, None
+    if messages and messages[0]["role"] == "system":
+        return messages, None
+    return [{"role": "system", "content": system_prompt}, *messages], system_prompt
+
+
 def _rendered_history_bytes(messages: list[dict[str, str]]) -> int:
     """Measure the deterministic conversation envelope used by the fallback renderer."""
 
@@ -175,6 +190,7 @@ class RunManager:
                 )
         messages = _generation_messages(lineage)
         messages.append({"role": "user", "content": request.prompt})
+        messages, system_prompt = _with_system_prompt(messages, chat.get("system_prompt"))
         rendered_bytes = _rendered_history_bytes(messages)
         if rendered_bytes > self.settings.limits.prompt_bytes:
             raise InvalidRequestError(
@@ -196,6 +212,7 @@ class RunManager:
                 descriptor,
                 chat,
                 messages,
+                system_prompt,
                 run_id,
                 reservation,
             )
@@ -209,6 +226,7 @@ class RunManager:
         descriptor: ModelDescriptor,
         chat: Mapping[str, Any],
         messages: list[dict[str, str]],
+        system_prompt: str | None,
         run_id: str,
         reservation: InferenceReservation,
     ) -> dict[str, Any]:
@@ -257,6 +275,7 @@ class RunManager:
                 "instrumentation": instrumentation.value,
                 "deterministic_reference_mode": deterministic_reference_mode,
                 "reasoning": reasoning,
+                "system_prompt": system_prompt,
             },
             "effective_config": self.settings.inference_snapshot(),
             "reproducibility": reproducibility,
@@ -671,7 +690,11 @@ class RunManager:
             raise CapabilityUnavailableError(
                 "the source generation branch does not end in a user message"
             )
-        messages = _generation_messages(branch)
+        settings = dict(source.get("settings") or {})
+        messages, system_prompt = _with_system_prompt(
+            _generation_messages(branch), settings.get("system_prompt")
+        )
+        settings["system_prompt"] = system_prompt
         rendered_bytes = _rendered_history_bytes(messages)
         if rendered_bytes > self.settings.limits.prompt_bytes:
             raise InvalidRequestError(
@@ -684,7 +707,6 @@ class RunManager:
                 },
             )
 
-        settings = dict(source.get("settings") or {})
         try:
             sampling = SamplingRequest.model_validate(settings.get("sampling", {})).model_dump(
                 mode="json"
@@ -944,7 +966,11 @@ class RunManager:
             raise CapabilityUnavailableError(
                 "the source generation branch does not end in a user message"
             )
-        messages = _generation_messages(lineage)
+        settings = dict(source.get("settings") or {})
+        messages, system_prompt = _with_system_prompt(
+            _generation_messages(lineage), settings.get("system_prompt")
+        )
+        settings["system_prompt"] = system_prompt
         rendered_bytes = _rendered_history_bytes(messages)
         if rendered_bytes > self.settings.limits.prompt_bytes:
             raise InvalidRequestError(
@@ -960,7 +986,6 @@ class RunManager:
         if source_chat is None:
             raise CapabilityUnavailableError("the source generation chat no longer exists")
 
-        settings = dict(source.get("settings") or {})
         try:
             sampling = SamplingRequest.model_validate(settings.get("sampling", {})).model_dump(
                 mode="json"
@@ -1073,6 +1098,7 @@ class RunManager:
                     "tokenizer_fingerprint": source.get("tokenizer_fingerprint"),
                 },
                 assistant_metadata={"token_branch": branch_details},
+                system_prompt=system_prompt,
                 hardware=hardware_snapshot,
                 software=hardware_snapshot.get("software_versions", {}),
                 backend={
