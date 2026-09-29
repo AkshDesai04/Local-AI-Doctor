@@ -12,7 +12,7 @@ The codebase has four parts:
 - **Deployment**: hardened Docker Compose (CPU and NVIDIA profiles) that runs **only through WSL2** (`compose.yaml`, `Dockerfile`, `docker/`, `scripts/wsl-docker.ps1`).
 - **Desktop**: an Electron Windows installer wrapping a PyInstaller-built backend (`desktop/`).
 
-Version `0.1.3` (from `VERSION`).
+The version comes from the `VERSION` file at the repo root; read it there instead of relying on a number written in this document.
 
 ### Sources of truth, in priority order
 1. The owner's latest explicit request.
@@ -189,7 +189,7 @@ Shutdown runs in reverse: `runs.close()`, worker close with the grace period, `t
 ### 5.3 Request pipeline (`main.py`)
 Middleware order, outermost first:
 1. `trusted_host_transport`: Host allow-list against DNS rebinding. Allowed hosts are the server host, the hosts from `allowed_origins`, and loopback aliases when the server host is loopback. Otherwise 400 `host_rejected`.
-2. `CORSMiddleware`: allowed `allow_origins`, methods `GET, POST, PATCH, DELETE`.
+2. `CORSMiddleware`: allowed `allow_origins`, methods `GET, POST, PUT, PATCH, DELETE`.
 3. `RequestBodyLimitMiddleware`: JSON ≤ `limits.prompt_bytes + 1 MiB`, multipart ≤ `upload_bytes + 1 MiB`, else 413.
 4. `secure_transport`:
    - Bearer auth when `server.authentication_token` is set. Static-shell GETs are exempt. Otherwise 401 `authentication_required`.
@@ -200,7 +200,8 @@ Error shapes:
 - `WorkbenchError` → `{"error": exc.to_dict()}` with the class's `http_status`. See `errors.py` for the code→status map, e.g. `capability_unavailable` 409, `limit_exceeded` 429/413, `out_of_memory` 507, `worker_busy` 409.
 - Validation → 422 `invalid_request` with `details.issues`.
 - Uncaught errors → 500 `internal_error` with no text.
-- Some routes raise plain `HTTPException`, giving a `{"detail": …}` shape. Clients handle both shapes.
+- `WorkerFailure` (from load, unload, embeddings, prompt scoring) → the same envelope with the worker's code: out-of-memory → 507 `out_of_memory` (original code kept in `details.worker_code`), timeouts → 504, `model_worker_state_mismatch` → 409, anything else → 502 (`errors.worker_failure_response`).
+- Routes raise `WorkbenchError` subclasses (`ChatNotFoundError`, `RunNotFoundError`, `RunNotCancellableError`, `ConfirmationRequiredError`, `ModelNotLoadedError`, `NotFoundError`), so they return the envelope too. Only framework-level errors raised before a route runs (for example 405) still use `{"detail": …}`; clients handle both shapes.
 
 The WebSocket `/ws/v1/runs/{run_id}?after=N` checks Host (close 4403), auth via the `lad.auth.<base64url>` subprotocol or Bearer (close 4401), and Origin (4403). It then accepts with subprotocol `lad.events.v1`. A disconnect does **not** cancel the run.
 
@@ -245,7 +246,7 @@ Anything outside `/api` and `/ws` falls back to `frontend/dist/index.html`.
   - Sampling: max output 512, temperature 0.7, top-k 50, top-p 0.95, min-p 0, penalties 1/0/0, 10 alternatives.
   - Instrumentation `token`, queue limit 32.
   - Limits: prompt 4 MiB, upload 100 MiB, 16 attachments, 100k token events and 128 MiB of trace per run.
-  - Worker timeouts: startup 120 s, load 600 s, inference 3600 s, shutdown 15 s.
+  - Worker timeouts: startup 120 s, load 600 s, unload 60 s, inference 3600 s, shutdown 15 s.
 
 ### 5.5 Discovery and capabilities (`discovery/`)
 - **Scan:** depth 2 below each root, without following directory symlinks. A candidate folder has `config.json` or a SafeTensors file.
