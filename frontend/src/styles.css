@@ -529,11 +529,11 @@ button.attention-source-token:hover { border-color: var(--accent-strong); box-sh
 .context-hero strong { font-size: 14px; margin-top: 4px; }
 .context-bar { background: var(--surface-3); border-radius: 6px; display: flex; height: 11px; overflow: hidden; width: 100%; }
 .context-bar i { min-width: 0; }
-.context-bar .prompt, .context-legend .prompt { background: var(--accent); }
-.context-bar .template, .context-legend .template { background: var(--purple); }
-.context-bar .media, .context-legend .media { background: var(--blue); }
-.context-bar .generated, .context-legend .generated { background: var(--orange); }
-.context-bar .reserved, .context-legend .reserved { background: #626a66; }
+.context-bar .prompt, .context-legend .prompt { background: var(--viz-1); }
+.context-bar .template, .context-legend .template { background: var(--viz-3); }
+.context-bar .media, .context-legend .media { background: var(--viz-5); }
+.context-bar .generated, .context-legend .generated { background: var(--viz-2); }
+.context-bar .reserved, .context-legend .reserved { background: var(--viz-8); }
 .context-legend { display: grid; gap: 4px; }
 .context-legend > div { align-items: center; color: var(--muted); display: grid; font-size: 8.5px; gap: 6px; grid-template-columns: 7px 1fr auto; }
 .context-legend i { border-radius: 2px; height: 7px; width: 7px; }
