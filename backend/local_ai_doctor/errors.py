@@ -39,6 +39,8 @@ class ErrorCode(StrEnum):
     INVALID_LOGITS = "invalid_logits"
     INVALID_REQUEST = "invalid_request"
     LIMIT_EXCEEDED = "limit_exceeded"
+    INVALID_UPLOAD = "invalid_upload"
+    UNSUPPORTED_MEDIA_TYPE = "unsupported_media_type"
     WORKER_BUSY = "worker_busy"
     ACTIVE_RUN_CONFLICT = "active_run_conflict"
     RUN_NOT_CANCELLABLE = "run_not_cancellable"
@@ -192,6 +194,18 @@ class InvalidLogitsError(WorkbenchError):
 class InvalidRequestError(WorkbenchError):
     code = ErrorCode.INVALID_REQUEST
     http_status = 422
+
+
+class InvalidUploadError(WorkbenchError):
+    """The uploaded file itself is malformed, mislabeled, or undecodable."""
+
+    code = ErrorCode.INVALID_UPLOAD
+    http_status = 422
+
+
+class UnsupportedMediaTypeError(WorkbenchError):
+    code = ErrorCode.UNSUPPORTED_MEDIA_TYPE
+    http_status = 415
 
 
 class OutOfMemoryError(WorkbenchError):

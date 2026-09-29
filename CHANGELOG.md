@@ -37,6 +37,7 @@ This project follows a Keep a Changelog-style structure. Versions and dates are 
 - Editing a user message (a new user message under the same parent) now gets the next `branch_index` among its siblings instead of always `0`, matching how replay numbers assistant branches. Root messages are numbered per chat.
 - The browser-shaped `settings` object on `POST /runs` no longer overwrites an explicit `sampling` object or the top-level `deterministic_reference_mode` (`settings` now only fills fields that are not already set), and unknown or snake_case keys inside `settings` are rejected with 422 `invalid_request` instead of being silently dropped.
 - Unloading a model uses its own `workers.unload_timeout_seconds` (default 60, minimum 1) instead of `workers.shutdown_grace_seconds` (15). A slow unload previously timed out early, which recycled the whole worker process.
+- Uploads rejected because of the file itself (unrecognized signature, invalid filename, MIME type that contradicts the signature, invalid UTF-8, or media that fails decoding) now return HTTP 415 `unsupported_media_type` or 422 `invalid_upload` in the standard error envelope; they previously surfaced as a generic 500.
 
 ### Security
 

@@ -766,3 +766,33 @@ def test_unload_uses_its_own_timeout_not_the_shutdown_grace(
     assert api_settings.workers.shutdown_grace_seconds == 1.0
     assert observed == [api_settings.workers.unload_timeout_seconds]
     assert observed == [60.0]
+
+
+@pytest.mark.parametrize(
+    ("content", "content_type", "status", "code"),
+    [
+        (
+            b"\xfe\xfe\xfe not a known format",
+            "application/octet-stream",
+            415,
+            "unsupported_media_type",
+        ),
+        (b"a" * 4096 + b"\xff", "text/plain", 422, "invalid_upload"),
+        (b"\x89PNG\r\n\x1a\n" + bytes(32), "text/plain", 422, "invalid_upload"),
+    ],
+    ids=["unsupported-signature", "invalid-utf8", "mime-mismatch"],
+)
+def test_bad_uploads_return_client_error_envelopes(
+    api_client: TestClient, content: bytes, content_type: str, status: int, code: str
+) -> None:
+    model_id = api_client.get("/api/v1/models", headers=API_HEADERS).json()["models"][0]["id"]
+
+    response = api_client.post(
+        "/api/v1/attachments",
+        headers=API_HEADERS,
+        data={"model_id": model_id},
+        files={"file": ("upload.dat", content, content_type)},
+    )
+
+    assert response.status_code == status
+    assert response.json()["error"]["code"] == code

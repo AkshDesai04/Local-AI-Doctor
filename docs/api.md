@@ -178,6 +178,8 @@ The upload route determines type from content signature, not filename. It can id
 
 Accepted media is decoder-validated before the attachment record is created. Images undergo container verification plus dimension and animation-frame checks; video and audio streams are decoded while their bounds are enforced. Defaults cap an image at 40,000,000 pixels, video at 256 decoded frames and 8,500,000 pixels per frame, cumulative animated-image/video expansion at 500,000,000 pixels, and video/audio duration at 600 seconds. These values are configurable under `limits`.
 
+Upload failures caused by the file itself are client errors, not 500s: an unrecognized signature returns 415 `unsupported_media_type`; an invalid filename, a declared MIME type that contradicts the signature, invalid UTF-8 text, or media that fails decoder validation returns 422 `invalid_upload`. Oversized files and decode limits return 413 `limit_exceeded`, and a file the selected model cannot process returns 409 `capability_unavailable`.
+
 Embedding request:
 
 ```json
