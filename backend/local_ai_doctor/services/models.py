@@ -18,7 +18,7 @@ from ..errors import (
 )
 from ..hardware.models import BackendKind, HardwareInventory, HardwareSelection
 from ..hardware.probe import SystemHardwareProbe
-from ..hardware.selection import select_hardware
+from ..hardware.selection import available_backends, select_hardware
 from ..persistence import WorkspaceRepository
 from ..workers import InferenceReservation, ModelWorkerSupervisor, SingleWorkerAdmission
 
@@ -45,14 +45,10 @@ class ModelRegistry:
 
     async def refresh(self) -> ModelScanReport:
         self.hardware = self._discover_hardware()
-        backends = {BackendKind.CPU}
-        for device in self.hardware.accelerators:
-            if device.runtime_available:
-                backends.add(device.backend)
         scanner = ModelScanner(
             self.settings.paths.model_roots,
             conservative_context_limit=self.settings.inference.conservative_context_limit,
-            available_backends=frozenset(backends),
+            available_backends=available_backends(self.hardware),
         )
         self.report = await asyncio.to_thread(scanner.scan)
         self._models = self.report.by_id
@@ -102,17 +98,7 @@ class ModelRegistry:
         report = self.report
         if report is None:
             return {"models": [], "roots": []}
-        return {
-            "models": self.public_models(),
-            "roots": [
-                {
-                    "root": f"<model-root:{index}>",
-                    "discovered_count": result.discovered_count,
-                    "diagnostics": [item.model_dump(mode="json") for item in result.diagnostics],
-                }
-                for index, result in enumerate(report.roots)
-            ],
-        }
+        return {"models": self.public_models(), "roots": report.public_roots()}
 
     def choose_hardware(
         self,

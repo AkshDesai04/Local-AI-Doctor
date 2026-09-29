@@ -10,8 +10,10 @@ from pathlib import Path
 
 import uvicorn
 
-from .config import AppSettings, SettingsLoader
+from .config import AppSettings, DeviceMode, SettingsLoader
 from .discovery.scanner import ModelScanner
+from .hardware.probe import SystemHardwareProbe
+from .hardware.selection import available_backends
 
 
 def _settings(arguments: Sequence[str]) -> AppSettings:
@@ -35,11 +37,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(settings.redacted_effective_config(), indent=2))
         return 0
     if known.command == "scan":
+        # Probe the same way the server does, so CUDA support is not reported as
+        # unavailable merely because the CLI skipped hardware discovery.
+        hardware = SystemHardwareProbe().discover(
+            probe_runtime=settings.runtime.device is not DeviceMode.CPU
+        )
         report = ModelScanner(
             settings.paths.model_roots,
             conservative_context_limit=settings.inference.conservative_context_limit,
+            available_backends=available_backends(hardware),
         ).scan()
-        print(json.dumps({"models": [model.public_dict() for model in report.models]}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "models": [model.public_dict() for model in report.models],
+                    "roots": report.public_roots(),
+                },
+                indent=2,
+            )
+        )
         return 0
     uvicorn.run(
         "local_ai_doctor.main:create_app",

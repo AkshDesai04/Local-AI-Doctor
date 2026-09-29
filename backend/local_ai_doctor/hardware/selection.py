@@ -36,6 +36,15 @@ def _cpu_dtype(requested: DType) -> tuple[DType, list[str]]:
     return requested, warnings
 
 
+def available_backends(inventory: HardwareInventory) -> frozenset[BackendKind]:
+    """Backends the capability matrix may advertise: CPU plus runtime-usable devices."""
+
+    return frozenset(
+        {BackendKind.CPU}
+        | {device.backend for device in inventory.accelerators if device.runtime_available}
+    )
+
+
 def select_hardware(
     inventory: HardwareInventory,
     requested: DeviceMode,

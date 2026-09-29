@@ -654,3 +654,47 @@ def test_empty_and_gguf_only_folders_get_root_diagnostics(
     public = json.dumps(report.public_roots())
     assert str(tmp_path).replace("\\", "\\\\") not in public
     assert "Quantized-GGUF" in public
+
+
+def test_cli_scan_reports_probed_backends_and_root_diagnostics(
+    causal_model_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from local_ai_doctor import cli
+    from local_ai_doctor.config import AppSettings
+    from local_ai_doctor.hardware.models import (
+        AcceleratorDevice,
+        CPUInfo,
+        HardwareInventory,
+        MemoryInfo,
+    )
+
+    (tmp_path / "Empty").mkdir()
+    inventory = HardwareInventory(
+        operating_system="test",
+        os_release="1",
+        python_version="3.12",
+        cpu=CPUInfo(logical_cores=1, architecture="x86_64"),
+        memory=MemoryInfo(source="test"),
+        accelerators=(
+            AcceleratorDevice(
+                backend=BackendKind.CUDA,
+                index=0,
+                name="gpu",
+                identifier="cuda:0",
+                runtime_available=True,
+            ),
+        ),
+    )
+    settings = AppSettings.model_validate({"paths": {"model_roots": [str(tmp_path)]}})
+    monkeypatch.setattr(cli, "_settings", lambda _arguments: settings)
+    monkeypatch.setattr(cli.SystemHardwareProbe, "discover", lambda _self, **_kwargs: inventory)
+
+    assert cli.main(["scan"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    model = output["models"][0]
+    assert model["capabilities"]["entries"]["cuda"]["state"] == "full"
+    assert output["roots"][0]["diagnostics"][0]["code"] == "empty_model_directory"
