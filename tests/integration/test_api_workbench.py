@@ -705,8 +705,8 @@ def test_resource_and_conflict_errors_use_the_error_envelope(
 
     error_of(
         api_client.post("/api/v1/runs/missing/cancel", headers=API_HEADERS),
-        409,
-        "run_not_cancellable",
+        404,
+        "run_not_found",
     )
     error_of(
         api_client.delete("/api/v1/chats", headers=API_HEADERS, params={"confirm": "false"}),
@@ -796,3 +796,24 @@ def test_bad_uploads_return_client_error_envelopes(
 
     assert response.status_code == status
     assert response.json()["error"]["code"] == code
+
+
+def test_cancelling_a_finished_run_conflicts_but_a_missing_run_is_not_found(
+    api_client: TestClient,
+) -> None:
+    services = api_client.app.state.services
+    portal = api_client.portal
+    assert portal is not None
+    portal.call(
+        services.repository.create_run,
+        {"id": "finished-run", "status": "complete", "effective_seed": 0},
+    )
+
+    finished = api_client.post("/api/v1/runs/finished-run/cancel", headers=API_HEADERS)
+    assert finished.status_code == 409
+    assert finished.json()["error"]["code"] == "run_not_cancellable"
+
+    missing = api_client.post("/api/v1/runs/never-existed/cancel", headers=API_HEADERS)
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "run_not_found"
+    assert missing.json()["error"]["details"] == {"run_id": "never-existed"}

@@ -99,7 +99,7 @@ The portable document uses `"schema":"local-ai-doctor/chat-workspace"` and `"sch
 | --- | --- | --- |
 | `POST` | `/runs` or `/runs/generation` | Persist and schedule a generation; returns 202 immediately. |
 | `GET` | `/runs/{run_id}` | Run record, token rows/alternatives, phase metrics, environment snapshot, and terminal summary when present. |
-| `POST` | `/runs/{run_id}/cancel` | Request cancellation for queued/loading/running work. |
+| `POST` | `/runs/{run_id}/cancel` | Request cancellation for queued/loading/running work. An unknown run returns 404 `run_not_found`; a run that has already finished returns 409 `run_not_cancellable`. |
 | `POST` | `/runs/{run_id}/replay` | Schedule a new generation from a completed run as a sibling assistant branch. |
 | `GET` | `/runs/{run_id}/export?format=json` | Run metadata and token rows. |
 | `GET` | `/runs/{run_id}/export?format=jsonl` | Durable raw protocol events as NDJSON. |

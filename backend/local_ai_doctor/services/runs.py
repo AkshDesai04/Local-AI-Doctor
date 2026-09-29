@@ -25,6 +25,7 @@ from ..errors import (
     CapabilityUnavailableError,
     ChatNotFoundError,
     InvalidRequestError,
+    RunNotFoundError,
     WorkbenchError,
 )
 from ..persistence import TelemetryWriter, WorkspaceRepository
@@ -595,7 +596,9 @@ class RunManager:
 
     async def cancel(self, run_id: str) -> bool:
         run = await self.repository.get_run(run_id)
-        if run is None or run["status"] not in {"queued", "loading", "running"}:
+        if run is None:
+            raise RunNotFoundError("run not found", details={"run_id": run_id})
+        if run["status"] not in {"queued", "loading", "running"}:
             return False
         reservation = self._reservations.get(run_id)
         if reservation is not None and reservation.cancel_if_waiting():
