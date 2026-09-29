@@ -1,4 +1,3 @@
-import { Maximize2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { TokenEvent } from "../api/types";
 import { displayTokenText, formatNumber } from "../utils/format";
@@ -56,7 +55,6 @@ export function TraceChart({ title, tokens, metrics, revealTokenText = false, se
         <div><span className="eyebrow">Token position on x-axis</span><h3>{title}</h3></div>
         <div className="chart-actions">
           <label>Window <select onChange={(event) => setWindowSize(event.target.value as "128" | "512" | "all")} value={windowSize}><option value="128">128</option><option value="512">512</option><option value="all">All</option></select></label>
-          <Maximize2 size={14} />
         </div>
       </div>
       {tokens.length === 0 || allValues.length === 0 ? (

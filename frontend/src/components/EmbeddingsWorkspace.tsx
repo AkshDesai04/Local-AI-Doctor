@@ -61,7 +61,7 @@ function vectorLabel(vector: EmbeddingVector, run: EmbeddingRun): string {
   return run.inputs.find((input) => input.id === vector.inputId)?.label ?? vector.inputId;
 }
 
-function npyBlob(run: EmbeddingRun): Blob {
+function npyBuffer(run: EmbeddingRun): ArrayBuffer {
   const rows = run.vectors.length;
   const columns = run.outputDimensions;
   const dictionary = `{'descr': '<f4', 'fortran_order': False, 'shape': (${String(rows)}, ${String(columns)}), }`;
@@ -82,7 +82,7 @@ function npyBlob(run: EmbeddingRun): Blob {
       offset += 4;
     }
   }
-  return new Blob([buffer], { type: "application/octet-stream" });
+  return buffer;
 }
 
 function VectorRow({ vector, run }: { vector: EmbeddingVector; run: EmbeddingRun }): React.ReactNode {
@@ -205,7 +205,7 @@ export function EmbeddingsWorkspace({ models, selectedModelId, connected, onSele
           {!run ? <div className="embedding-results-empty"><div><Boxes size={20} /></div><strong>No embedding run yet</strong><p>Results will appear exactly as returned by the local model. Nothing here is demonstration data.</p></div> : (
             <>
               <div className="embedding-run-summary"><div><span>Run</span><code>{run.id}</code></div><div><span>Shape</span><strong>{String(run.vectors.length)} × {String(run.outputDimensions)}</strong></div><div><span>Pooling</span><strong>{run.pooling ?? "Not reported"}</strong></div><div><span>Total</span><strong>{formatDuration(run.totalMs)}</strong></div><div><span>Normalized</span><strong>{run.normalized ? "Yes" : "No"}</strong></div></div>
-              <div className="export-row"><span>{run.jointSpace === undefined ? "Joint space not reported" : run.jointSpace ? "Joint multimodal space" : "Modality-specific space"}</span><div><button onClick={() => downloadBlob(`embeddings-${run.id}.json`, JSON.stringify(run, null, 2), "application/json")} type="button"><FileJson size={13} /> JSON</button><button onClick={exportCsv} type="button"><Download size={13} /> CSV</button><button onClick={() => { const blob = npyBlob(run); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = `embeddings-${run.id}.npy`; anchor.click(); URL.revokeObjectURL(url); }} type="button"><Download size={13} /> NumPy</button></div></div>
+              <div className="export-row"><span>{run.jointSpace === undefined ? "Joint space not reported" : run.jointSpace ? "Joint multimodal space" : "Modality-specific space"}</span><div><button onClick={() => downloadBlob(`embeddings-${run.id}.json`, JSON.stringify(run, null, 2), "application/json")} type="button"><FileJson size={13} /> JSON</button><button onClick={exportCsv} type="button"><Download size={13} /> CSV</button><button onClick={() => downloadBlob(`embeddings-${run.id}.npy`, npyBuffer(run), "application/octet-stream")} type="button"><Download size={13} /> NumPy</button></div></div>
               {activeTab === "vectors" && <div className="vector-list">{run.vectors.map((vector) => <VectorRow key={vector.inputId} run={run} vector={vector} />)}</div>}
               {activeTab === "similarity" && <div className="similarity-wrap"><div className="similarity-matrix" style={{ gridTemplateColumns: `minmax(90px, 1fr) repeat(${String(run.vectors.length)}, minmax(64px, 1fr))` }}><div /><>{run.vectors.map((vector, index) => <strong key={vector.inputId}>{String(index + 1)}<small>{vectorLabel(vector, run)}</small></strong>)}</>{run.vectors.flatMap((row, rowIndex) => [<strong key={`row-${row.inputId}`}>{String(rowIndex + 1)}<small>{vectorLabel(row, run)}</small></strong>, ...run.vectors.map((column, columnIndex) => { const value = similarity[rowIndex]?.[columnIndex]; return <span key={`${row.inputId}-${column.inputId}`} style={{ "--similarity": String(Math.max(0, value ?? 0)) } as React.CSSProperties}>{formatNumber(value, 4)}</span>; })])}</div><p className="footnote">Cosine similarity is computed from returned vectors when the backend does not provide a matrix.</p></div>}
               {activeTab === "projection" && (run.projection?.length ? <div className="projection-view"><svg viewBox="0 0 640 400">{run.projection.map((point, index) => <g key={point.inputId} transform={`translate(${String(40 + point.x * 560)} ${String(360 - point.y * 320)})`}><circle r="7" /><text x="11" y="4">{run.inputs.find((input) => input.id === point.inputId)?.label ?? String(index + 1)}</text></g>)}</svg><p className="footnote">Model/backend-provided projection; axes do not preserve original feature meaning.</p></div> : <div className="embedding-results-empty"><div><BarChart3 size={19} /></div><strong>No projection returned</strong><p>PCA or UMAP coordinates must be explicitly computed and labeled by the backend. The UI will not invent coordinates.</p></div>)}
