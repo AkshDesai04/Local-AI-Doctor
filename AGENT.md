@@ -417,7 +417,7 @@ Shutdown cancels orchestration, asks the worker to unload and exit, drains telem
 1. Validate request shape, model capability, prompt byte limit, chat/parent, seed, sampling, and admission.
 2. Resolve hardware/device/dtype, then persist the user message, pending assistant, queued run, model fingerprint, and reproducibility snapshot.
 3. Emit `run_created`, load/reuse the selected model, and transition the run to `running`.
-4. Reconstruct the selected conversation branch and render the tokenizer chat template with `add_generation_prompt=true`, or use the documented deterministic fallback when no template exists.
+4. Reconstruct the selected conversation branch, lead it with the chat's system prompt when set (unless the branch already begins with a system message), and render the tokenizer chat template with `add_generation_prompt=true`, or use the documented deterministic fallback when no template exists. A template that raises on or drops the system role gets it prepended to the first user message instead, with a `system_prompt_merged` warning. The applied prompt is snapshotted in `settings.system_prompt`.
 5. Tokenize with `add_special_tokens=false` because the template owns special-token behavior. The plain-text fallback has no template, so it prepends the BOS token the tokenizer inserts by default.
 6. For causal generation, prefill and reuse KV cache, passing absolute `cache_position` to every decoder call (multimodal-RoPE families such as Qwen3-VL derive decode positions from it). For encoder-decoder generation, encode source once, resolve the decoder-start token, and reuse encoder outputs/decoder cache.
 7. Run the owned sampling pipeline, emit bounded events, persist according to policy, checkpoint partial message text every eight tokens, and check cancellation between bounded units.
@@ -466,14 +466,14 @@ For supported tagged reasoning models, if the configured output budget ends befo
 Normal replay:
 
 - Requires a completed generation, intact model ID/fingerprint, and valid message lineage.
-- Reconstructs the source branch and recorded settings.
+- Reconstructs the source branch and recorded settings, including the recorded `settings.system_prompt` snapshot rather than the chat's current prompt.
 - Creates a sibling assistant branch linked by `parent_run_id`.
 
 Alternative-token branching:
 
 - Validates the exact source run, token index, distribution (`raw` or `sampler`), alternative rank, and token ID.
 - Reconstructs the prefix through the selected decision point, forces the chosen alternative, and continues locally.
-- Creates a new chat and new run; source records remain immutable.
+- Creates a new chat and new run; source records remain immutable. The new chat inherits the source run's system prompt snapshot.
 - Must preserve reproducibility metadata and make the forced-token decision explicit in persisted state/telemetry.
 
 The canonical route is `POST /api/v1/runs/{run_id}/branch`. Its request identifies `tokenIndex`, `distribution`, `rank`, and `tokenId`. The source must be complete, its model/fingerprint must still match, token rows through the branch point must be contiguous and durable, and the requested alternative must match a persisted raw or sampler alternative exactly. The runtime forces the original prefix through token `N-1`, substitutes the selected token at `N`, advances cache through the forced prefix, then samples the suffix normally. The new run intentionally has no cross-chat `parent_run_id`; provenance is stored separately so workspace export does not create a dangling cross-chat foreign key.
@@ -618,12 +618,12 @@ The current returned similarity matrix is a dot product. It is cosine similarity
 
 SQLite uses one WAL-mode connection, foreign keys, explicit transactions, indexed queries, append-only migrations, and a write lock. Existing databases are backed up before pending migrations.
 
-Current migrations cover the initial schema, reasoning slices, and token attention attribution. Never edit an already released migration; add the next migration and test upgrade, backup, restart, and failure behavior.
+Current migrations cover the initial schema, reasoning slices, token attention attribution, and the per-chat system prompt (`chats.system_prompt`). Never edit an already released migration; add the next migration and test upgrade, backup, restart, and failure behavior.
 
 Persistent concepts include:
 
 - Models, fingerprints, diagnostics, and capabilities.
-- Chats, branched messages, and attachment links.
+- Chats (with an optional system prompt), branched messages, and attachment links.
 - Content-addressed attachment metadata.
 - Generation runs and replay parentage.
 - Environment/configuration snapshots and phase metrics.
@@ -887,6 +887,7 @@ The composer-side prompt popover applies to the next response and exposes:
 - Temperature slider.
 - Top-k slider.
 - Top-p slider.
+- A "System prompt" textarea for the active chat. Edits are saved with a debounced `PATCH` and flushed before a send; a chat that does not exist yet keeps the text locally and sends it with the create request. A composer icon labelled "System prompt active" and a collapsed "System prompt" card at the top of the conversation show when one is set.
 
 It is mutually exclusive with the attachment popover and closes while disconnected, unsupported, running, or branching. Enter sends; Shift+Enter inserts a newline. Stop explicitly preserves partial output.
 

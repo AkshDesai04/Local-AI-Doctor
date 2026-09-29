@@ -208,7 +208,7 @@ The WebSocket `/ws/v1/runs/{run_id}?after=N` checks Host (close 4403), auth via 
 Routes (all under `/api/v1`):
 - **Service:** `health`, `configuration`, `GET/PUT configuration/model-roots`, `hardware`, `storage`, `DELETE storage/telemetry?before=<tz-aware>&confirm=true`.
 - **Models:** `models`, `models/refresh`, `models/{id}/load` (body `{device?,dtype?}`), `models/unload`, `models/{id}/unload`, `models/{id}/inspect`.
-- **Chats:** `chats` (POST, GET `?search=&archived=`), `chats/import`, `chats/{id}` (GET, PATCH, DELETE), `chats/{id}/export`, `chats/{id}/messages` (GET, POST), `DELETE chats?confirm=true&include_archived=`.
+- **Chats:** `chats` (POST, GET `?search=&archived=`; POST/PATCH accept `systemPrompt`), `chats/import`, `chats/{id}` (GET, PATCH, DELETE), `chats/{id}/export`, `chats/{id}/messages` (GET, POST), `DELETE chats?confirm=true&include_archived=`.
 - **Runs:**
   - `runs` or `runs/generation` (202; returns `runId`, `messageId`, `websocketUrl` plus `run`/`user_message`/`assistant_message`)
   - `runs/{id}` (run with `tokens`, `branchable_through_token_index`, `phases`, `environment`, `summary`, `warnings`)
@@ -296,7 +296,7 @@ Anything outside `/api` and `/ws` falls back to `frontend/dist/index.html`.
 Cancel works in two ways. A run still waiting in the queue is cancelled in place (`cancelled_before_start`). A running run is cancelled through the worker cancel event, which is checked between decode steps.
 
 Inside the worker (`_generate_impl`):
-1. Renders the chat template with `add_generation_prompt=True`. The request's `reasoning` is forwarded as `enable_thinking` only to compatible templates. Without a template, a deterministic "Role: content" fallback is used and a `chat_template_unavailable` warning is emitted.
+1. Renders the chat template with `add_generation_prompt=True`. `create_generation` leads the branch with the chat's `system_prompt` (unless the lineage already starts with a system message) and snapshots it as `settings.system_prompt`; replay and token branch reuse the source run's snapshot. `_render_messages` folds the system text into the first user turn when the template raises or drops it and reports renderer `chat_template_system_merged`, which emits a `system_prompt_merged` warning. The request's `reasoning` is forwarded as `enable_thinking` only to compatible templates. Without a template, a deterministic "Role: content" fallback is used and a `chat_template_unavailable` warning is emitted.
 2. Tokenizes with `add_special_tokens=False`. Only for the plain-text fallback, the BOS the tokenizer inserts by default (`_default_bos_token_id`) is prepended, because no template wrote it.
 3. Causal models prefill, then reuse the KV cache. Every decoder-body call passes `cache_position` (derived from attention-mask length minus new tokens); Qwen3-VL computes decode positions from it plus prefill `rope_deltas`, so omitting it put every decoded token at position 0. Families rejecting the keyword fall back without it. Encoder-decoder models encode once and resolve the decoder start token.
 4. The owned sampler runs, penalties first (`_apply_penalties`), then `_filter_distribution`. Fixed order: repetition → frequency → presence → temperature (0 = argmax) → top-k → top-p → min-p → renormalize → `torch.multinomial` with a seeded `torch.Generator`.
@@ -345,10 +345,10 @@ Inside the worker (`_generate_impl`):
 
 ### 5.9 Persistence (`persistence/`)
 - One aiosqlite connection, WAL, foreign keys, a write lock, and explicit transactions. **All SQL lives in `repository.py`**, except the token and alternative INSERTs in `runs.py` and the raw-event INSERT in `main.py`, which go through `TelemetryWriter.submit`.
-- Migrations: `0001_initial.sql`, `0002_token_reasoning_slices.sql` (`reasoning_slices_json`), `0003_token_attention_attribution.sql` (`attention_attribution_json`). They are **append-only**: add `000N_*.sql` and never edit an applied one.
+- Migrations: `0001_initial.sql`, `0002_token_reasoning_slices.sql` (`reasoning_slices_json`), `0003_token_attention_attribution.sql` (`attention_attribution_json`), `0004_chat_system_prompt.sql` (`chats.system_prompt`). They are **append-only**: add `000N_*.sql` and never edit an applied one.
 - Tables:
   - `models` and `model_capabilities`
-  - `chats` (pinned, archived) and `messages` (a parent_id tree with `branch_index`; status `pending|streaming|complete|cancelled|failed`)
+  - `chats` (pinned, archived, optional `system_prompt`) and `messages` (a parent_id tree with `branch_index`; status `pending|streaming|complete|cancelled|failed`)
   - `attachments` (sha256, content-addressed) and `message_attachments`
   - `inference_runs` (kind `generation|embedding|prompt_score|benchmark`; status `queued|loading|running|complete|cancelled|failed|disconnected`; seeds, settings/effective_config/reproducibility JSON, timestamps)
   - `environment_snapshots` and `phase_metrics`
@@ -389,7 +389,7 @@ Inside the worker (`_generate_impl`):
   - Nerd Mode shows raw tokens colored by raw probability, sampler probability, surprise, latency, or segment. Clicking a token locks the inspector selection, which exposes raw and sampler alternatives and "Branch out with selected token". Very old token boundaries collapse past 1,200.
   - Token chips are a fixed 30 px high and use `displayTokenText`/`tokenTextHint`, keeping the raw piece in the tooltip.
 - **Inspector tabs:** Overview, Tokens, Probability, Timing, Experts, Context, Embeddings, Hardware, Configuration, Raw Events. Each is capability-gated with an exact reason, and none is ever filled with fake data. Chart tooltips outside Nerd Mode must not leak hidden token text.
-- **Composer:** a popover sets reasoning, temperature, top-k, and top-p for the next response. Enter sends and Shift+Enter inserts a newline. `GenerationControls` exposes the full settings: token, device, dtype, instrumentation, seed, deterministic mode, all sampler knobs, stop sequences, and reset to backend defaults. Ctrl/Cmd+K creates a new chat when connected.
+- **Composer:** a popover sets reasoning, temperature, top-k, top-p, and the chat's system prompt (`useWorkbench` debounces the PATCH by 500 ms, flushes it before submit, and keeps a draft for a chat without an id until create). A "System prompt active" composer icon and a collapsed card at the top of `ChatView` show it. Enter sends and Shift+Enter inserts a newline. `GenerationControls` exposes the full settings: token, device, dtype, instrumentation, seed, deterministic mode, all sampler knobs, stop sequences, and reset to backend defaults. Ctrl/Cmd+K creates a new chat when connected.
 - **Styling and accessibility:**
   - Accent blue `#60a5fa`, never green. DM Sans for UI, JetBrains Mono for data.
   - Dense text has a 10–11 px floor.

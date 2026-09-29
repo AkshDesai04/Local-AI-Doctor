@@ -13,6 +13,7 @@ Despite the name, this is a model-diagnostics tool. It is not a medical product 
 - Teacher-forced prompt scoring for causal generation models.
 - SentenceTransformers text, image, video, and mixed-input embeddings where the selected checkpoint exposes those modalities, with truncation and re-normalization only for reviewed model-specific dimension contracts.
 - Persistent chats, runs, partial output, telemetry, attachments, portable chat-workspace import/export, branch-aware run replay, and confirmed terminal-run retention in SQLite and content-addressed storage.
+- Per-chat system prompts, set from the composer's prompt controls, stored with the chat, snapshotted on every run, and reused unchanged by replay and token branching.
 - CPU and CUDA selection, one-model-at-a-time lifecycle management, bounded single-worker admission, a responsive React workbench, and hardened CPU/NVIDIA container definitions.
 
 Support remains capability-gated. Discovery does not imply that every Transformers architecture or modality can run. Unknown or incomplete model folders remain visible with diagnostics instead of being guessed into a working state. See [Known limitations](docs/limitations.md) and the [supplied-model capability report](docs/model-capability-report.md).

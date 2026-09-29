@@ -80,20 +80,22 @@ In the scan report, each descriptor's `dtype` is the SafeTensors header dtype th
 
 | Method | Path | Result |
 | --- | --- | --- |
-| `POST` | `/chats` | Create a chat; body is `{}` or `{"title":"..."}`. |
+| `POST` | `/chats` | Create a chat; body is `{}` or `{"title":"...","systemPrompt":"..."}`. |
 | `POST` | `/chats/import` | Validate and import a version-1 portable chat workspace, remapping message/run IDs. |
 | `GET` | `/chats?search=&archived=false` | Up to 100 chats, pinned first and then most recently updated. |
 | `GET` | `/chats/{chat_id}` | Chat and ordered messages. |
 | `GET` | `/chats/{chat_id}/export` | Download a path-free version-1 chat workspace JSON document. |
 | `GET` | `/chats/{chat_id}/messages` | Ordered message list only. |
-| `PATCH` | `/chats/{chat_id}` | Change any of `title`, `pinned`, or `archived`. |
+| `PATCH` | `/chats/{chat_id}` | Change any of `title`, `pinned`, `archived`, or `systemPrompt`. |
 | `DELETE` | `/chats/{chat_id}` | Delete a chat and cascading messages/runs/telemetry. Returns 204. |
 | `DELETE` | `/chats?confirm=true&include_archived=false` | Explicit bulk deletion; returns count. |
 | `POST` | `/chats/{chat_id}/messages` | Create a standalone system/user/assistant/tool message with optional parent, branch index, and attachment IDs. |
 
 Generated messages are normally created through the run endpoint so run identity, status, and partial output remain linked.
 
-The portable document uses `"schema":"local-ai-doctor/chat-workspace"` and `"schema_version":1`. It carries chat metadata, branched messages, runs, token rows, and bounded token alternatives. It deliberately excludes filesystem paths, attachments/upload bytes, raw WebSocket events, environment/phase rows, and embedding vectors. Import rejects unknown fields, duplicate IDs, missing parents, cycles, duplicate token indices/alternatives, and unsupported versions. All message/run IDs are regenerated; source IDs are retained only as import provenance. A run whose model ID is absent from the destination registry is imported with `model_id=null` while its recorded fingerprint remains. Runs/messages captured in a non-terminal state are imported as failed snapshots rather than resumed.
+Chat objects carry `system_prompt` (`null` when unset). `POST /chats` and `PATCH /chats/{chat_id}` accept it as `system_prompt` or `systemPrompt`. On `PATCH`, an absent field leaves the prompt unchanged, while `null`, an empty string, or whitespace-only text clears it; any other text is stored exactly as sent. The UTF-8 byte length is bounded by `limits.prompt_bytes` and a larger value is rejected with a structured 413 `limit_exceeded`. The prompt is chat-level state, not a message: it does not appear in `messages`.
+
+The portable document uses `"schema":"local-ai-doctor/chat-workspace"` and `"schema_version":1`. It carries chat metadata (including the optional `system_prompt`, validated like `PATCH`), branched messages, runs, token rows, and bounded token alternatives. It deliberately excludes filesystem paths, attachments/upload bytes, raw WebSocket events, environment/phase rows, and embedding vectors. Import rejects unknown fields, duplicate IDs, missing parents, cycles, duplicate token indices/alternatives, and unsupported versions. All message/run IDs are regenerated; source IDs are retained only as import provenance. A run whose model ID is absent from the destination registry is imported with `model_id=null` while its recorded fingerprint remains. Runs/messages captured in a non-terminal state are imported as failed snapshots rather than resumed.
 
 ### Generation and scoring
 
@@ -151,6 +153,8 @@ The response includes camel-case convenience fields and canonical objects:
   "assistant_message": {}
 }
 ```
+
+When the chat has a system prompt, generation prepends it as a `system` message to the reconstructed branch (unless the branch already begins with a system message, which then wins). The rendered-history byte check includes it, and the applied text is snapshotted into the run as `settings.system_prompt` (`null` when none was applied). Replay and token branching use the source run's snapshot, never the chat's current prompt, so editing the prompt later does not change a replay; a token branch's new chat inherits the snapshot. The JSON run export shows it under `run.settings`. When the model's chat template has no system role (it raises, or its output omits the system text), the worker re-renders with the prompt prepended to the first user message and emits a `warning` event with code `system_prompt_merged`; the `prefill` stage reports `prompt_renderer` as `chat_template_system_merged`.
 
 Generation attachments are rejected by the current adapter. `seed` accepts the full unsigned 64-bit range and zero is valid. JavaScript clients should preserve large returned seeds as strings.
 
@@ -244,7 +248,7 @@ Sequence numbers are per run and begin at one. They order the live stream and, f
 | `model_loaded` | lifecycle, device/dtype selection, load duration, and memory. |
 | `metric` | sampler order, seed/RNG, prefill, and prompt throughput. |
 | `token` | token identity, selected sampler likelihood, timing, decoded replacement, and segment; exact raw likelihood/rank, entropy/perplexity, and alternatives are populated only at `token`/`full`/`expert` instrumentation. |
-| `warning` | bounded model/runtime warning. |
+| `warning` | bounded model/runtime warning, for example `system_prompt_merged`. |
 | `completed` | finish reason, response/segment metrics, throughput, memory, and routing applicability. |
 | `cancelled` | same terminal summary shape with cancellation finish reason. |
 | `error` | structured failure code, message, and optional hint. |
