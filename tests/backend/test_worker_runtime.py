@@ -242,6 +242,10 @@ class FakeTorch(ModuleType):
     def full_like(tensor: FakeTensor, value: float) -> FakeTensor:
         return FakeTensor(np.full_like(tensor.values, value, dtype=np.float32))
 
+    @staticmethod
+    def arange(start: int, end: int, **_kwargs: Any) -> FakeTensor:
+        return FakeTensor(np.arange(start, end))
+
 
 class FakeQueue:
     def __init__(self) -> None:
@@ -494,6 +498,212 @@ def configured_reasoning_runtime(
     runtime.decoder_start_token_id = 1
     runtime.decoder_start_token_source = "config.decoder_start_token_id"
     return runtime, output
+
+
+class BosTokenizer(FakeTokenizer):
+    """A base-model tokenizer that inserts BOS by default, like Llama 3.2's."""
+
+    bos_token_id = 1
+
+    def __init__(self, *, adds_bos: bool = True, chat_template: str | None = None) -> None:
+        self.adds_bos = adds_bos
+        self.chat_template = chat_template
+
+    def apply_chat_template(self, _messages: Any, **_options: Any) -> str:
+        return "summarize this"
+
+    def __call__(self, text: str, **kwargs: Any) -> Any:
+        if text == "":
+            return {"input_ids": [1] if self.adds_bos and kwargs["add_special_tokens"] else []}
+        return super().__call__(text, **kwargs)
+
+
+class RecordingCausalModel:
+    """Greedy fixture that emits token 2 twice, then EOS, recording every call."""
+
+    def __init__(self, *, reject: frozenset[str] = frozenset()) -> None:
+        self.config = SimpleNamespace(is_encoder_decoder=False, eos_token_id=3)
+        self.generation_config = SimpleNamespace(eos_token_id=3)
+        self.calls: list[dict[str, Any]] = []
+        self.reject = reject
+
+    def __call__(self, **kwargs: Any) -> Any:
+        rejected = self.reject.intersection(kwargs)
+        if rejected:
+            raise TypeError(f"unexpected keyword argument {sorted(rejected)[0]!r}")
+        self.calls.append(kwargs)
+        values = np.full((1, 1, 5), -10.0, dtype=np.float32)
+        values[0, 0, 3 if len(self.calls) > 2 else 2] = 10.0
+        return SimpleNamespace(logits=FakeTensor(values), past_key_values="cache")
+
+
+@pytest.mark.parametrize(
+    ("tokenizer", "expected_ids"),
+    [
+        (BosTokenizer(), [1, 5, 6]),
+        (BosTokenizer(adds_bos=False), [5, 6]),
+        # A chat template writes its own BOS, so templated prompts are untouched.
+        (BosTokenizer(chat_template="fixture"), [5, 6]),
+    ],
+)
+def test_plain_text_fallback_restores_the_default_bos_token(
+    monkeypatch: pytest.MonkeyPatch, tokenizer: BosTokenizer, expected_ids: list[int]
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, _model, output = configured_causal_runtime()
+    model = RecordingCausalModel()
+    runtime.model = model
+    runtime.tokenizer = tokenizer
+
+    runtime._generate(generation_command())
+
+    assert model.calls[0]["input_ids"].tolist() == [expected_ids]
+    assert model.calls[0]["attention_mask"].tolist() == [[1] * len(expected_ids)]
+    stage = next(
+        item["payload"]
+        for item in output.items
+        if item["kind"] == "run_event" and item["event_type"] == "stage"
+    )
+    assert stage["prompt_tokens"] == len(expected_ids)
+
+
+def test_decoder_calls_receive_absolute_cache_positions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, _model, _output = configured_causal_runtime()
+    model = RecordingCausalModel()
+    runtime.model = model
+
+    runtime._generate(generation_command())
+
+    assert [call["cache_position"].tolist() for call in model.calls] == [[0, 1], [2], [3]]
+    assert all(call["logits_to_keep"] == 1 for call in model.calls)
+
+
+def test_families_rejecting_new_keywords_still_generate(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, _model, output = configured_causal_runtime()
+    model = RecordingCausalModel(reject=frozenset({"cache_position", "logits_to_keep"}))
+    runtime.model = model
+
+    runtime._generate(generation_command())
+
+    assert len(model.calls) == 3
+    assert not any("cache_position" in call for call in model.calls)
+    completed = next(item for item in output.items if item.get("event_type") == "completed")
+    assert completed["payload"]["text"] == "hellohello</s>"
+
+
+def _tiny_qwen3_vl() -> Any:
+    import torch
+    from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+
+    config = Qwen3VLConfig(
+        text_config={
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "max_position_embeddings": 128,
+            "rope_scaling": {
+                "rope_type": "default",
+                "mrope_section": [2, 1, 1],
+                "mrope_interleaved": True,
+            },
+            "bos_token_id": None,
+            "eos_token_id": None,
+            "pad_token_id": None,
+        },
+        vision_config={
+            "depth": 1,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_heads": 2,
+            "out_hidden_size": 32,
+            "patch_size": 4,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "num_position_embeddings": 16,
+            "deepstack_visual_indexes": [0],
+        },
+        image_token_id=60,
+        video_token_id=61,
+        vision_start_token_id=62,
+        vision_end_token_id=63,
+    )
+    torch.manual_seed(0)
+    return Qwen3VLForConditionalGeneration(config).eval()
+
+
+class TinyIdTokenizer:
+    chat_template = None
+    eos_token_id = None
+    bos_token_id = None
+
+    def __init__(self, prompt_ids: list[int]) -> None:
+        self.prompt_ids = prompt_ids
+
+    def __call__(self, _text: str, **_kwargs: Any) -> dict[str, Any]:
+        import torch
+
+        return {
+            "input_ids": torch.tensor([self.prompt_ids], dtype=torch.long),
+            "attention_mask": torch.ones((1, len(self.prompt_ids)), dtype=torch.long),
+        }
+
+    @staticmethod
+    def convert_ids_to_tokens(token_id: int) -> str:
+        return f"token-{token_id}"
+
+    @staticmethod
+    def decode(token_ids: list[int], **_kwargs: Any) -> str:
+        return "".join(f"<{token_id}>" for token_id in token_ids)
+
+
+@pytest.mark.parametrize("instrumentation", ["token", "full"])
+def test_multimodal_rope_decode_matches_reference_generate(instrumentation: str) -> None:
+    """Qwen3-VL positions decode steps from cache_position plus prefill rope deltas.
+
+    Without cache_position every decode step sat at position zero, so the reference
+    loop drifted from ``generate()`` after a few tokens even for text-only prompts.
+    The full tier also covers the split eager prefill used for attention capture.
+    """
+
+    import torch
+
+    model = _tiny_qwen3_vl()
+    prompt = [5, 6, 7, 8]
+    reference = model.generate(
+        input_ids=torch.tensor([prompt]),
+        attention_mask=torch.ones((1, len(prompt)), dtype=torch.long),
+        max_new_tokens=8,
+        do_sample=False,
+    )[0, len(prompt) :].tolist()
+    output = FakeQueue()
+    runtime = WorkerRuntime(cast(Any, FakeQueue()), cast(Any, output), FakeCancelEvent())
+    runtime.model = model
+    runtime.tokenizer = TinyIdTokenizer(prompt)
+    runtime.model_info = {
+        "id": "tiny-qwen3-vl",
+        "display_name": "Tiny Qwen3-VL Fixture",
+        "task": "text_generation",
+        "effective_context_limit": 64,
+    }
+    runtime.loaded_attention_implementation = str(model.config._attn_implementation)
+    command = generation_command()
+    command["instrumentation"] = instrumentation
+    command["sampling"]["max_output_tokens"] = 8
+
+    runtime._generate(command)
+
+    tokens = [
+        item["payload"]["token_id"]
+        for item in output.items
+        if item["kind"] == "run_event" and item["event_type"] == "token"
+    ]
+    assert tokens == reference
 
 
 def test_prompt_rendering_falls_back_without_chat_template() -> None:

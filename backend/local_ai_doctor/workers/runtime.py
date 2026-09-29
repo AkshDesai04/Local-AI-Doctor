@@ -309,6 +309,26 @@ def _valid_token_id(value: Any) -> int | None:
     return None
 
 
+def _default_bos_token_id(tokenizer: Any) -> int | None:
+    """Return the BOS token the tokenizer inserts by default, if any.
+
+    Prompts are tokenized with ``add_special_tokens=False`` because chat templates
+    write their own BOS. The plain-text fallback has no template, so that setting
+    silently dropped BOS for base checkpoints such as Llama 3.2, which were trained
+    with it. Probing an empty encode answers "does this tokenizer add BOS" without
+    guessing from flags that differ between slow and fast tokenizers.
+    """
+
+    bos = _valid_token_id(getattr(tokenizer, "bos_token_id", None))
+    if bos is None:
+        return None
+    try:
+        probe = list(tokenizer("", add_special_tokens=True)["input_ids"])
+    except Exception:  # an exotic tokenizer that cannot encode "" adds nothing here
+        return None
+    return bos if probe[:1] == [bos] else None
+
+
 def _decoder_start_token(model: Any, tokenizer: Any) -> tuple[int, str, str | None]:
     """Resolve a seq2seq decoder start token using Transformers' safe order."""
 
@@ -827,6 +847,29 @@ class WorkerRuntime:
             "return_dict": True,
             "output_attentions": capture_attention,
         }
+        # The attention mask spans cached and new positions, so the cache holds
+        # everything before these input tokens. Families with multimodal RoPE
+        # (Qwen3-VL) derive decode positions only from `cache_position`; without it
+        # every decoded token was placed at position zero.
+        past_length = int(attention_mask.shape[-1]) - int(input_ids.shape[-1])
+        optional: dict[str, Any] = {
+            "cache_position": torch.arange(
+                past_length, past_length + int(input_ids.shape[-1]), device=input_ids.device
+            )
+        }
+
+        def call(target: Any, extra: dict[str, Any]) -> Any:
+            # Older or custom families reject newer keywords; drop them newest first.
+            extra = dict(extra)
+            while True:
+                try:
+                    return target(**kwargs, **extra)
+                except TypeError:
+                    if not extra:
+                        raise
+                    extra.popitem()
+                    captured_attentions[:] = [None] * len(captured_attentions)
+
         # Causal decoder models can avoid materializing prompt-length vocabulary
         # logits by applying the LM head only to the final hidden state.
         body = getattr(self.model, "model", None)
@@ -837,7 +880,7 @@ class WorkerRuntime:
             and not getattr(self.model.config, "is_encoder_decoder", False)
         ):
             try:
-                outputs = body(**kwargs)
+                outputs = call(body, optional)
                 logits = head(outputs.last_hidden_state[:, -1:, :])
                 hook_attentions = tuple(captured_attentions)
                 attentions = (
@@ -850,11 +893,7 @@ class WorkerRuntime:
                 for handle in hook_handles:
                     handle.remove()
         try:
-            try:
-                outputs = self.model(**kwargs, logits_to_keep=1)
-            except TypeError:
-                captured_attentions[:] = [None] * len(captured_attentions)
-                outputs = self.model(**kwargs)
+            outputs = call(self.model, {**optional, "logits_to_keep": 1})
             model_attentions = getattr(outputs, "attentions", None)
             hook_attentions = tuple(captured_attentions)
             attentions = (
@@ -1024,8 +1063,22 @@ class WorkerRuntime:
             return_tensors="pt",
             add_special_tokens=False,
         )
-        input_ids = encoded["input_ids"].to(self.device)
-        attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids)).to(self.device)
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids))
+        fallback_bos = (
+            _default_bos_token_id(self.tokenizer)
+            if prompt_renderer == "plain_text_fallback"
+            else None
+        )
+        if fallback_bos is not None and input_ids[0].tolist()[:1] != [fallback_bos]:
+            input_ids = torch.cat(
+                [torch.tensor([[fallback_bos]], dtype=input_ids.dtype), input_ids], dim=-1
+            )
+            attention_mask = torch.cat(
+                [torch.ones((1, 1), dtype=attention_mask.dtype), attention_mask], dim=-1
+            )
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
         tokenization_ended = time.monotonic_ns()
         prompt_tokens = int(input_ids.shape[-1])
         context_limit = int(self.model_info.get("effective_context_limit") or 4096)
