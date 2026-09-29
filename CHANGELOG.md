@@ -41,6 +41,17 @@ This project follows a Keep a Changelog-style structure. Versions and dates are 
 - `POST /runs/{run_id}/cancel` on a run that does not exist now returns 404 `run_not_found`; it returned 409 `run_not_cancellable`, which is still used for a run that exists but has already finished.
 - `POST /chats/{chat_id}/messages` for a chat that does not exist now returns 404 `chat_not_found`; it returned 422 `invalid_request`.
 - Errors raised by the router itself (405 for an unsupported method, including unknown non-GET `/api` paths, and a missing static asset 404) now return the standard error envelope (`method_not_allowed`, `not_found`, `http_error`) instead of FastAPI's `{"detail": "..."}` shape. The frontend shell fallback for client-side routes is unchanged.
+- A checkpoint with a blocking discovery diagnostic no longer advertises capabilities. Krutrim-2 was not loadable yet reported text generation and raw logits as `full`; every capability of a non-loadable model is now `unsupported` with the blocking diagnostic named.
+- Reasoning delimiters are discovered only from chat-template text. Searching the whole `tokenizer_config.json` matched `<think>` in `added_tokens_decoder`, so Qwen3-VL-Embedding (and any Qwen tokenizer) falsely reported a reasoning channel.
+- The reported weight size, which also drives the RAM/VRAM budget preflight, counts only the files a Transformers load reads. Llama 3.2 was reported at twice its size because `original/consolidated.00.pth` was summed with `model.safetensors`. Fingerprint values do not change: the hashed file set still includes every weight file.
+- The model dtype now comes from the SafeTensors headers; the configuration's claim is kept as `metadata.declared_dtype` with an informational `dtype_metadata_mismatch` when they disagree. Pickle-only checkpoints report no dtype instead of the unverifiable claim (Krutrim-2 stores FP32 while its config says BF16).
+- Reviewed bundled code is statically import-checked. Krutrim-1's reviewed MPT code imports Llama rotary helpers that Transformers 4.57 removed and needs `einops`, so it was listed as loadable and failed only inside the worker; it is now blocked with `bundled_code_incompatible` naming the missing names and modules.
+- Pickle-only checkpoints are blocked with `pickle_weights_only` and offline SafeTensors conversion guidance instead of the generic `safetensors_missing`.
+- Empty and GGUF-only folders in a model root produce `empty_model_directory` / `gguf_only_directory` root diagnostics instead of being silently invisible, and dot-directories are no longer scanned.
+- The `scan` command probes hardware like the server, so CUDA is no longer reported unavailable there, and it prints root diagnostics.
+- Discovery reads the classic sentence-transformers pooled width (`word_embedding_dimension`), so XLM-R and BERT embedding models such as Vyakyarth report their vector width.
+- The plain-text fallback prompt now starts with the BOS token the tokenizer inserts by default. Tokenizing with `add_special_tokens=false` dropped it, so base checkpoints such as Llama 3.2 generated without BOS. Templated prompts are unchanged.
+- Decoder calls pass `cache_position`. Qwen3-VL derives decode positions from it, so every generated token was placed at position zero and output drifted from Transformers `generate()` (on Qwen3-VL-2B-Thinking from the fifth token), including text-only prompts and the split eager prefill used for attention capture.
 
 ### Security
 

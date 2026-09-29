@@ -6,6 +6,26 @@ This report covers the two checkpoints found in the configured local model root.
 
 Neither checkpoint directory was modified. SafeTensors headers and payload layouts were validated, but the multi-gigabyte payloads were not re-hashed in full. The workbench discovery fingerprint and the upstream Git/LFS identities are recorded below.
 
+## Full local inventory audit (2026-09-30)
+
+The configured root later grew to eleven folders. Every row below is **Metadata/Header verified** by the discovery scan; rows marked *runtime* passed the opt-in matrix in `tests/integration/test_real_model_matrix.py` on the RTX 4060 Laptop GPU (8 GiB, CUDA BF16) described under hardware below. The generator matrix loads through the worker runtime, repeats a 20-token greedy run, compares it with Transformers `generate()` on the same prompt ids, runs the `full` tier (split eager prefill plus attention capture), checks three sampling seeds at temperature 1.0, toggles `enable_thinking` where the template supports it, and confirms CUDA memory returns to baseline after unload. It is a correctness check, not a quality or throughput evaluation.
+
+| Checkpoint | Task | Loadable | Context selected (other candidates) | Reasoning | Modalities | Loader weights / 8 GiB GPU | Blocking reason | Matrix |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek-R1-Distill-Qwen-1.5B | text generation | yes | 131,072 `config.max_position_embeddings` (tokenizer 16,384) | `<think>` (template-primed) | text | 3.31 GiB BF16, fits | — | runtime: pass |
+| gemma-3-1b-it | text generation | yes | 32,768 `config.max_position_embeddings` (tokenizer sentinel ignored) | none | text | 1.86 GiB BF16, fits | — | runtime: pass |
+| Krutrim-1-instruct | text generation | no | 4,096 `config.max_seq_len` (tokenizer 4,096) | none | text | 13.68 GiB BF16, does not fit | `bundled_code_incompatible`: the reviewed MPT code imports `LlamaDynamicNTKScalingRotaryEmbedding` and `LlamaLinearScalingRotaryEmbedding`, which Transformers 4.57.6 no longer defines, and needs `einops`, which is not installed | scan only |
+| Krutrim-2-instruct | text generation | no | 1,024,000 `config.max_position_embeddings` (tokenizer 4,096) | none | text | 45.63 GiB pickle shards (stored FP32; config claims BF16), does not fit | `pickle_weights_only`: ten `pytorch_model-*.bin` shards and no SafeTensors; convert offline with a trusted tool into a new folder | scan only |
+| Llama-3.2-1B | text generation (base) | yes | 131,072 `config.max_position_embeddings` (RoPE base 8,192 evidence only; tokenizer 131,072) | none | text | 2.30 GiB BF16, fits (the `original/consolidated.00.pth` copy is no longer counted) | — | runtime: pass; plain-text fallback prompt starts with BOS 128000 |
+| Ministral-3-3B-Reasoning-2512-GGUF | — | — | — | — | — | empty folder | root diagnostic `empty_model_directory` | scan only |
+| Phi-3-mini-4k-instruct | text generation | yes | 4,096 `config.max_position_embeddings` (tokenizer 4,096) | none | text | 7.12 GiB BF16; exceeds the ~6.9 GiB free VRAM before activations | — | skipped: needs quantization or CPU offload, not yet implemented |
+| Qwen3-1.7B | text generation | yes | 40,960 `config.max_position_embeddings` (tokenizer 131,072) | `<think>` (`enable_thinking` template) | text | 3.78 GiB BF16, fits | — | runtime: pass, including reasoning on/off |
+| Qwen3-VL-2B-Thinking | text generation | yes | 262,144 `config.text_config.max_position_embeddings` (tokenizer 262,144) | `<think>` (template-primed) | text, image, video | 3.96 GiB BF16, fits | — | runtime: pass (text prompts) |
+| Qwen3-VL-Embedding-2B | multimodal embedding | yes | 262,144 `config.text_config.max_position_embeddings` (tokenizer 262,144) | none (no longer inferred from added tokens) | text, image, video | 3.96 GiB BF16, fits | — | runtime: pass, 2,048-wide normalized vectors |
+| Vyakyarth | text embedding | yes | 128 `sentence_bert_config.max_seq_length` (positions 514, tokenizer 128) | none | text | 1.04 GiB FP32, fits | — | runtime: pass, 768-wide vectors (run in BF16 on CUDA) |
+
+The Qwen3-VL row records a fixed defect. Before the worker passed `cache_position`, Qwen3-VL placed every decoded token at position zero. On this checkpoint the old decode loop diverged from `generate()` at the fifth generated token for the prompt "Name three primary colors." and then repeated itself; the fixed loop matches `generate()` for all 20 tokens. The other runtime-verified generators also match `generate()` with the change in place. The Phi-3 skip is a memory limit of this 8 GiB card, not a compatibility result.
+
 ## Evidence labels
 
 | Label | Meaning |

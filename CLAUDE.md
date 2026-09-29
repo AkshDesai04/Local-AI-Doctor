@@ -249,7 +249,7 @@ Anything outside `/api` and `/ws` falls back to `frontend/dist/index.html`.
   - Worker timeouts: startup 120 s, load 600 s, unload 60 s, inference 3600 s, shutdown 15 s.
 
 ### 5.5 Discovery and capabilities (`discovery/`)
-- **Scan:** depth 2 below each root, without following directory symlinks. A candidate folder has `config.json` or a SafeTensors file.
+- **Scan:** depth 2 below each root, without following directory symlinks and skipping dot-directories (`.git`, `.cache`). A candidate folder has `config.json` or a SafeTensors file. Empty and GGUF-only folders are not candidates; they produce root diagnostics `empty_model_directory` / `gguf_only_directory` with root-relative names (`ModelScanReport.public_roots()`, shared by `GET /models` and the `scan` CLI).
 - **Bounds:** JSON ≤ 32 MiB, SafeTensors header ≤ 256 MiB, ≤ 1,000,000 tensors. Offsets and dtypes are validated without reading weights.
 - **Task detection** (`_detect_task`) works from metadata:
   - SentenceTransformers files or architecture names containing embedding/sentence/featureextraction → `embedding`, or `multimodal_embedding` when there is more than one modality.
@@ -258,9 +258,12 @@ Anything outside `/api` and `/ws` falls back to `frontend/dist/index.html`.
   - Anything else → `unknown` with `loadable=false`. Unknown models stay visible with diagnostics.
 - **MoE:** only config keys (`num_experts`, `num_local_experts`, `n_routed_experts`, …) or router tensors count. A dense `gate_proj` is **not** MoE.
 - **Context:** every context candidate is recorded, and the most authoritative one is selected by tier: `sentence_bert_config.max_seq_length` → the architecture's declared capacity (`max_position_embeddings`, plus the family aliases `max_seq_len`/`n_positions`/`seq_length`/`max_sequence_length`/`n_ctx`, also under `text_config`) → `tokenizer_config.model_max_length` → `inference.conservative_context_limit` (fallback only, never a cap). `sliding_window`, `rope_scaling.original_max_position_embeddings`, and values above 10,000,000 are evidence only. Prompt size is bounded by `inference.max_prompt_tokens`.
-- **Reasoning delimiters** come from tokenizer metadata.
-- **Capabilities:** `CapabilityMatrix` must contain every `Capability` enum member. States are `full | partial | unsupported | unavailable_on_backend`, and every non-full state carries a reason. `build_capability_matrix(ModelEvidence)` never promotes unknowns.
-- **Fingerprint** (quick policy): hashes metadata files fully, plus SafeTensors headers and sizes. It is identity evidence, not a full-file integrity digest. A changed fingerprint means a new identity; historical runs keep their fingerprint.
+- **Reasoning delimiters** come only from chat-template text (`tokenizer_config.chat_template` string or named list, `chat_template.jinja`, `chat_template.json`), never from `added_tokens_decoder`.
+- **Weights:** only SafeTensors load. Pickle-only folders get the blocking `pickle_weights_only` (conversion hint); otherwise a missing SafeTensors file is `safetensors_missing`. `dtype` is the dominant SafeTensors header dtype (config claim kept as `metadata.declared_dtype`, mismatch → info `dtype_metadata_mismatch`; pickle-only → `null`).
+- **Reviewed bundled code** (`reviewed_bundled_code.py`) is also statically import-checked by `bundled_imports.py` (AST only, nothing imported or executed); unresolved Transformers names or missing packages → blocking `bundled_code_incompatible`. Krutrim-1 is blocked this way on Transformers 4.57.
+- **Capabilities:** `CapabilityMatrix` must contain every `Capability` enum member. States are `full | partial | unsupported | unavailable_on_backend`, and every non-full state carries a reason. `build_capability_matrix(ModelEvidence)` never promotes unknowns, and any error-severity diagnostic (`ModelEvidence.blocking_diagnostics`) makes every capability `unsupported` with the blocking codes as the reason.
+- **Fingerprint** (quick policy): hashes metadata files fully, plus SafeTensors headers and sizes. It is identity evidence, not a full-file integrity digest. A changed fingerprint means a new identity; historical runs keep their fingerprint. `total_weight_bytes` (the budget preflight input) counts only loader-read files (index-listed shards, else `model.safetensors`), while the hash still covers every weight file in the tree.
+- **Backends:** `hardware.selection.available_backends(inventory)` feeds the scanner in both `ModelRegistry.refresh` and the `scan` CLI.
 - Deleting model metadata never touches files. Model roots are read-only, always.
 
 ### 5.6 Hardware, admission, lifecycle
@@ -294,8 +297,8 @@ Cancel works in two ways. A run still waiting in the queue is cancelled in place
 
 Inside the worker (`_generate_impl`):
 1. Renders the chat template with `add_generation_prompt=True`. The request's `reasoning` is forwarded as `enable_thinking` only to compatible templates. Without a template, a deterministic "Role: content" fallback is used and a `chat_template_unavailable` warning is emitted.
-2. Tokenizes with `add_special_tokens=False`.
-3. Causal models prefill, then reuse the KV cache. Encoder-decoder models encode once and resolve the decoder start token.
+2. Tokenizes with `add_special_tokens=False`. Only for the plain-text fallback, the BOS the tokenizer inserts by default (`_default_bos_token_id`) is prepended, because no template wrote it.
+3. Causal models prefill, then reuse the KV cache. Every decoder-body call passes `cache_position` (derived from attention-mask length minus new tokens); Qwen3-VL computes decode positions from it plus prefill `rope_deltas`, so omitting it put every decoded token at position 0. Families rejecting the keyword fall back without it. Encoder-decoder models encode once and resolve the decoder start token.
 4. The owned sampler runs, penalties first (`_apply_penalties`), then `_filter_distribution`. Fixed order: repetition → frequency → presence → temperature (0 = argmax) → top-k → top-p → min-p → renormalize → `torch.multinomial` with a seeded `torch.Generator`.
 5. Stop sequences are detected **after** a token is decoded, so the matched stop text stays in the output.
 

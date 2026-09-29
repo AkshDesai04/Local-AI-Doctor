@@ -328,13 +328,15 @@ Discovery scans each configured root to depth two without following directory sy
 - Infer task and modalities from architecture, tensor, and packaging evidence—not a marketing model name.
 - Identify MoE only through genuine router/expert evidence. Ordinary `gate_proj` tensors in a dense SwiGLU MLP are not experts.
 - Record every discovered context-length candidate and select the most authoritative one: the sentence-transformers truncation length, then the architecture's declared positional capacity, then the tokenizer's `model_max_length`, and only then the configured application fallback. Never select a pre-scaling RoPE base length, a per-layer attention span, or an unbounded tokenizer sentinel; record them as evidence. Selecting a minimum across all candidates is a defect: it floors every checkpoint to the application value and hides the real context.
-- Produce diagnostics for missing, malformed, contradictory, or unsupported components.
-- Produce a complete capability matrix. Every non-`full` state needs a reason.
-- Compute a stable manifest fingerprint. The default quick policy hashes metadata fully and SafeTensors headers/sizes, not every weight byte; it is identity evidence, not a full checkpoint-integrity digest.
+- Produce diagnostics for missing, malformed, contradictory, or unsupported components. Pickle-only weights are blocked with `pickle_weights_only` and conversion guidance, never unpickled. Reviewed bundled code must also pass a static import check (`bundled_code_incompatible` otherwise); a review approves what code does, not that it still imports.
+- Discover reasoning delimiters only from chat-template text. Added-token lists name `<think>` for whole tokenizer families, including embedding checkpoints.
+- Report the SafeTensors header dtype as the model dtype and keep the configuration's claim as evidence.
+- Produce a complete capability matrix. Every non-`full` state needs a reason. A checkpoint with any error-severity diagnostic is not loadable and reports every capability `unsupported`, naming the blocking diagnostic.
+- Compute a stable manifest fingerprint. The default quick policy hashes metadata fully and SafeTensors headers/sizes, not every weight byte; it is identity evidence, not a full checkpoint-integrity digest. The reported weight size counts only files a Transformers load reads (index-listed shards, else `model.safetensors`), so alternate copies such as `original/consolidated.00.pth` do not inflate budget checks.
 
 Current defensive scan bounds include 32 MiB JSON metadata, 256 MiB SafeTensors headers, and 1,000,000 tensor records. Preserve bounded reads and failure diagnostics when extending discovery.
 
-Unknown or incomplete folders remain visible with `task=unknown`/`loadable=false` and actionable diagnostics. Do not make discovery hide them and do not guess them into a working task.
+Unknown or incomplete folders remain visible with `task=unknown`/`loadable=false` and actionable diagnostics. Do not make discovery hide them and do not guess them into a working task. Folders that cannot be candidates at all (empty, GGUF-only) are reported as root diagnostics with root-relative names; dot-directories are skipped.
 
 Model deletion in the registry may remove metadata, never underlying files. A changed fingerprint creates new identity evidence; historical runs retain the recorded fingerprint.
 
@@ -416,8 +418,8 @@ Shutdown cancels orchestration, asks the worker to unload and exit, drains telem
 2. Resolve hardware/device/dtype, then persist the user message, pending assistant, queued run, model fingerprint, and reproducibility snapshot.
 3. Emit `run_created`, load/reuse the selected model, and transition the run to `running`.
 4. Reconstruct the selected conversation branch and render the tokenizer chat template with `add_generation_prompt=true`, or use the documented deterministic fallback when no template exists.
-5. Tokenize with `add_special_tokens=false` because the template owns special-token behavior.
-6. For causal generation, prefill and reuse KV cache. For encoder-decoder generation, encode source once, resolve the decoder-start token, and reuse encoder outputs/decoder cache.
+5. Tokenize with `add_special_tokens=false` because the template owns special-token behavior. The plain-text fallback has no template, so it prepends the BOS token the tokenizer inserts by default.
+6. For causal generation, prefill and reuse KV cache, passing absolute `cache_position` to every decoder call (multimodal-RoPE families such as Qwen3-VL derive decode positions from it). For encoder-decoder generation, encode source once, resolve the decoder-start token, and reuse encoder outputs/decoder cache.
 7. Run the owned sampling pipeline, emit bounded events, persist according to policy, checkpoint partial message text every eight tokens, and check cancellation between bounded units.
 8. Finalize run/message on completion, cancellation, or failure while preserving partial output and accepted telemetry.
 

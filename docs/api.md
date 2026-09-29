@@ -74,6 +74,8 @@ Load body, all fields optional:
 
 `device` is `auto`, `cpu`, or `cuda`; dtype is `auto`, `float32`, `float16`, or `bfloat16`.
 
+In the scan report, each descriptor's `dtype` is the SafeTensors header dtype that stores the most parameters (`null` when no header exists, for example pickle-only folders); the configuration's claim is `metadata.declared_dtype`. `fingerprint.total_weight_bytes` counts only the files a Transformers load reads. A descriptor with any `error` diagnostic has `loadable: false` and every capability `unsupported`. Each `roots[]` entry carries root-level diagnostics, including `empty_model_directory` and `gguf_only_directory` for folders that cannot be candidates, with root-relative names only.
+
 ### Chats and messages
 
 | Method | Path | Result |
