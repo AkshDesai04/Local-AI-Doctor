@@ -1,10 +1,11 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
 
 const {
-  PACKAGED_DEVICE_MODE,
   isBackendReady,
   waitForBackend,
 } = require("../lib/lifecycle.cjs");
@@ -15,8 +16,12 @@ test("backend readiness requires the API, database, and model worker", () => {
   assert.equal(isBackendReady({ status: "ok", worker: "ready" }), false);
 });
 
-test("packaged builds discover the best usable local device", () => {
-  assert.equal(PACKAGED_DEVICE_MODE, "auto");
+test("the shell leaves runtime.device to the profile default and the user's config", () => {
+  // An environment override would outrank a device chosen in local.yaml.
+  const main = fs.readFileSync(path.join(__dirname, "..", "main.cjs"), "utf8");
+  assert.doesNotMatch(main, /LAD_RUNTIME__DEVICE/);
+  const defaults = fs.readFileSync(path.join(__dirname, "..", "..", "config", "default.yaml"), "utf8");
+  assert.match(defaults, /^ {2}native-windows:\n {4}runtime:\n {6}device: auto$/m);
 });
 
 test("waitForBackend retries until the backend reports healthy", async () => {

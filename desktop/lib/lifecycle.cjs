@@ -7,7 +7,6 @@ const BACKEND_HOST = "127.0.0.1";
 const BACKEND_PORT = 6767;
 const FRONTEND_HOST = "127.0.0.1";
 const FRONTEND_PORT = 6969;
-const PACKAGED_DEVICE_MODE = "auto";
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -110,7 +109,6 @@ module.exports = {
   BACKEND_PORT,
   FRONTEND_HOST,
   FRONTEND_PORT,
-  PACKAGED_DEVICE_MODE,
   delay,
   isBackendReady,
   isPortAvailable,

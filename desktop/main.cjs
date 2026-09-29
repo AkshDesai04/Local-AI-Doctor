@@ -13,7 +13,6 @@ const {
   BACKEND_PORT,
   FRONTEND_HOST,
   FRONTEND_PORT,
-  PACKAGED_DEVICE_MODE,
   isPortAvailable,
   waitForBackend,
 } = require("./lib/lifecycle.cjs");
@@ -93,7 +92,8 @@ function backendEnvironment(paths, shutdownFile) {
     LAD_USER_CONFIG: paths.userConfig,
     LAD_PROFILE: "native-windows",
     LAD_DESKTOP_SHUTDOWN_FILE: shutdownFile,
-    ...(app.isPackaged ? { LAD_RUNTIME__DEVICE: PACKAGED_DEVICE_MODE } : {}),
+    // runtime.device is deliberately not set here: the native-windows profile
+    // defaults to auto, and a device chosen in the user's local.yaml must win.
     LAD_SERVER__HOST: BACKEND_HOST,
     LAD_SERVER__PORT: String(BACKEND_PORT),
     LAD_SERVER__ALLOWED_ORIGINS: JSON.stringify([
