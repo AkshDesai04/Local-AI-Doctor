@@ -62,6 +62,7 @@ from .errors import (
     InvalidRequestError,
     PayloadTooLargeError,
     WorkbenchError,
+    worker_failure_response,
 )
 from .persistence import Database, TelemetryWriter, WorkspaceRepository
 from .services.events import EventBroker
@@ -69,7 +70,7 @@ from .services.models import ModelRegistry
 from .services.runs import RunManager
 from .services.uploads import UploadStore
 from .services.workspace import WorkspaceService
-from .workers import ModelWorkerSupervisor
+from .workers import ModelWorkerSupervisor, WorkerFailure
 
 
 @dataclass(slots=True)
@@ -545,6 +546,11 @@ def create_app(
     @app.exception_handler(WorkbenchError)
     async def workbench_error(_request: Request, exc: WorkbenchError) -> JSONResponse:
         return JSONResponse({"error": exc.to_dict()}, status_code=exc.http_status)
+
+    @app.exception_handler(WorkerFailure)
+    async def worker_failure(_request: Request, exc: WorkerFailure) -> JSONResponse:
+        http_status, payload = worker_failure_response(exc.error)
+        return JSONResponse({"error": payload}, status_code=http_status)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:

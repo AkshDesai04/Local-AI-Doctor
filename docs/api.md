@@ -30,6 +30,17 @@ Structured application errors use:
 
 Validation errors use code `invalid_request` with a bounded `details.issues` array. Some direct HTTP resource/conflict errors use FastAPI's `{"detail":"..."}` shape. Clients should handle both.
 
+Failures reported by the model worker (model load and unload, embeddings, prompt scoring) use the same envelope with the worker's error code and a status chosen from it. The message and hint are the worker's fixed, redacted text; exception text and paths never appear.
+
+| Worker code | HTTP status | Envelope `code` |
+| --- | --- | --- |
+| `model_out_of_memory`, `out_of_memory` | 507 | `out_of_memory` (the original worker code is kept in `details.worker_code`) |
+| `model_worker_timeout`, `inference_timeout` | 504 | unchanged |
+| `model_worker_state_mismatch` | 409 | unchanged |
+| any other code (for example `cuda_runtime_error`, `model_worker_error`) | 502 | unchanged |
+
+Out-of-memory and timeout failures are marked `retryable`.
+
 POST, PUT, and PATCH bodies are bounded before route parsing. Non-multipart bodies may use at most `limits.prompt_bytes + 1 MiB`; upload multipart bodies may use at most `limits.upload_bytes + 1 MiB`. The inner services separately enforce the exact prompt/content and uploaded-file limits. A declared or streamed envelope overrun returns HTTP 413 with code `limit_exceeded`.
 
 ## Endpoint index

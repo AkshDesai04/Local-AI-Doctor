@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from local_ai_doctor.config import AppSettings, ProfileName, SettingsLoader
+from local_ai_doctor.workers import WorkerFailure
 
 API_TOKEN = "integration-test-token"
 API_HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
@@ -579,3 +580,77 @@ def test_model_refresh_replaces_fingerprint_derived_id_atomically(
     persisted = portal.call(api_client.app.state.services.repository.list_models)
     assert len(persisted) == 1
     assert persisted[0]["id"] == after["id"]
+
+
+@pytest.mark.parametrize(
+    ("worker_error", "status", "code", "retryable"),
+    [
+        (
+            {"code": "model_out_of_memory", "message": "model worker exhausted available memory"},
+            507,
+            "out_of_memory",
+            True,
+        ),
+        ({"code": "out_of_memory", "message": "out of memory"}, 507, "out_of_memory", True),
+        (
+            {"code": "model_worker_timeout", "message": "timed out"},
+            504,
+            "model_worker_timeout",
+            True,
+        ),
+        ({"code": "inference_timeout", "message": "timed out"}, 504, "inference_timeout", True),
+        (
+            {"code": "model_worker_state_mismatch", "message": "different model loaded"},
+            409,
+            "model_worker_state_mismatch",
+            False,
+        ),
+        (
+            {"code": "cuda_runtime_error", "message": "CUDA failed", "exception": "RuntimeError"},
+            502,
+            "cuda_runtime_error",
+            False,
+        ),
+        ({"message": "model worker operation failed"}, 502, "model_worker_error", False),
+    ],
+)
+def test_worker_failures_return_the_error_envelope_with_the_worker_code(
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_error: dict[str, str],
+    status: int,
+    code: str,
+    retryable: bool,
+) -> None:
+    services = api_client.app.state.services
+    model_id = api_client.get("/api/v1/models", headers=API_HEADERS).json()["models"][0]["id"]
+    error = {**worker_error, "hint": "safe guidance", "details": {"requested": "a", "loaded": "b"}}
+
+    async def failing_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise WorkerFailure(error)
+
+    async def failing_unload(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise WorkerFailure(error)
+
+    monkeypatch.setattr(services.worker, "load_model", failing_load)
+    monkeypatch.setattr(services.worker, "unload", failing_unload)
+
+    for response in (
+        api_client.post(f"/api/v1/models/{model_id}/load", headers=API_HEADERS),
+        api_client.post("/api/v1/models/unload", headers=API_HEADERS),
+        api_client.post(
+            "/api/v1/runs/prompt-score",
+            headers=API_HEADERS,
+            json={"model_id": model_id, "text": "score me"},
+        ),
+    ):
+        assert response.status_code == status
+        body = response.json()["error"]
+        assert body["code"] == code
+        assert body["message"] == worker_error["message"]
+        assert body["retryable"] is retryable
+        assert body["hint"] == "safe guidance"
+        assert body["details"]["requested"] == "a"
+        assert "RuntimeError" not in response.text
+        if worker_error.get("code") == "model_out_of_memory":
+            assert body["details"]["worker_code"] == "model_out_of_memory"

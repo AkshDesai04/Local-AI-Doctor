@@ -208,3 +208,39 @@ class ActiveRunConflictError(WorkbenchError):
 class CancelledError(WorkbenchError):
     code = ErrorCode.CANCELLED
     http_status = 499
+
+
+_WORKER_CODE_STATUS = {
+    "model_out_of_memory": 507,
+    "out_of_memory": 507,
+    "model_worker_timeout": 504,
+    "inference_timeout": 504,
+    "model_worker_state_mismatch": 409,
+}
+
+
+def worker_failure_response(error: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
+    """Map a model-worker error dict to an HTTP status and the public error envelope.
+
+    The dict is already redacted at the process boundary (a code, a canned
+    message, an optional hint, and supervisor-selected details), so nothing
+    here reads exception text. Out-of-memory codes are normalized to the API's
+    ``out_of_memory``; every other worker code is passed through unchanged.
+    """
+
+    worker_code = str(error.get("code") or "model_worker_error")[:64]
+    status = _WORKER_CODE_STATUS.get(worker_code, 502)
+    code = ErrorCode.OUT_OF_MEMORY.value if status == 507 else worker_code
+    details = dict(error["details"]) if isinstance(error.get("details"), Mapping) else {}
+    if code != worker_code:
+        details["worker_code"] = worker_code
+    payload: dict[str, Any] = {
+        "code": code,
+        "message": str(error.get("message") or "model worker operation failed"),
+        "retryable": status in {504, 507},
+    }
+    if error.get("hint"):
+        payload["hint"] = str(error["hint"])
+    if details:
+        payload["details"] = _safe_detail(details)
+    return status, payload
