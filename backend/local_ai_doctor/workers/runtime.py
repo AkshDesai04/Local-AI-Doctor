@@ -223,7 +223,52 @@ def _safe_error(exc: BaseException) -> dict[str, Any]:
     return {"code": code, "message": message, "hint": hint, "exception": type(exc).__name__}
 
 
+def _fold_system_into_first_user(
+    messages: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]] | None:
+    """Return ``messages`` with a leading system prompt prepended to the first user turn."""
+
+    if not messages or messages[0].get("role") != "system":
+        return None
+    system = str(messages[0].get("content") or "")
+    rest = [dict(message) for message in messages[1:]]
+    for message in rest:
+        if system.strip() and message.get("role") == "user":
+            message["content"] = f"{system}\n\n{message.get('content') or ''}"
+            return rest
+    return None
+
+
 def _render_messages(
+    tokenizer: Any,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    reasoning: bool | None = None,
+    reasoning_delimiters: tuple[str, str] | None = None,
+) -> tuple[str, str]:
+    """Render chat messages; templates without a system role get it folded into the user turn.
+
+    A template that raises on the system role or silently drops its text is
+    re-rendered with the system prompt prepended to the first user message, and
+    the renderer is reported as ``chat_template_system_merged``.
+    """
+
+    options: dict[str, Any] = {"reasoning": reasoning, "reasoning_delimiters": reasoning_delimiters}
+    merged = (
+        _fold_system_into_first_user(messages)
+        if getattr(tokenizer, "chat_template", None)
+        else None
+    )
+    if merged is None:
+        return _render_conversation(tokenizer, messages, **options)
+    with contextlib.suppress(Exception):  # the folded re-render below reports real failures
+        rendered, renderer = _render_conversation(tokenizer, messages, **options)
+        if str(messages[0].get("content") or "").strip() in rendered:
+            return rendered, renderer
+    return _render_conversation(tokenizer, merged, **options)[0], "chat_template_system_merged"
+
+
+def _render_conversation(
     tokenizer: Any,
     messages: Sequence[Mapping[str, Any]],
     *,
@@ -1029,6 +1074,18 @@ class WorkerRuntime:
             reasoning_delimiters=self.model_info.get("reasoning_delimiters"),
         )
         template_ended = time.monotonic_ns()
+        if prompt_renderer == "chat_template_system_merged":
+            self._emit_run(
+                run_id,
+                "warning",
+                {
+                    "code": "system_prompt_merged",
+                    "message": (
+                        "This model's chat template has no system role; the system prompt "
+                        "was prepended to the first user message."
+                    ),
+                },
+            )
         if prompt_renderer == "plain_text_fallback":
             self._emit_run(
                 run_id,
