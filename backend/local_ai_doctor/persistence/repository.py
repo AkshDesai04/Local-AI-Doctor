@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from ..errors import ActiveRunConflictError, InvalidRequestError
+from ..errors import ActiveRunConflictError, ChatNotFoundError, InvalidRequestError
 from .database import Database, utc_now
 
 
@@ -379,7 +379,7 @@ class WorkspaceRepository:
         async with self.database.transaction() as connection:
             chat_cursor = await connection.execute("SELECT id FROM chats WHERE id = ?", (chat_id,))
             if await chat_cursor.fetchone() is None:
-                raise InvalidRequestError("chat not found", details={"chat_id": chat_id})
+                raise ChatNotFoundError("chat not found", details={"chat_id": chat_id})
             if parent_id is not None:
                 parent_cursor = await connection.execute(
                     "SELECT chat_id FROM messages WHERE id = ?", (parent_id,)

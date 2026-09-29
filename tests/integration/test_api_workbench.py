@@ -817,3 +817,16 @@ def test_cancelling_a_finished_run_conflicts_but_a_missing_run_is_not_found(
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "run_not_found"
     assert missing.json()["error"]["details"] == {"run_id": "never-existed"}
+
+
+def test_posting_a_message_to_a_missing_chat_returns_404(api_client: TestClient) -> None:
+    response = api_client.post(
+        "/api/v1/chats/no-such-chat/messages",
+        headers=API_HEADERS,
+        json={"role": "user", "content": "hello"},
+    )
+
+    assert response.status_code == 404
+    error = response.json()["error"]
+    assert error["code"] == "chat_not_found"
+    assert error["details"] == {"chat_id": "no-such-chat"}
