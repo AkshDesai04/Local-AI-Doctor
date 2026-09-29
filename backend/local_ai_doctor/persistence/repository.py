@@ -27,6 +27,9 @@ def _decode_json_columns(row: dict[str, Any]) -> dict[str, Any]:
     return decoded
 
 
+# Sentinel distinguishing "leave unchanged" from an explicit ``None`` (clear).
+UNSET: Any = object()
+
 _INSERT_RUN_SQL = """
 INSERT INTO inference_runs(
     id, message_id, model_id, parent_run_id, kind, status, requested_seed,
@@ -157,12 +160,15 @@ class WorkspaceRepository:
             result.append(row)
         return result
 
-    async def create_chat(self, title: str = "New chat") -> dict[str, Any]:
+    async def create_chat(
+        self, title: str = "New chat", system_prompt: str | None = None
+    ) -> dict[str, Any]:
         chat_id = str(uuid.uuid4())
         now = utc_now()
         await self.database.execute(
-            "INSERT INTO chats(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (chat_id, title.strip()[:200] or "New chat", now, now),
+            "INSERT INTO chats(id, title, system_prompt, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (chat_id, title.strip()[:200] or "New chat", system_prompt, now, now),
         )
         chat = await self.get_chat(chat_id)
         assert chat is not None
@@ -287,16 +293,19 @@ class WorkspaceRepository:
         title: str | None = None,
         pinned: bool | None = None,
         archived: bool | None = None,
+        system_prompt: str | None = UNSET,
     ) -> dict[str, Any] | None:
         current = await self.database.fetch_one("SELECT * FROM chats WHERE id = ?", (chat_id,))
         if current is None:
             return None
         await self.database.execute(
-            "UPDATE chats SET title = ?, pinned = ?, archived = ?, updated_at = ? WHERE id = ?",
+            "UPDATE chats SET title = ?, pinned = ?, archived = ?, system_prompt = ?,"
+            " updated_at = ? WHERE id = ?",
             (
                 (title.strip()[:200] or "New chat") if title is not None else current["title"],
                 int(pinned) if pinned is not None else current["pinned"],
                 int(archived) if archived is not None else current["archived"],
+                current["system_prompt"] if system_prompt is UNSET else system_prompt,
                 utc_now(),
                 chat_id,
             ),
@@ -585,6 +594,7 @@ class WorkspaceRepository:
         hardware: Mapping[str, Any],
         software: Mapping[str, Any],
         backend: Mapping[str, Any],
+        system_prompt: str | None = None,
     ) -> dict[str, Any]:
         """Clone one message lineage into a new chat and attach an active run atomically."""
 
@@ -608,8 +618,15 @@ class WorkspaceRepository:
 
         async with self.database.transaction() as connection:
             await connection.execute(
-                "INSERT INTO chats(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                (chat_id, title.strip()[:200] or "New chat", chat_created_at, assistant_created_at),
+                "INSERT INTO chats(id, title, system_prompt, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (
+                    chat_id,
+                    title.strip()[:200] or "New chat",
+                    system_prompt,
+                    chat_created_at,
+                    assistant_created_at,
+                ),
             )
             for ordinal, source_message in enumerate(lineage, start=1):
                 message_id = str(uuid.uuid4())
@@ -854,14 +871,15 @@ class WorkspaceRepository:
         async with self.database.transaction() as connection:
             await connection.execute(
                 """
-                INSERT INTO chats(id, title, pinned, archived, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO chats(id, title, pinned, archived, system_prompt, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chat["id"],
                     chat["title"],
                     int(bool(chat.get("pinned"))),
                     int(bool(chat.get("archived"))),
+                    chat.get("system_prompt"),
                     now,
                     now,
                 ),
