@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -22,7 +24,8 @@ hiddenimports = []
 # PyInstaller's maintained hooks already collect Torch and TorchVision,
 # including their runtime DLLs, while excluding development-only archives and
 # headers, so do not collect those two packages a second time here.
-for package in (
+# bitsandbytes is collected when the packaging environment has it.
+packages = [
     "accelerate",
     "av",
     "local_ai_doctor",
@@ -32,8 +35,20 @@ for package in (
     "sentence_transformers",
     "transformers",
     "uvicorn",
-):
-    package_datas, package_binaries, package_hiddenimports = collect_all(package)
+]
+if importlib.util.find_spec("bitsandbytes") is not None:
+    packages.append("bitsandbytes")
+# Test-only subpackages that collect_all() would otherwise bundle as sources.
+test_only = {"accelerate": ("test_utils",)}
+for package in packages:
+    skipped = tuple(f"{package}.{name}" for name in test_only.get(package, ()))
+    package_datas, package_binaries, package_hiddenimports = collect_all(
+        package,
+        filter_submodules=lambda name, skipped=skipped: not any(
+            name == prefix or name.startswith(f"{prefix}.") for prefix in skipped
+        ),
+        exclude_datas=list(test_only.get(package, ())),
+    )
     datas += package_datas
     binaries += package_binaries
     hiddenimports += package_hiddenimports
@@ -61,6 +76,46 @@ a = Analysis(
     },
     noarchive=False,
 )
+
+
+def _package_dir(name):
+    spec = importlib.util.find_spec(name)
+    return Path(next(iter(spec.submodule_search_locations))).resolve() if spec else None
+
+
+# CUDA runtime DLLs may only come from the pinned wheels. Anything else, such
+# as a CUDA Toolkit found on PATH, is machine-dependent and version-mismatched.
+cuda_runtime_dll = re.compile(r"^(nvrtc|cudart|cublas|cudnn|cufft|cusparse|cusolver|curand|nvjitlink)")
+torch_dir = _package_dir("torch")
+cuda_dll_sources = {
+    directory
+    for directory in (
+        torch_dir / "lib" if torch_dir else None,
+        _package_dir("torchvision"),
+        _package_dir("bitsandbytes"),
+    )
+    if directory is not None
+}
+# Shipped by the CUDA wheel but never imported or loaded by name by any bundled
+# binary or Python module (checked against PE import tables and a string scan of
+# the whole bundle). The packaged self-check still runs cuBLAS, SDPA, and
+# NVRTC-compiled kernels without them.
+unused_dlls = {"cusolvermg64_11.dll", "nvrtc64_120_0.alt.dll"}
+
+
+def _keep_binary(destination, source):
+    name = Path(destination).name.lower()
+    if name in unused_dlls:
+        return False
+    if name.startswith("libbitsandbytes_"):
+        # Keep only the CPU library and the build matching torch's CUDA 12.8.
+        return name.startswith(("libbitsandbytes_cpu", "libbitsandbytes_cuda128"))
+    if cuda_runtime_dll.match(name):
+        return Path(source).resolve().parent in cuda_dll_sources
+    return True
+
+
+a.binaries = [entry for entry in a.binaries if _keep_binary(entry[0], entry[1])]
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
