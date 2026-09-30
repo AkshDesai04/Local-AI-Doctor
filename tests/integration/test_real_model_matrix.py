@@ -21,9 +21,10 @@ import pytest
 from local_ai_doctor.discovery import ModelScanner
 from local_ai_doctor.discovery.scanner import ModelScanReport
 from local_ai_doctor.domain import Capability, CapabilityState, ModelTask
-from local_ai_doctor.domain.models import ModelDescriptor, TrustDecision
+from local_ai_doctor.domain.models import ModelDescriptor
 from local_ai_doctor.hardware.models import BackendKind
 from local_ai_doctor.workers.runtime import WorkerRuntime
+from local_ai_doctor.workers.supervisor import worker_model_payload
 
 pytestmark = pytest.mark.real_model
 
@@ -99,20 +100,7 @@ def _load(descriptor: ModelDescriptor) -> tuple[WorkerRuntime, _Queue]:
             )
     output = _Queue()
     runtime = WorkerRuntime(_Queue(), output, _NeverCancelled())  # type: ignore[arg-type]
-    metadata = descriptor.metadata
-    model = {
-        "id": descriptor.id,
-        "display_name": descriptor.display_name,
-        "path": str(descriptor.path),
-        "task": descriptor.task.value,
-        "model_type": descriptor.model_type,
-        "effective_context_limit": descriptor.effective_context_limit,
-        "reasoning_delimiters": descriptor.reasoning_delimiters,
-        "fingerprint": descriptor.fingerprint.value,
-        "embedding_pooling": metadata.get("pooling"),
-        "joint_embedding_space": metadata.get("joint_embedding_space", False),
-        "trust_remote_code": descriptor.trust_decision is TrustDecision.REVIEWED_BUNDLED_CODE,
-    }
+    model = worker_model_payload(descriptor)
     try:
         runtime._load(
             {
@@ -141,7 +129,7 @@ def _generate(
     tokens: int = 20,
     instrumentation: str = "token",
     reasoning: bool | None = None,
-    messages: list[dict[str, str]] = _PROMPT,
+    messages: list[dict[str, Any]] = _PROMPT,
 ) -> dict[str, Any]:
     output.items.clear()
     runtime._generate(
@@ -249,6 +237,88 @@ def test_real_generator_matrix(name: str) -> None:
         runtime._unload()
     if cuda:
         assert torch.cuda.memory_allocated() - baseline < _CUDA_HEADROOM_BYTES
+
+
+def _vision_generators() -> list[str]:
+    report = _report()
+    if report is None:
+        return ["<unset>"]
+    return [
+        model.display_name
+        for model in report.models
+        if model.loadable
+        and model.task is ModelTask.TEXT_GENERATION
+        and model.capabilities.support(Capability.VISION).state is CapabilityState.PARTIAL
+    ]
+
+
+def _synthetic_media(directory: Path) -> tuple[Path, Path]:
+    import av
+    import numpy as np
+    from PIL import Image
+
+    image = directory / "red-square.png"
+    Image.new("RGB", (96, 96), (220, 20, 20)).save(image)
+    video = directory / "brightening.mp4"
+    with av.open(str(video), "w") as container:
+        stream = container.add_stream("mpeg4", rate=8)
+        stream.width, stream.height, stream.pix_fmt = 64, 64, "yuv420p"
+        for index in range(16):
+            frame = np.full((64, 64, 3), index * 15, dtype=np.uint8)
+            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return image, video
+
+
+@pytest.mark.parametrize("name", _vision_generators())
+def test_real_vision_generation(name: str, tmp_path: Path) -> None:
+    pytest.importorskip("torch")
+    descriptor = _descriptor(name)
+    image, video = _synthetic_media(tmp_path)
+    runtime, output = _load(descriptor)
+    assert runtime.processor is not None
+    quiet = False if descriptor.reasoning_delimiters else None
+    try:
+        for kind, path in (("image", image), ("video", video)):
+            if kind not in descriptor.modalities:
+                continue
+            messages = [
+                {
+                    "role": "user",
+                    "content": f"What colour is this {kind}? Answer in one word.",
+                    "attachments": [{"kind": kind, "path": str(path)}],
+                }
+            ]
+            result = _generate(runtime, output, tokens=16, reasoning=quiet, messages=messages)
+            media = result["stage"]["media"]
+            assert media[f"{kind}s"] == 1
+            assert media["placeholder_tokens"] > 0
+            assert result["stage"]["prompt_tokens"] > media["placeholder_tokens"]
+            assert result["completed"]["text"].strip(), f"{kind} prompt produced no output"
+
+        full = _generate(
+            runtime,
+            output,
+            tokens=2,
+            instrumentation="full",
+            reasoning=quiet,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Describe the image.",
+                    "attachments": [{"kind": "image", "path": str(image)}],
+                }
+            ],
+        )
+        catalogue = full["attention"][0]["context_tokens"]
+        labelled = [item for item in catalogue if "media" in item]
+        assert len(labelled) == full["stage"]["media"]["placeholder_tokens"]
+        assert {item["media"]["index"] for item in labelled} == {0}
+        assert all(item["source_kind"] == "prompt" for item in labelled)
+    finally:
+        runtime._unload()
 
 
 @pytest.mark.parametrize("name", _names(ModelTask.EMBEDDING, ModelTask.MULTIMODAL_EMBEDDING))
