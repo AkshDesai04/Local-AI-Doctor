@@ -12,6 +12,15 @@ if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
     throw "The packaged backend is missing at $Executable."
 }
 
+# Verify the bundled PyTorch flavor first (and real CUDA kernels when this
+# machine has an NVIDIA driver) without starting the API server.
+$Guard = Join-Path $PSScriptRoot "build-guard.cjs"
+$Variant = ([string](& node $Guard variant)).Trim()
+if ($LASTEXITCODE -ne 0) { throw "Could not resolve the desktop PyTorch variant." }
+& node $Guard self-check $Executable
+if ($LASTEXITCODE -ne 0) { throw "The packaged backend failed its $Variant self-check." }
+$RequireCuda = $Variant -eq "cuda" -and $null -ne (Get-Command nvidia-smi -ErrorAction SilentlyContinue)
+
 $TemporaryBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $TemporaryRoot = [IO.Path]::GetFullPath(
     (Join-Path $TemporaryBase "local-ai-doctor-desktop-smoke-$([guid]::NewGuid().ToString('N'))")
@@ -42,7 +51,6 @@ $StartInfo.Environment["LAD_PROFILE"] = "native-windows"
 $StartInfo.Environment["LAD_SERVER__HOST"] = "127.0.0.1"
 $StartInfo.Environment["LAD_SERVER__PORT"] = [string]$Port
 $StartInfo.Environment["LAD_SERVER__ALLOWED_ORIGINS"] = ConvertTo-Json -InputObject @("http://127.0.0.1:16969") -Compress
-$StartInfo.Environment["LAD_RUNTIME__DEVICE"] = "auto"
 $StartInfo.Environment["LAD_DESKTOP_SHUTDOWN_FILE"] = $ShutdownFile
 $StartInfo.Environment["LAD_PATHS__MODEL_ROOTS"] = ConvertTo-Json -InputObject @($ModelDirectory.FullName) -Compress
 $StartInfo.Environment["LAD_PATHS__DATABASE"] = (Join-Path $TemporaryRoot "workbench.sqlite3")
@@ -107,6 +115,10 @@ try {
     }
     if ([string]::IsNullOrWhiteSpace($TorchVersion) -or $RuntimeImportFailure.Count -gt 0) {
         throw "Packaged backend cannot import its bundled PyTorch runtime: $($RuntimeImportFailure -join '; ')"
+    }
+    $UsableCuda = @($Hardware.inventory.accelerators | Where-Object { $_.backend -eq "cuda" -and $_.runtime_available })
+    if ($RequireCuda -and ($UsableCuda.Count -eq 0 -or $Hardware.selection.selected_backend -ne "cuda")) {
+        throw "This machine has an NVIDIA GPU, but the packaged backend selected $($Hardware.selection.selected_backend): $(@($Hardware.inventory.discovery_warnings) -join '; ')"
     }
     Write-Host "Packaged PyTorch runtime is usable: $TorchVersion ($($Hardware.selection.selected_backend))."
     Write-Host "Packaged backend smoke passed on 127.0.0.1:$Port."

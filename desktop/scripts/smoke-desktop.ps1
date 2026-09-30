@@ -14,7 +14,14 @@ $ErrorActionPreference = "Stop"
 $DesktopRoot = Split-Path -Parent $PSScriptRoot
 $RepositoryRoot = Split-Path -Parent $DesktopRoot
 $Manifest = Get-Content -LiteralPath (Join-Path $DesktopRoot "package.json") -Raw | ConvertFrom-Json
-$Installer = Join-Path $RepositoryRoot "release\Local-AI-Doctor-$($Manifest.version).exe"
+$Guard = Join-Path $PSScriptRoot "build-guard.cjs"
+$Variant = ([string](& node $Guard variant)).Trim()
+if ($LASTEXITCODE -ne 0) { throw "Could not resolve the desktop PyTorch variant." }
+$ArtifactName = ([string](& node $Guard artifact-name)).Trim()
+if ($LASTEXITCODE -ne 0) { throw "Could not resolve the desktop installer name." }
+$Installer = Join-Path $RepositoryRoot "release\$ArtifactName"
+$RequireCuda = $Variant -eq "cuda" -and $null -ne (Get-Command nvidia-smi -ErrorAction SilentlyContinue)
+$HardwareUri = "http://127.0.0.1:6767/api/v1/hardware"
 $InstallerGuid = [string]$Manifest.build.nsis.guid
 $ExpectedInstallerGuid = "df0eb923-5a87-57ad-bb13-24a35a6c435a"
 $BackendUri = "http://127.0.0.1:6767/api/v1/health"
@@ -518,6 +525,14 @@ try {
     }
     $BackendElapsedSeconds = [math]::Round(([DateTime]::UtcNow - $StartedAt).TotalSeconds, 2)
 
+    $Hardware = Invoke-RestMethod -Uri $HardwareUri -TimeoutSec 30
+    $SelectedBackend = [string]$Hardware.selection.selected_backend
+    $UsableCuda = @($Hardware.inventory.accelerators | Where-Object { $_.backend -eq "cuda" -and $_.runtime_available })
+    if ($RequireCuda -and ($UsableCuda.Count -eq 0 -or $SelectedBackend -ne "cuda")) {
+        throw "This machine has an NVIDIA GPU, but the installed $Variant application selected ${SelectedBackend}: $(@($Hardware.inventory.discovery_warnings) -join '; ')"
+    }
+    $HardwareSummary = "$SelectedBackend ($(@($UsableCuda | ForEach-Object { $_.name }) -join ', '))"
+
     $FrontendReady = $false
     while ([DateTime]::UtcNow -lt $Deadline) {
         Update-ManagedProcessTree -ManagedProcesses $ManagedProcesses
@@ -753,7 +768,7 @@ if ($CleanupFailures.Count -gt 0) {
 }
 
 Write-Host (
-    "Installed Electron smoke passed: install ${InstallElapsedSeconds}s; backend ${BackendElapsedSeconds}s; " +
+    "Installed Electron smoke passed ($ArtifactName, device $HardwareSummary): install ${InstallElapsedSeconds}s; backend ${BackendElapsedSeconds}s; " +
     "frontend ${FrontendElapsedSeconds}s; readiness-to-frontend request ${ReadinessToFrontendMilliseconds}ms; " +
     "uninstall ${UninstallElapsedSeconds}s; graceful shutdown and cleanup verified."
 )
