@@ -31,7 +31,9 @@ function sourceTitle(contextToken: AttentionContextToken, source: AttentionSourc
     `Model context position: ${String(contextToken.contextIndex)} · token ID ${String(contextToken.tokenId)}`,
     contextToken.sourceKind === "generated"
       ? `Earlier generated token #${String(contextToken.generatedTokenIndex ?? "unknown")}`
-      : "Rendered prompt/history/template token",
+      : contextToken.media
+        ? `Placeholder carrying ${contextToken.media.kind}${contextToken.media.index === undefined ? "" : ` attachment ${String(contextToken.media.index + 1)}`} features`
+        : "Rendered prompt/history/template token",
     "Attention weight is not a causal contribution score.",
   ].filter(Boolean).join("\n");
 }

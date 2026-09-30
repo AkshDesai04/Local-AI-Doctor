@@ -20,6 +20,40 @@ const model: ModelSummary = {
   effectiveContextLimit: 4096,
 };
 
+describe("attachments", () => {
+  it("accepts only the media kinds a vision-language generator can read", () => {
+    const visionModel: ModelSummary = {
+      ...model,
+      capabilities: {
+        text_generation: { state: "full" },
+        vision: { state: "partial", reason: "validated on Qwen3-VL; other processor families best-effort" },
+        video: { state: "partial", reason: "validated on Qwen3-VL; other processor families best-effort" },
+        audio: { state: "unsupported", reason: "audio chat input is not implemented for this generation path" },
+        native_file_input: { state: "partial", reason: "only processor-declared native media types are accepted" },
+        extracted_text_input: { state: "unsupported", reason: "no extracted-text inference adapter is currently registered" },
+      },
+    };
+    const { container } = render(
+      <Composer
+        attachments={[]}
+        busy={false}
+        connected
+        model={visionModel}
+        onAttach={vi.fn()}
+        onRemoveAttachment={vi.fn()}
+        onSettingsChange={vi.fn()}
+        onStop={vi.fn()}
+        onSubmit={vi.fn()}
+        running={false}
+        settings={defaultGenerationSettings}
+      />,
+    );
+
+    expect(container.querySelector("input[type=file]")).toHaveAttribute("accept", "image/*,video/*");
+    expect(screen.getByRole("button", { name: "Attach a file" })).toBeEnabled();
+  });
+});
+
 describe("prompt controls", () => {
   it("offers reasoning, temperature, Top K, and Top P before sending", async () => {
     const user = userEvent.setup();

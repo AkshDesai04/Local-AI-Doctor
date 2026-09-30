@@ -211,6 +211,8 @@ function normalizeAttentionContextToken(value: unknown): AttentionContextToken |
   if (contextIndex === undefined || tokenId === undefined) return null;
   if (!Number.isInteger(contextIndex) || contextIndex < 0 || !Number.isInteger(tokenId)) return null;
   if (sourceKindValue !== "prompt" && sourceKindValue !== "generated") return null;
+  const media = asRecord(raw.media);
+  const mediaIndex = asOptionalNumber(media.index);
   return {
     contextIndex,
     tokenId,
@@ -218,6 +220,9 @@ function normalizeAttentionContextToken(value: unknown): AttentionContextToken |
     displayText: asString(raw.displayText ?? raw.display_text ?? raw.piece, ""),
     sourceKind: sourceKindValue,
     generatedTokenIndex: asOptionalNumber(raw.generatedTokenIndex ?? raw.generated_token_index),
+    ...(media.kind === "image" || media.kind === "video"
+      ? { media: { kind: media.kind, ...(mediaIndex !== undefined && Number.isInteger(mediaIndex) && mediaIndex >= 0 ? { index: mediaIndex } : {}) } }
+      : {}),
   };
 }
 

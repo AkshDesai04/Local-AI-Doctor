@@ -166,6 +166,8 @@ export interface AttentionContextToken {
   displayText: string;
   sourceKind: "prompt" | "generated";
   generatedTokenIndex?: number;
+  /** Set on prompt positions that carry image or video features. */
+  media?: { kind: "image" | "video"; index?: number };
 }
 
 export interface AttentionSourceToken extends AttentionContextToken {

@@ -296,7 +296,11 @@ describe("API boundary normalization", () => {
           method: "mean_causal_self_attention",
           aggregation: "arithmetic_mean_over_layers_and_heads",
           semantics: "attention_weights_not_causal_contributions",
-          context_tokens: [{ context_index: 0, token_id: 1, piece: "Question", display_text: "Question", source_kind: "prompt" }],
+          context_tokens: [
+            { context_index: 0, token_id: 1, piece: "Question", display_text: "Question", source_kind: "prompt" },
+            { context_index: 1, token_id: 9, piece: "<|image_pad|>", display_text: "<|image_pad|>", source_kind: "prompt", media: { kind: "image", index: 0 } },
+            { context_index: 2, token_id: 9, piece: "<|image_pad|>", display_text: "<|image_pad|>", source_kind: "prompt", media: { kind: "audio", index: 0 } },
+          ],
           source_tokens: [{ context_index: 0, token_id: 1, piece: "Question", display_text: "Question", source_kind: "prompt", weight: 0.75 }],
           captured_layers: [0, 1],
           captured_heads: 4,
@@ -345,9 +349,15 @@ describe("API boundary normalization", () => {
       retainedSourceCount: 1,
       retainedWeight: 0.75,
       omittedWeight: 0.25,
-      contextTokens: [expect.objectContaining({ contextIndex: 0, tokenId: 1, sourceKind: "prompt" })],
+      contextTokens: [
+        expect.objectContaining({ contextIndex: 0, tokenId: 1, sourceKind: "prompt" }),
+        expect.objectContaining({ contextIndex: 1, sourceKind: "prompt", media: { kind: "image", index: 0 } }),
+        expect.objectContaining({ contextIndex: 2, sourceKind: "prompt" }),
+      ],
       sourceTokens: [expect.objectContaining({ contextIndex: 0, tokenId: 1, sourceKind: "prompt", weight: 0.75 })],
     }));
+    // An unknown media kind is dropped rather than guessed.
+    expect(run.tokens[0]?.attentionAttribution?.contextTokens?.[2]?.media).toBeUndefined();
     expect(run.branchableThroughTokenIndex).toBe(0);
     expect(run.effectiveSettings).toMatchObject({ instrumentation: "full", sampling: { temperature: 0.7 } });
   });

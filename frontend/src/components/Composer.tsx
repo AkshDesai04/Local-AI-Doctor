@@ -61,7 +61,8 @@ export function Composer({ model, connected, busy, running, attachments, setting
   if (isUsable(model, "vision")) accepted.push("image/*");
   if (isUsable(model, "video")) accepted.push("video/*");
   if (isUsable(model, "audio")) accepted.push("audio/*");
-  if (isUsable(model, "native_file_input") || isUsable(model, "extracted_text_input")) accepted.push(".txt,.md,.pdf,.docx");
+  // Native file input covers the media kinds above; documents need text extraction.
+  if (isUsable(model, "extracted_text_input")) accepted.push(".txt,.md,.pdf,.docx");
 
   useEffect(() => {
     if (!textarea.current) return;
@@ -118,7 +119,7 @@ export function Composer({ model, connected, busy, running, attachments, setting
                 <span className={isUsable(model, "vision") ? "supported" : ""}><Image size={14} /> Image</span>
                 <span className={isUsable(model, "video") ? "supported" : ""}><Video size={14} /> Video</span>
                 <span className={isUsable(model, "audio") ? "supported" : ""}><Mic size={14} /> Audio</span>
-                <span className={isUsable(model, "native_file_input") || isUsable(model, "extracted_text_input") ? "supported" : ""}><FileText size={14} /> Document</span>
+                <span className={isUsable(model, "extracted_text_input") ? "supported" : ""}><FileText size={14} /> Document</span>
               </div>
               <button className="button primary compact" onClick={() => { fileInput.current?.click(); setAttachmentMenu(false); }} type="button">Choose file</button>
             </div>
