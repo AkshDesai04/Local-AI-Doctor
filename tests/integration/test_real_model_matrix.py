@@ -96,7 +96,8 @@ def _load(descriptor: ModelDescriptor) -> tuple[WorkerRuntime, _Queue]:
             pytest.skip(
                 f"{descriptor.display_name}: {weights / 1024**3:.1f} GiB of weights do not fit "
                 f"the {free / 1024**3:.1f} GiB of free VRAM with room for activations; this "
-                "needs quantization or CPU offload, which the runtime does not provide yet"
+                "matrix runs GPU-resident models only (layer offload is covered by "
+                "test_real_multi_model.py)"
             )
     output = _Queue()
     runtime = WorkerRuntime(_Queue(), output, _NeverCancelled())  # type: ignore[arg-type]
