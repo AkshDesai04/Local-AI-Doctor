@@ -34,6 +34,7 @@ class Capability(StrEnum):
     STREAMING = "streaming"
     BATCHING = "batching"
     DETERMINISTIC_SEEDING = "deterministic_seeding"
+    CPU_OFFLOAD = "cpu_offload"
     CPU = "cpu"
     CUDA = "cuda"
     ROCM = "rocm"

@@ -218,6 +218,35 @@ def test_unimplemented_accelerator_adapters_are_never_advertised_as_full() -> No
     assert matrix.support(Capability.MPS).state is CapabilityState.UNAVAILABLE_ON_BACKEND
 
 
+@pytest.mark.parametrize(
+    ("task", "backends", "state"),
+    [
+        (ModelTask.TEXT_GENERATION, {BackendKind.CPU, BackendKind.CUDA}, CapabilityState.PARTIAL),
+        (ModelTask.TEXT_GENERATION, {BackendKind.CPU}, CapabilityState.UNSUPPORTED),
+        (ModelTask.EMBEDDING, {BackendKind.CPU, BackendKind.CUDA}, CapabilityState.UNSUPPORTED),
+    ],
+)
+def test_cpu_offload_is_partial_only_for_generators_on_cuda(
+    task: ModelTask, backends: set[BackendKind], state: CapabilityState
+) -> None:
+    matrix = build_capability_matrix(
+        ModelEvidence(
+            task=task,
+            modalities=frozenset({"text"}),
+            has_tokenizer=True,
+            has_processor=False,
+            has_reasoning_delimiters=False,
+            is_moe=False,
+            architecture_known=True,
+            available_backends=frozenset(backends),
+        )
+    )
+
+    support = matrix.support(Capability.CPU_OFFLOAD)
+    assert support.state is state
+    assert support.reason
+
+
 def test_moe_checkpoint_does_not_claim_routing_without_an_instrumentation_adapter() -> None:
     matrix = build_capability_matrix(
         ModelEvidence(

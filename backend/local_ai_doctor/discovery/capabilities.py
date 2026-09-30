@@ -184,6 +184,18 @@ def build_capability_matrix(evidence: ModelEvidence) -> CapabilityMatrix:
         else _unsupported("the model task is unknown")
     )
 
+    entries[Capability.CPU_OFFLOAD] = (
+        _partial(
+            "accelerate layer offload when Strict VRAM is off; much slower",
+            "layers placed in system RAM are copied to the GPU on every forward pass",
+        )
+        if generation and BackendKind.CUDA in evidence.available_backends
+        else _unsupported(
+            "layer offload needs a usable CUDA runtime"
+            if generation
+            else "layer offload applies only to generation models"
+        )
+    )
     entries[Capability.CPU] = _backend(evidence, BackendKind.CPU)
     entries[Capability.CUDA] = _backend(evidence, BackendKind.CUDA)
     entries[Capability.ROCM] = _backend(evidence, BackendKind.ROCM)
