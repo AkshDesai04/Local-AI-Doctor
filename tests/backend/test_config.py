@@ -228,3 +228,29 @@ def test_unload_timeout_is_separate_from_the_shutdown_grace() -> None:
     assert override.workers.unload_timeout_seconds == 5.0
     with pytest.raises(ValidationError):
         AppSettings.model_validate({"workers": {"unload_timeout_seconds": 0.5}})
+
+
+def test_runtime_defaults_allow_several_residents_under_strict_vram() -> None:
+    runtime = AppSettings().runtime
+
+    assert runtime.strict_vram is True
+    assert runtime.vram_safety_margin_bytes == 512 * 1024**2
+    assert runtime.kv_reserve_tokens == 4096
+    assert runtime.load_one_model_at_a_time is False
+    assert runtime.max_loaded_models == 4
+    assert runtime.max_concurrent_runs == 2
+    snapshot = AppSettings().inference_snapshot()["runtime"]
+    assert snapshot["strict_vram"] is True
+    assert snapshot["vram_safety_margin_bytes"] == 512 * 1024**2
+
+
+def test_runtime_rejects_superseded_cpu_offload_and_incoherent_limits() -> None:
+    with pytest.raises(ValidationError, match="superseded by runtime.strict_vram=false"):
+        AppSettings.model_validate({"runtime": {"cpu_offload": True}})
+    with pytest.raises(ValidationError, match="max_loaded_models must be 1"):
+        AppSettings.model_validate(
+            {"runtime": {"load_one_model_at_a_time": True, "max_loaded_models": 2}}
+        )
+    with pytest.raises(ValidationError):
+        AppSettings.model_validate({"runtime": {"vram_safety_margin_bytes": 17 * 1024**3}})
+    assert AppSettings.model_validate({"runtime": {"cpu_offload": False}}).runtime.strict_vram

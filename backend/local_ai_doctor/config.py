@@ -201,15 +201,21 @@ class RuntimeSettings(BaseModel):
     ram_budget_bytes: int | None = Field(default=None, ge=256 * 1024**2)
     vram_budget_bytes: int | None = Field(default=None, ge=256 * 1024**2)
     low_memory_loading: bool = True
+    # Superseded by strict_vram=false; kept so existing files that say `false` still load.
     cpu_offload: bool = False
     device_placement: str = "sequential"
     dtype: DType = DType.AUTO
     quantization: Quantization = Quantization.NONE
     attention_backend: AttentionBackend = AttentionBackend.AUTO
-    load_one_model_at_a_time: bool = True
-    max_loaded_models: int = Field(default=1, ge=1, le=32)
+    # Strict VRAM never lets weights spill into system RAM: a load that does not fit
+    # fails instead of offloading layers. Each load may override it.
+    strict_vram: bool = True
+    vram_safety_margin_bytes: int = Field(default=512 * 1024**2, ge=0, le=16 * 1024**3)
+    kv_reserve_tokens: int = Field(default=4096, ge=0, le=10_000_000)
+    load_one_model_at_a_time: bool = False
+    max_loaded_models: int = Field(default=4, ge=1, le=32)
     max_batch_size: int = Field(default=1, ge=1, le=1024)
-    max_concurrent_runs: int = Field(default=1, ge=1, le=256)
+    max_concurrent_runs: int = Field(default=2, ge=1, le=256)
     queue_limit: int = Field(default=32, ge=0, le=100_000)
 
     @model_validator(mode="after")
@@ -219,8 +225,8 @@ class RuntimeSettings(BaseModel):
                 "runtime.max_loaded_models must be 1 when "
                 "runtime.load_one_model_at_a_time is enabled"
             )
-        if self.cpu_offload and self.device is DeviceMode.CPU:
-            raise ValueError("CPU offload has no effect when runtime.device is cpu")
+        if self.cpu_offload:
+            raise ValueError("runtime.cpu_offload is superseded by runtime.strict_vram=false")
         return self
 
 
