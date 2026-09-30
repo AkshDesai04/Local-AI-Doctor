@@ -196,10 +196,17 @@ Configuration also supports `LAD_` environment variables with `__` between neste
 ## Using the workbench
 
 1. Inspect the model registry and its diagnostics, context candidates, and capability states.
-2. Load one or more models. Several models stay resident together while they fit in VRAM (up to `runtime.max_loaded_models`); loading one that does not fit unloads the least recently used idle model first. With Strict VRAM on (the default) a model that still does not fit fails with a clear error; turn Strict VRAM off for that load to offload layers to system RAM, which is much slower. Auto selection prefers the first usable CUDA device and otherwise uses CPU when fallback is permitted.
+2. Load models from their registry cards. Several stay resident together while they fit in VRAM (up to `runtime.max_loaded_models`); loading one that does not fit unloads the least recently used idle model first. See [Resident models and Strict VRAM](#resident-models-and-strict-vram). Auto selection prefers the first usable CUDA device and otherwise uses CPU when fallback is permitted.
 3. For generation, create or select a chat, set sampling and instrumentation controls, then stream the response. Nerd Mode links visible token boundaries to probability and timing views. A new decoder-only run at `full` or `expert` also lets you select a token and inspect its bounded context-attention map.
 4. For an embedding model, open the Embeddings workspace, provide text or supported uploaded media, choose an advertised dimension, and compare normalized vectors.
 5. Export a generation run as JSON, replayable JSONL events, or token CSV. The API also exports/imports a path-free chat workspace and can replay a completed generation as a sibling assistant branch using its recorded settings.
+
+### Resident models and Strict VRAM
+
+- Each loadable model card in the registry has its own load options: **Device** (Auto, CUDA, or CPU), **Data type** (Auto, bfloat16, float16, or float32), and **Strict VRAM**. They are saved per model in the browser and also appear under Generation controls › Model loading for the selected model. A chat message sent to a model that is not resident loads it with these options; a resident copy is reused as it is.
+- **Strict VRAM** is on by default (`runtime.strict_vram`). It keeps the whole model in GPU memory and fails with a readable "Not enough GPU memory" message instead of spilling into system RAM. Turn it off for a load to let layers that do not fit run from system RAM, which is much slower; such a copy shows an "Offloaded to system RAM" badge. The switch is disabled for CPU loads.
+- Every resident copy is listed on its model card with its device, dtype, placement, measured GPU, RAM, and KV-reserve usage, and its own **Unload**. **Unload all** sits on the memory card at the top of the registry, which splits GPU memory into resident models, other use, PyTorch's reserved cache, the safety margin, and free memory, and shows how many models are resident out of `runtime.max_loaded_models`.
+- When a load needs room, the least recently used idle model is unloaded first and a notice names it. The header shows the selected model's resident copy (for example `cuda:0 · bf16`) and a compact used/total VRAM meter when the backend reports a CUDA device.
 
 The REST API is rooted at `/api/v1`; live runs use the `lad.events.v1` WebSocket subprotocol. See [API and WebSocket reference](docs/api.md) and [metric definitions](docs/metrics.md).
 
