@@ -1,12 +1,17 @@
 [CmdletBinding()]
-param()
+param(
+    # Installer file name produced by electron-builder, for example
+    # Local-AI-Doctor-<version>-cuda.exe. scripts/dist.cjs supplies it.
+    [Parameter(Mandatory)]
+    [ValidatePattern('^Local-AI-Doctor-.+-(cuda|cpu)\.exe$')]
+    [string]$ArtifactName
+)
 
 $ErrorActionPreference = "Stop"
 $DesktopRoot = Split-Path -Parent $PSScriptRoot
 $RepositoryRoot = Split-Path -Parent $DesktopRoot
 $ReleaseRoot = [IO.Path]::GetFullPath((Join-Path $RepositoryRoot "release"))
-$Manifest = Get-Content -LiteralPath (Join-Path $DesktopRoot "package.json") -Raw | ConvertFrom-Json
-$ExpectedName = "Local-AI-Doctor-$($Manifest.version).exe"
+$ExpectedName = $ArtifactName
 $ExpectedPath = [IO.Path]::GetFullPath((Join-Path $ReleaseRoot $ExpectedName))
 
 if (-not (Test-Path -LiteralPath $ExpectedPath -PathType Leaf)) {

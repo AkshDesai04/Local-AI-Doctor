@@ -12,7 +12,7 @@
     "build:frontend": "npm --prefix ../frontend run build",
     "build:backend": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-backend.ps1",
     "build:payload": "npm run build:frontend && npm run build:backend",
-    "dist": "npm run build:payload && electron-builder --win nsis --x64 --publish never && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-packaged-layout.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/finalize-release.ps1",
+    "dist": "node scripts/dist.cjs",
     "dist:win": "npm run dist"
   },
   "devDependencies": {
@@ -57,7 +57,7 @@
           ]
         }
       ],
-      "artifactName": "Local-AI-Doctor-${version}.exe"
+      "artifactName": "Local-AI-Doctor-${version}-${env.LAD_DESKTOP_TORCH_VARIANT}.exe"
     },
     "nsis": {
       "guid": "df0eb923-5a87-57ad-bb13-24a35a6c435a",

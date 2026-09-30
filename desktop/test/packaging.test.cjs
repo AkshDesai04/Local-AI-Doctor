@@ -10,7 +10,9 @@ const manifest = require("../package.json");
 test("the Windows artifact installs persistently instead of extracting on every launch", () => {
   assert.equal(manifest.build.compression, "normal");
   assert.deepEqual(manifest.build.win.target, [{ target: "nsis", arch: ["x64"] }]);
-  assert.equal(manifest.build.win.artifactName, "Local-AI-Doctor-${version}.exe");
+  // The PyTorch variant is part of the name, and an unset variable fails the build.
+  assert.equal(manifest.build.win.artifactName, "Local-AI-Doctor-${version}-${env.LAD_DESKTOP_TORCH_VARIANT}.exe");
+  assert.equal(manifest.scripts.dist, "node scripts/dist.cjs");
   assert.equal(manifest.build.nsis.guid, "df0eb923-5a87-57ad-bb13-24a35a6c435a");
   assert.equal(manifest.build.nsis.oneClick, false);
   assert.equal(manifest.build.nsis.perMachine, false);

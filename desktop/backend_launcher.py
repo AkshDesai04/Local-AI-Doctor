@@ -132,8 +132,8 @@ def self_check(variant: str | None, require_cuda: bool) -> tuple[dict[str, Any],
         or report["torch_cuda_build"] != expected[1]
     ):
         problems.append(
-            f"expected a {variant} PyTorch build (*{expected[0]}, CUDA {expected[1]}) but found "
-            f"{report['torch_version']} (CUDA {report['torch_cuda_build']})"
+            f"expected a {variant} PyTorch build (*{expected[0]}, CUDA {expected[1] or 'none'}) but found "
+            f"{report['torch_version']} (CUDA {report['torch_cuda_build'] or 'none'})"
         )
     if require_cuda:
         if not cuda_available:
