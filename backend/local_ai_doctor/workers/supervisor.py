@@ -569,10 +569,12 @@ class ModelWorkerSupervisor:
         normalize: bool,
         batch_size: int,
         timeout_seconds: float,
+        model_key: str | None = None,
     ) -> dict[str, Any]:
         return await self._request(
             {
                 "op": "embed",
+                "model_key": model_key,
                 "inputs": inputs,
                 "dimensions": dimensions,
                 "normalize": normalize,
@@ -581,9 +583,11 @@ class ModelWorkerSupervisor:
             timeout_seconds,
         )
 
-    async def score_prompt(self, text: str, *, timeout_seconds: float) -> dict[str, Any]:
+    async def score_prompt(
+        self, text: str, *, timeout_seconds: float, model_key: str | None = None
+    ) -> dict[str, Any]:
         return await self._request(
-            {"op": "score_prompt", "text": text},
+            {"op": "score_prompt", "model_key": model_key, "text": text},
             timeout_seconds,
         )
 

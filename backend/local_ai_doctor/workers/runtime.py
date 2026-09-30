@@ -1207,7 +1207,7 @@ class WorkerRuntime:
 
         resident = self.residents.pop(key, None)
         if resident is not None and self._active is resident:
-            self._active = None
+            self._active = next(reversed(self.residents.values()), None)
         del resident
         gc.collect()
         self._empty_cache()
@@ -1636,6 +1636,7 @@ class WorkerRuntime:
             self._restore_attention_implementation()
 
     def _embed(self, command: Mapping[str, Any]) -> dict[str, Any]:
+        self._select_resident(command.get("model_key"))
         if self.sentence_model is None or self.model_info is None:
             raise RuntimeError("no embedding model is loaded")
         import numpy as np
@@ -1720,6 +1721,7 @@ class WorkerRuntime:
         }
 
     def _score_prompt(self, command: Mapping[str, Any]) -> dict[str, Any]:
+        self._select_resident(command.get("model_key"))
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("no generation model is loaded")
         import torch

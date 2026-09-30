@@ -1488,6 +1488,7 @@ class RunManager:
                 normalize=request.normalize,
                 batch_size=self.settings.runtime.max_batch_size,
                 timeout_seconds=self.settings.workers.inference_timeout_seconds,
+                model_key=loaded.get("model_key"),
             )
             now = _now()
             async with self.repository.database.transaction() as connection:
@@ -1662,6 +1663,7 @@ class RunManager:
             result = await self.worker.score_prompt(
                 request.text,
                 timeout_seconds=self.settings.workers.inference_timeout_seconds,
+                model_key=loaded.get("model_key"),
             )
             await self.repository.update_run(
                 run_id,

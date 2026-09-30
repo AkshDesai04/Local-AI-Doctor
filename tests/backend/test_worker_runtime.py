@@ -2043,3 +2043,30 @@ def test_unload_reports_freed_and_leaked_device_bytes(monkeypatch: pytest.Monkey
         runtime._unload("a")
     assert runtime._unload()["unloaded_model_keys"] == ["b"]
     assert runtime._unload()["unloaded_model_id"] is None
+
+
+def test_embeddings_and_scoring_run_on_the_named_resident(monkeypatch: pytest.MonkeyPatch) -> None:
+    from local_ai_doctor.workers.runtime import ResidentModel, WorkerReportedError
+
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, _output = _two_resident_runtime([], CountingCausalModel(2), CountingCausalModel(2))
+    runtime.residents["embed"] = ResidentModel(
+        key="embed",
+        sentence_model=FakeSentenceModel(),
+        model_info={"id": "embedder", "model_type": "bert", "embedding_pooling": "mean"},
+    )
+    runtime._active = runtime.residents["a"]
+
+    result = runtime._embed(
+        {
+            "model_key": "embed",
+            "inputs": [{"input_id": "one", "modality": "text", "text": "hello"}],
+            "normalize": False,
+            "batch_size": 1,
+        }
+    )
+
+    assert result["results"][0]["output_dimension"] == 128
+    assert result["pooling"] == "mean"
+    with pytest.raises(WorkerReportedError, match="model_not_resident"):
+        runtime._score_prompt({"model_key": "gone", "text": "score me"})
