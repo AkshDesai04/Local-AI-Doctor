@@ -245,7 +245,7 @@ def test_runtime_defaults_allow_several_residents_under_strict_vram() -> None:
 
 
 def test_runtime_rejects_superseded_cpu_offload_and_incoherent_limits() -> None:
-    with pytest.raises(ValidationError, match="superseded by runtime.strict_vram=false"):
+    with pytest.raises(ValidationError, match=r"superseded by runtime.strict_vram=false"):
         AppSettings.model_validate({"runtime": {"cpu_offload": True}})
     with pytest.raises(ValidationError, match="max_loaded_models must be 1"):
         AppSettings.model_validate(

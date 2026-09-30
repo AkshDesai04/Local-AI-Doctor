@@ -12,6 +12,7 @@ import time
 import traceback
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from multiprocessing.queues import Queue
 from pathlib import Path
 from typing import Any
@@ -634,22 +635,87 @@ def _contains_visible_answer(token: SegmentedToken) -> bool:
     )
 
 
+@dataclass(eq=False)
+class ResidentModel:
+    """One loaded checkpoint and everything the worker needs to run it."""
+
+    key: str
+    model: Any = None
+    tokenizer: Any = None
+    processor: Any = None
+    sentence_model: Any = None
+    model_info: dict[str, Any] | None = None
+    # `device` is the requested device; `input_device` is where input tensors go,
+    # which is the GPU whenever any part of the device map uses it.
+    device: str = "cpu"
+    input_device: str = "cpu"
+    dtype: str = "float32"
+    quantization: str = "none"
+    strict_vram: bool = True
+    placement: str = "cpu"
+    loaded_attention_implementation: str | None = None
+    decoder_start_token_id: int | None = None
+    decoder_start_token_source: str | None = None
+    decoder_start_warning: str | None = None
+    gpu_bytes: int = 0
+    cpu_bytes: int = 0
+    kv_reserve_bytes: int = 0
+    load_seconds: float = 0.0
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "model_key": self.key,
+            "model_id": (self.model_info or {}).get("id"),
+            "placement": self.placement,
+            "quantization": self.quantization,
+            "strict_vram": self.strict_vram,
+            "gpu_bytes": self.gpu_bytes,
+            "cpu_bytes": self.cpu_bytes,
+            "kv_reserve_bytes": self.kv_reserve_bytes,
+        }
+
+
+def _active_attribute(name: str, default: Any) -> Any:
+    """Expose one attribute of the active resident as a runtime attribute.
+
+    Setting a value on a runtime with no residents creates a ``default`` resident,
+    so single-model callers keep assigning ``runtime.model`` and friends directly.
+    """
+
+    def get(runtime: WorkerRuntime) -> Any:
+        return default if runtime._active is None else getattr(runtime._active, name)
+
+    def set_(runtime: WorkerRuntime, value: Any) -> None:
+        if runtime._active is None:
+            if value is None:
+                return
+            runtime._active = runtime.residents["default"] = ResidentModel(key="default")
+        setattr(runtime._active, name, value)
+        if name == "device":
+            runtime._active.input_device = value
+
+    return property(get, set_)
+
+
 class WorkerRuntime:
+    model = _active_attribute("model", None)
+    tokenizer = _active_attribute("tokenizer", None)
+    processor = _active_attribute("processor", None)
+    sentence_model = _active_attribute("sentence_model", None)
+    model_info = _active_attribute("model_info", None)
+    device = _active_attribute("device", "cpu")
+    dtype = _active_attribute("dtype", "float32")
+    decoder_start_token_id = _active_attribute("decoder_start_token_id", None)
+    decoder_start_token_source = _active_attribute("decoder_start_token_source", None)
+    decoder_start_warning = _active_attribute("decoder_start_warning", None)
+    loaded_attention_implementation = _active_attribute("loaded_attention_implementation", None)
+
     def __init__(self, commands: Queue[Any], output: Queue[Any], cancel_event: Any) -> None:
         self.commands = commands
         self.output = output
         self.cancel_event = cancel_event
-        self.model: Any = None
-        self.tokenizer: Any = None
-        self.processor: Any = None
-        self.sentence_model: Any = None
-        self.model_info: dict[str, Any] | None = None
-        self.device = "cpu"
-        self.dtype = "float32"
-        self.decoder_start_token_id: int | None = None
-        self.decoder_start_token_source: str | None = None
-        self.decoder_start_warning: str | None = None
-        self.loaded_attention_implementation: str | None = None
+        self.residents: dict[str, ResidentModel] = {}
+        self._active: ResidentModel | None = None
 
     def run(self) -> None:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -715,6 +781,8 @@ class WorkerRuntime:
             raise FileNotFoundError(
                 f"configured model directory {model_path.name!r} is unavailable"
             )
+        key = str(command.get("model_key") or "default")
+        self._active = self.residents[key] = ResidentModel(key=key)
         self.device = str(runtime.get("device", "cpu"))
         self.dtype = str(runtime.get("dtype", "float32"))
         torch.set_num_threads(int(runtime.get("cpu_threads", max(1, os.cpu_count() or 1))))
@@ -816,7 +884,7 @@ class WorkerRuntime:
         unloaded = self.model_info["id"] if self.model_info else None
         memory_before: dict[str, Any] = {}
         torch_module: Any | None = None
-        if self.model is not None or self.sentence_model is not None or self.model_info is not None:
+        if self.residents:
             try:
                 import torch
 
@@ -824,15 +892,8 @@ class WorkerRuntime:
                 memory_before = self._memory_snapshot(torch)
             except ImportError:
                 pass
-        self.model = None
-        self.tokenizer = None
-        self.processor = None
-        self.sentence_model = None
-        self.model_info = None
-        self.decoder_start_token_id = None
-        self.decoder_start_token_source = None
-        self.decoder_start_warning = None
-        self.loaded_attention_implementation = None
+        self.residents.clear()
+        self._active = None
         gc.collect()
         try:
             if torch_module is not None and torch_module.cuda.is_available():
