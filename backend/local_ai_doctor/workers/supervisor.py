@@ -10,7 +10,8 @@ import uuid
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from typing import Any
 
-from ..domain.models import ModelDescriptor, TrustDecision
+from ..domain.capabilities import Capability, CapabilityState
+from ..domain.models import ModelDescriptor, ModelTask, TrustDecision
 from .runtime import worker_main
 
 
@@ -18,6 +19,35 @@ class WorkerFailure(RuntimeError):
     def __init__(self, error: Mapping[str, Any]) -> None:
         self.error = dict(error)
         super().__init__(str(error.get("message", "model worker failed")))
+
+
+def worker_model_payload(descriptor: ModelDescriptor) -> dict[str, Any]:
+    """The bounded model description the worker loads; never includes weights."""
+
+    metadata = getattr(descriptor, "metadata", {}) or {}
+    return {
+        "id": descriptor.id,
+        "display_name": descriptor.display_name,
+        "path": str(descriptor.path),
+        "task": descriptor.task.value,
+        "model_type": descriptor.model_type,
+        "effective_context_limit": descriptor.effective_context_limit,
+        "reasoning_delimiters": getattr(descriptor, "reasoning_delimiters", None),
+        "fingerprint": descriptor.fingerprint.value,
+        "embedding_pooling": metadata.get("pooling"),
+        "joint_embedding_space": metadata.get("joint_embedding_space", False),
+        "trust_remote_code": descriptor.trust_decision is TrustDecision.REVIEWED_BUNDLED_CODE,
+        # Chat media the worker must prepare with the checkpoint's processor.
+        "media_modalities": sorted(
+            modality
+            for modality, capability in (
+                ("image", Capability.VISION),
+                ("video", Capability.VIDEO),
+            )
+            if descriptor.task is ModelTask.TEXT_GENERATION
+            and descriptor.capabilities.support(capability).state is not CapabilityState.UNSUPPORTED
+        ),
+    }
 
 
 class ModelWorkerSupervisor:
@@ -337,20 +367,7 @@ class ModelWorkerSupervisor:
         *,
         timeout_seconds: float,
     ) -> dict[str, Any]:
-        metadata = getattr(descriptor, "metadata", {}) or {}
-        model = {
-            "id": descriptor.id,
-            "display_name": descriptor.display_name,
-            "path": str(descriptor.path),
-            "task": descriptor.task.value,
-            "model_type": descriptor.model_type,
-            "effective_context_limit": descriptor.effective_context_limit,
-            "reasoning_delimiters": getattr(descriptor, "reasoning_delimiters", None),
-            "fingerprint": descriptor.fingerprint.value,
-            "embedding_pooling": metadata.get("pooling"),
-            "joint_embedding_space": metadata.get("joint_embedding_space", False),
-            "trust_remote_code": descriptor.trust_decision is TrustDecision.REVIEWED_BUNDLED_CODE,
-        }
+        model = worker_model_payload(descriptor)
         requested = {"model": model, "runtime": dict(runtime)}
         if (
             self._loaded is not None
@@ -398,7 +415,7 @@ class ModelWorkerSupervisor:
         self,
         *,
         run_id: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         sampling: Mapping[str, Any],
         effective_seed: int,
         instrumentation: str,

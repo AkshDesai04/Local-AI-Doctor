@@ -593,6 +593,119 @@ def test_families_rejecting_new_keywords_still_generate(monkeypatch: pytest.Monk
     assert completed["payload"]["text"] == "hellohello</s>"
 
 
+class FakeProcessor:
+    """Processor fixture: renders content parts and expands one image into two pads."""
+
+    chat_template = "fixture"
+    image_processor = SimpleNamespace(merge_size=1)
+    video_processor = SimpleNamespace(merge_size=1)
+
+    def __init__(self) -> None:
+        self.rendered: list[Any] = []
+        self.calls: list[dict[str, Any]] = []
+
+    def apply_chat_template(self, messages: Any, **_options: Any) -> str:
+        self.rendered.append(messages)
+        return "summarize this"
+
+    def __call__(self, **kwargs: Any) -> dict[str, FakeTensor]:
+        self.calls.append(kwargs)
+        return {
+            "input_ids": FakeTensor([[7, 7, 5, 6]]),
+            "attention_mask": FakeTensor([[1, 1, 1, 1]]),
+            "pixel_values": FakeTensor([[0.5, 0.5]]),
+            "image_grid_thw": FakeTensor([[1, 1, 2]]),
+        }
+
+
+def _media_command(image_path: Path) -> dict[str, Any]:
+    command = generation_command()
+    command["messages"] = [
+        {"role": "user", "content": "earlier", "attachments": []},
+        {"role": "assistant", "content": "noted"},
+        {
+            "role": "user",
+            "content": "summarize this",
+            "attachments": [{"kind": "image", "path": str(image_path)}],
+        },
+    ]
+    return command
+
+
+def test_media_prompts_use_processor_content_parts_and_prefill_only_pixels(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from PIL import Image
+
+    image_path = tmp_path / "red.png"
+    Image.new("RGB", (4, 4), (255, 0, 0)).save(image_path)
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, _model, output = configured_causal_runtime()
+    model = RecordingCausalModel()
+    model.config.image_token_id = 7
+    runtime.model = model
+    processor = FakeProcessor()
+    runtime.processor = processor
+
+    runtime._generate(_media_command(image_path))
+
+    assert processor.rendered[0][-1]["content"] == [
+        {"type": "image"},
+        {"type": "text", "text": "summarize this"},
+    ]
+    assert processor.rendered[0][0]["content"] == [{"type": "text", "text": "earlier"}]
+    assert "path" not in json.dumps(processor.rendered[0])
+    images = processor.calls[0]["images"]
+    assert len(images) == 1 and images[0].mode == "RGB"
+    assert processor.calls[0]["add_special_tokens"] is False
+    assert "pixel_values" in model.calls[0] and "image_grid_thw" in model.calls[0]
+    assert all("pixel_values" not in call for call in model.calls[1:])
+    assert model.calls[0]["input_ids"].tolist() == [[7, 7, 5, 6]]
+    stage = next(
+        item["payload"]
+        for item in output.items
+        if item["kind"] == "run_event" and item["event_type"] == "stage"
+    )
+    assert stage["media"] == {"images": 1, "videos": 0, "placeholder_tokens": 2}
+
+
+def test_media_prompts_require_a_loaded_processor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, model, _output = configured_causal_runtime()
+
+    with pytest.raises(ValueError, match="no chat media processor"):
+        runtime._generate(_media_command(tmp_path / "unused.png"))
+    assert model.calls == []
+
+
+def test_media_labels_assign_placeholders_to_their_attachment() -> None:
+    from local_ai_doctor.workers.runtime import _media_labels
+
+    labels = _media_labels(
+        [1, 7, 7, 2, 7, 8, 8, 8, 3],
+        {7: "image", 8: "video"},
+        {"image": [2, 1], "video": [3]},
+    )
+    assert labels == [
+        None,
+        {"kind": "image", "index": 0},
+        {"kind": "image", "index": 0},
+        None,
+        {"kind": "image", "index": 1},
+        {"kind": "video", "index": 0},
+        {"kind": "video", "index": 0},
+        {"kind": "video", "index": 0},
+        None,
+    ]
+    # Counts that do not match the prompt are not trusted for item indices.
+    assert _media_labels([7, 7], {7: "image"}, {"image": [3]}) == [
+        {"kind": "image"},
+        {"kind": "image"},
+    ]
+
+
 def _tiny_qwen3_vl() -> Any:
     import torch
     from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration

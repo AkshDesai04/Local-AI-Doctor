@@ -447,6 +447,123 @@ def _generation_loader(model_path: Path, common: Mapping[str, Any]) -> Any:
     return transformers.AutoModelForCausalLM
 
 
+_MEDIA_KINDS = frozenset({"image", "video"})
+
+
+def _processor_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Convert chat messages to the content-part form processor chat templates expect.
+
+    Media parts carry no path or bytes: the template only emits placeholder tokens,
+    and the processor expands them from the decoded inputs passed alongside the text.
+    """
+
+    return [
+        {
+            "role": str(message.get("role", "user")),
+            "content": [
+                *({"type": str(item["kind"])} for item in message.get("attachments") or ()),
+                {"type": "text", "text": str(message.get("content") or "")},
+            ],
+        }
+        for message in messages
+    ]
+
+
+def _load_media(
+    processor: Any, messages: Sequence[Mapping[str, Any]]
+) -> tuple[list[Any], list[Any], list[Any]]:
+    """Decode attachment files the parent resolved inside the upload store.
+
+    Order follows the conversation so it matches the placeholder order the chat
+    template renders. Video frames are sampled with the processor's own policy,
+    and the metadata is kept because Qwen3-VL derives frame timestamps from it.
+    """
+
+    from PIL import Image
+
+    images: list[Any] = []
+    videos: list[Any] = []
+    video_metadata: list[Any] = []
+    for message in messages:
+        for item in message.get("attachments") or ():
+            kind = str(item.get("kind"))
+            path = Path(str(item.get("path")))
+            if kind not in _MEDIA_KINDS:
+                raise ValueError(f"unsupported chat media kind: {kind!r}")
+            if path.is_symlink() or not path.is_file():
+                raise FileNotFoundError("a chat attachment file is unavailable")
+            if kind == "image":
+                with Image.open(path) as image:
+                    images.append(image.convert("RGB"))
+            else:
+                from transformers import video_utils
+
+                # Local paths only: the parent resolved each file inside the upload
+                # store, so the URL branches of this loader are never reached.
+                load_video: Any = video_utils.load_video
+                frames, metadata = load_video(
+                    str(path),
+                    backend="pyav",
+                    sample_indices_fn=processor.video_processor.sample_frames,
+                )
+                videos.append(frames)
+                video_metadata.append(metadata)
+    return images, videos, video_metadata
+
+
+def _media_token_counts(processor: Any, media_inputs: Mapping[str, Any]) -> dict[str, list[int]]:
+    """Placeholder tokens per media item, from the processor's patch grids."""
+
+    counts: dict[str, list[int]] = {}
+    for kind, grid_key, component in (
+        ("image", "image_grid_thw", "image_processor"),
+        ("video", "video_grid_thw", "video_processor"),
+    ):
+        grid = media_inputs.get(grid_key)
+        merge = getattr(getattr(processor, component, None), "merge_size", None)
+        if grid is not None and isinstance(merge, int) and merge > 0:
+            counts[kind] = [
+                int(frames * height * width) // merge**2 for frames, height, width in grid.tolist()
+            ]
+    return counts
+
+
+def _media_labels(
+    token_ids: Sequence[int],
+    placeholder_ids: Mapping[int, str],
+    tokens_per_item: Mapping[str, Sequence[int]],
+) -> list[dict[str, Any] | None]:
+    """Label each prompt position that holds image or video features.
+
+    Placeholder positions are assigned to media items by the per-item token counts
+    the processor produced; when those are unknown the item index is omitted.
+    """
+
+    boundaries = {
+        kind: [sum(counts[: index + 1]) for index in range(len(counts))]
+        for kind, counts in tokens_per_item.items()
+    }
+    totals = {
+        kind: sum(1 for token_id in token_ids if placeholder_ids.get(token_id) == kind)
+        for kind in set(placeholder_ids.values())
+    }
+    seen: dict[str, int] = {}
+    labels: list[dict[str, Any] | None] = []
+    for token_id in token_ids:
+        kind = placeholder_ids.get(token_id)
+        if kind is None:
+            labels.append(None)
+            continue
+        position = seen.get(kind, 0)
+        seen[kind] = position + 1
+        label: dict[str, Any] = {"kind": kind}
+        limits = boundaries.get(kind)
+        if limits and limits[-1] == totals[kind]:
+            label["index"] = next(index for index, end in enumerate(limits) if position < end)
+        labels.append(label)
+    return labels
+
+
 def _embedding_model_kwargs(model_path: Path, kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Return loader kwargs required by reviewed built-in embedding architectures.
 
@@ -524,6 +641,7 @@ class WorkerRuntime:
         self.cancel_event = cancel_event
         self.model: Any = None
         self.tokenizer: Any = None
+        self.processor: Any = None
         self.sentence_model: Any = None
         self.model_info: dict[str, Any] | None = None
         self.device = "cpu"
@@ -626,6 +744,11 @@ class WorkerRuntime:
 
             tokenizer_loader: Any = AutoTokenizer
             self.tokenizer = tokenizer_loader.from_pretrained(model_path, **common)
+            if model.get("media_modalities"):
+                from transformers import AutoProcessor
+
+                processor_loader: Any = AutoProcessor
+                self.processor = processor_loader.from_pretrained(model_path, **common)
             loader: Any = (
                 AutoModelForSeq2SeqLM
                 if task == "encoder_decoder_generation"
@@ -703,6 +826,7 @@ class WorkerRuntime:
                 pass
         self.model = None
         self.tokenizer = None
+        self.processor = None
         self.sentence_model = None
         self.model_info = None
         self.decoder_start_token_id = None
@@ -850,6 +974,7 @@ class WorkerRuntime:
         past_key_values: Any = None,
         *,
         capture_attention: bool = False,
+        media: Mapping[str, Any] | None = None,
     ) -> tuple[Any, Any, Any]:
         captured_attentions: list[Any | None] = []
         hook_handles: list[Any] = []
@@ -891,6 +1016,9 @@ class WorkerRuntime:
             "use_cache": True,
             "return_dict": True,
             "output_attentions": capture_attention,
+            # Processor outputs (pixel values, grids) belong to the prompt forward
+            # that contains their placeholder tokens; decode steps never repeat them.
+            **(media or {}),
         }
         # The attention mask spans cached and new positions, so the cache holds
         # everything before these input tokens. Families with multimodal RoPE
@@ -1067,9 +1195,14 @@ class WorkerRuntime:
         reasoning_requested = command.get("reasoning")
         if reasoning_requested is not None and not isinstance(reasoning_requested, bool):
             raise ValueError("reasoning must be a boolean when provided")
+        media_requested = any(item.get("attachments") for item in messages)
+        if media_requested and (self.processor is None or encoder_decoder):
+            raise ValueError("the loaded model has no chat media processor")
+        # Processors render the same chat templates from content-part messages,
+        # so media conversations reuse the tokenizer rendering path unchanged.
         rendered_prompt, prompt_renderer = _render_messages(
-            self.tokenizer,
-            messages,
+            self.processor if media_requested else self.tokenizer,
+            _processor_messages(messages) if media_requested else messages,
             reasoning=reasoning_requested,
             reasoning_delimiters=self.model_info.get("reasoning_delimiters"),
         )
@@ -1115,11 +1248,35 @@ class WorkerRuntime:
                 },
             )
         tokenization_started = time.monotonic_ns()
-        encoded = self.tokenizer(
-            rendered_prompt,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
+        media_inputs: dict[str, Any] = {}
+        media_summary: dict[str, Any] | None = None
+        if media_requested:
+            images, videos, video_metadata = _load_media(self.processor, messages)
+            processor_kwargs: dict[str, Any] = {}
+            if images:
+                processor_kwargs["images"] = images
+            if videos:
+                processor_kwargs.update(
+                    videos=videos, video_metadata=video_metadata, do_sample_frames=False
+                )
+            encoded = self.processor(
+                text=[rendered_prompt],
+                return_tensors="pt",
+                add_special_tokens=False,
+                **processor_kwargs,
+            )
+            media_inputs = {
+                key: value
+                for key, value in encoded.items()
+                if key not in {"input_ids", "attention_mask"}
+            }
+            media_summary = {"images": len(images), "videos": len(videos)}
+        else:
+            encoded = self.tokenizer(
+                rendered_prompt,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )
         input_ids = encoded["input_ids"]
         attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids))
         fallback_bos = (
@@ -1136,8 +1293,25 @@ class WorkerRuntime:
             )
         input_ids = input_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
+        media_inputs = {
+            key: value.to(self.device) if hasattr(value, "to") else value
+            for key, value in media_inputs.items()
+        }
         tokenization_ended = time.monotonic_ns()
         prompt_tokens = int(input_ids.shape[-1])
+        media_placeholders = {
+            int(token_id): kind
+            for kind, token_id in (
+                ("image", getattr(self.model.config, "image_token_id", None)),
+                ("video", getattr(self.model.config, "video_token_id", None)),
+            )
+            if media_summary is not None and isinstance(token_id, int)
+        }
+        if media_summary is not None:
+            prompt_ids = input_ids[0].tolist()
+            media_summary["placeholder_tokens"] = sum(
+                1 for token_id in prompt_ids if token_id in media_placeholders
+            )
         context_limit = int(self.model_info.get("effective_context_limit") or 4096)
         configured_prompt_limit = int(command.get("max_prompt_tokens", context_limit))
         reserved_output_tokens = int(command.get("reserved_output_tokens", 0))
@@ -1181,6 +1355,17 @@ class WorkerRuntime:
             if attention_capture_active
             else []
         )
+        if prompt_context_tokens and media_placeholders:
+            # Media positions stay `prompt` sources for older readers; the extra
+            # `media` field says which attached image or video they carry.
+            labels = _media_labels(
+                [int(item["token_id"]) for item in prompt_context_tokens],
+                media_placeholders,
+                _media_token_counts(self.processor, media_inputs),
+            )
+            for source, label in zip(prompt_context_tokens, labels, strict=True):
+                if label is not None:
+                    source["media"] = label
 
         configured_delimiters = self.model_info.get("reasoning_delimiters")
         tagged_reasoning_enabled = (
@@ -1286,6 +1471,7 @@ class WorkerRuntime:
                 ),
                 "template_ms": (template_ended - template_started) / 1e6,
                 "tokenization_ms": (tokenization_ended - tokenization_started) / 1e6,
+                "media": media_summary,
             },
         )
         if synchronize:
@@ -1319,6 +1505,7 @@ class WorkerRuntime:
                     torch,
                     input_ids[:, :-1],
                     attention_mask[:, :-1],
+                    media=media_inputs,
                 )
                 attention_capture_active = self._select_attention_implementation("eager")
                 if not attention_capture_active and not attention_capture_warning_emitted:
@@ -1347,7 +1534,9 @@ class WorkerRuntime:
                     input_ids,
                     attention_mask,
                     capture_attention=attention_capture_active,
+                    media=media_inputs,
                 )
+        media_inputs.clear()  # Pixel tensors are consumed by prefill; free them now.
         if synchronize:
             torch.cuda.synchronize()
         prefill_ended = time.monotonic_ns()
