@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { saveSessionAuthToken } from "./auth";
-import { api, subscribeToRun } from "./client";
+import { defaultGenerationSettings } from "../hooks/useWorkbench";
+import { api, ApiError, subscribeToRun } from "./client";
 import type { GenerateRequest } from "./types";
 
 function jsonResponse(value: unknown): Response {
@@ -513,5 +514,204 @@ describe("API boundary normalization", () => {
     expect(resumedUrl.searchParams.get("after")).toBe("12");
     expect(events).toHaveLength(1);
     unsubscribe();
+  });
+});
+
+describe("resident models and memory", () => {
+  const gib = 1024 ** 3;
+
+  function sentJson(fetchMock: { mock: { calls: Array<Parameters<typeof fetch>> } }): unknown {
+    const body = fetchMock.mock.calls[0]?.[1]?.body;
+    if (typeof body !== "string") throw new Error("Expected a JSON request body.");
+    return JSON.parse(body);
+  }
+
+  function errorResponse(status: number, value: unknown): Response {
+    return new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
+  }
+
+  it("normalizes every resident listed by health and keeps the most recent as loadedModelId", async () => {
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      status: "ok",
+      loaded_model: { model_id: "model-b", device: "cuda:0" },
+      loaded_models: [
+        { model_key: "key-a", model_id: "model-a", device: "cuda:0", dtype: "bfloat16", quantization: "none", placement: "gpu", strict_vram: true },
+        { model_key: "key-b", model_id: "model-b", device: "cuda:0", dtype: "float16", quantization: "none", placement: "offload", strict_vram: false },
+      ],
+    })));
+
+    const health = await api.health();
+    expect(health.loadedModelId).toBe("model-b");
+    expect(health.loadedModels).toEqual([
+      expect.objectContaining({ modelKey: "key-a", modelId: "model-a", dtype: "bfloat16", placement: "gpu", strictVram: true, gpuBytes: null }),
+      expect.objectContaining({ modelKey: "key-b", modelId: "model-b", dtype: "float16", placement: "offload", strictVram: false }),
+    ]);
+  });
+
+  it("leaves loadedModels undefined for a backend that reports only one loaded model", async () => {
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ status: "ok", loaded_model: { model_id: "model-a", device: "cpu" } })));
+    const health = await api.health();
+    expect(health.loadedModels).toBeUndefined();
+    expect(health.loadedModelId).toBe("model-a");
+  });
+
+  it("normalizes resident status with the memory ledger", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      models: [{
+        model_key: "key-a",
+        model_id: "model-a",
+        display_name: "Model A",
+        device: "cuda:0",
+        dtype: "bfloat16",
+        quantization: "none",
+        strict_vram: true,
+        placement: "gpu",
+        gpu_bytes: 2 * gib,
+        cpu_bytes: 64 * 1024 ** 2,
+        kv_reserve_bytes: 256 * 1024 ** 2,
+        load_seconds: 4.5,
+        last_used_at: "2026-10-01T10:00:00Z",
+        in_use: true,
+      }],
+      memory: {
+        device: "cuda:0",
+        total_bytes: 8 * gib,
+        free_bytes: 5 * gib,
+        torch_allocated_bytes: 2 * gib,
+        torch_reserved_bytes: 2.5 * gib,
+        cap_bytes: null,
+        process_rss_bytes: gib,
+        system_available_bytes: 12 * gib,
+        safety_margin_bytes: 512 * 1024 ** 2,
+        ledger_age_seconds: 1.5,
+        stale: false,
+      },
+      max_loaded_models: 4,
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const status = await api.residentStatus();
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/models/resident");
+    expect(status?.maxLoadedModels).toBe(4);
+    expect(status?.models).toEqual([{
+      modelKey: "key-a",
+      modelId: "model-a",
+      displayName: "Model A",
+      device: "cuda:0",
+      dtype: "bfloat16",
+      quantization: "none",
+      strictVram: true,
+      placement: "gpu",
+      gpuBytes: 2 * gib,
+      cpuBytes: 64 * 1024 ** 2,
+      kvReserveBytes: 256 * 1024 ** 2,
+      loadSeconds: 4.5,
+      lastUsedAt: "2026-10-01T10:00:00Z",
+      inUse: true,
+    }]);
+    expect(status?.memory).toEqual({
+      device: "cuda:0",
+      totalBytes: 8 * gib,
+      freeBytes: 5 * gib,
+      torchAllocatedBytes: 2 * gib,
+      torchReservedBytes: 2.5 * gib,
+      capBytes: null,
+      processRssBytes: gib,
+      systemAvailableBytes: 12 * gib,
+      safetyMarginBytes: 512 * 1024 ** 2,
+      ledgerAgeSeconds: 1.5,
+      stale: false,
+    });
+  });
+
+  it("returns null resident status when the backend has no resident endpoint", async () => {
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(errorResponse(404, { error: { code: "not_found", message: "not found" } })));
+    await expect(api.residentStatus()).resolves.toBeNull();
+  });
+
+  it("sends load options and surfaces the evicted residents", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      id: "model-c",
+      display_name: "Model C",
+      task: "text_generation",
+      lifecycle: "loaded",
+      loaded_device: "cuda:0",
+      model_key: "key-c",
+      placement: "gpu",
+      quantization: "none",
+      strict_vram: true,
+      evicted_model_keys: ["key-a"],
+      load: { ledger: { device: "cuda:0", total_bytes: 8 * gib } },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.loadModel("model-c", { device: "cuda", dtype: "bfloat16", strictVram: true });
+    expect(result).toMatchObject({ modelKey: "key-c", placement: "gpu", strictVram: true, evictedModelKeys: ["key-a"], model: { id: "model-c", lifecycle: "loaded" } });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/models/model-c/load");
+    expect(sentJson(fetchMock)).toEqual({ device: "cuda", dtype: "bfloat16", strictVram: true });
+  });
+
+  it("unloads one resident, one model, or every resident", async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ unloaded_model_keys: ["key/a"], freed_bytes: gib, leaked_bytes: 0 }))
+      .mockResolvedValueOnce(jsonResponse({ id: "model-b", lifecycle: "unloaded", unload: { unloaded_model_keys: ["key-b"], freed_bytes: 2 * gib } }))
+      .mockResolvedValueOnce(jsonResponse({ unloaded_model_keys: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.unloadResident("key/a")).resolves.toEqual({ unloadedModelKeys: ["key/a"], freedBytes: gib, leakedBytes: 0 });
+    await expect(api.unloadModel("model-b")).resolves.toEqual({ unloadedModelKeys: ["key-b"], freedBytes: 2 * gib, leakedBytes: null });
+    await api.unloadAll();
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method])).toEqual([
+      ["/api/v1/models/resident/key%2Fa/unload", "POST"],
+      ["/api/v1/models/model-b/unload", "POST"],
+      ["/api/v1/models/unload", "POST"],
+    ]);
+  });
+
+  it("turns an out-of-memory envelope into a readable message with the byte counts and hint", async () => {
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(errorResponse(507, {
+      error: {
+        code: "out_of_memory",
+        message: "insufficient memory",
+        retryable: false,
+        hint: "Quantize the model, unload another model, or turn off Strict VRAM to allow system-RAM offload.",
+        details: {
+          required_bytes: 7.3 * gib,
+          available_bytes: 5.9 * gib,
+          resident_model_keys: ["key-a"],
+          pinned_model_keys: ["key-a"],
+          evicted_model_keys: [],
+        },
+      },
+    })));
+
+    const failure = await api.loadModel("model-c", { device: "cuda", dtype: "auto", strictVram: true }).catch((cause: unknown) => cause);
+    expect(failure).toBeInstanceOf(ApiError);
+    const error = failure as ApiError;
+    expect(error.status).toBe(507);
+    expect(error.code).toBe("out_of_memory");
+    expect(error.message).toBe("Not enough GPU memory: needs 7.3 GiB, 5.9 GiB available. Quantize the model, unload another model, or turn off Strict VRAM to allow system-RAM offload.");
+    expect(error.details).toMatchObject({ pinned_model_keys: ["key-a"] });
+  });
+
+  it("sends Strict VRAM with generation settings and reads evictions from model_loaded events", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ run: { id: "run-1" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await api.generate({
+      chatId: "chat-1",
+      modelId: "model-1",
+      content: "Hi",
+      attachmentIds: [],
+      settings: { ...defaultGenerationSettings, device: "cuda", dtype: "bfloat16", strictVram: false },
+    });
+    expect(sentJson(fetchMock)).toMatchObject({ device: "cuda", dtype: "bfloat16", strict_vram: false });
+
+    fetchMock.mockResolvedValue(jsonResponse({ events: [
+      { version: 1, sequence: 2, type: "model_loaded", payload: { model_key: "key-c", evicted_model_keys: ["key-a"] } },
+      { version: 1, sequence: 9, type: "error", payload: { code: "out_of_memory", message: "insufficient memory", details: { required_bytes: 2 * gib, available_bytes: gib, memory_kind: "ram" } } },
+    ] }));
+    const [loaded, failed] = await api.runEvents("run-1");
+    expect(loaded).toMatchObject({ type: "stage.changed", evictedModelKeys: ["key-a"] });
+    expect(failed?.type === "error" ? failed.message : "").toMatch(/^Not enough system memory: needs 2 GiB, 1 GiB available\./);
   });
 });

@@ -22,6 +22,7 @@ const labels: Record<CapabilityKey, string> = {
   deterministic_seed: "Deterministic seeding",
   cpu: "CPU",
   cuda: "CUDA",
+  cpu_offload: "CPU offload",
 };
 
 export function capabilityLabel(key: CapabilityKey): string {

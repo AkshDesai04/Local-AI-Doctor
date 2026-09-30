@@ -21,7 +21,8 @@ export type CapabilityKey =
   | "batching"
   | "deterministic_seed"
   | "cpu"
-  | "cuda";
+  | "cuda"
+  | "cpu_offload";
 
 export interface Capability {
   state: CapabilityState;
@@ -71,10 +72,77 @@ export interface HealthStatus {
   version?: string;
   database?: string;
   worker?: string;
+  /** The most recently used resident model. */
   loadedModelId?: string;
   loadedDevice?: string;
+  /** Every resident model; undefined when the backend predates multi-model residency. */
+  loadedModels?: ResidentModel[];
   selectedBackend?: string;
   reason?: string;
+}
+
+export type ResidentPlacement = "gpu" | "offload" | "cpu";
+
+/** One loaded copy of a model. A model can have several with different device or dtype. */
+export interface ResidentModel {
+  modelKey: string;
+  modelId: string;
+  displayName: string | null;
+  device: string;
+  dtype: string | null;
+  quantization: string | null;
+  strictVram: boolean | null;
+  placement: ResidentPlacement | null;
+  /** Measured at load time; null when the backend does not report it. */
+  gpuBytes: number | null;
+  cpuBytes: number | null;
+  kvReserveBytes: number | null;
+  loadSeconds: number | null;
+  lastUsedAt: string | null;
+  inUse: boolean;
+}
+
+export interface MemoryLedger {
+  device: string;
+  totalBytes: number | null;
+  freeBytes: number | null;
+  torchAllocatedBytes: number | null;
+  torchReservedBytes: number | null;
+  /** Per-process allocator cap applied while a Strict VRAM resident is loaded. */
+  capBytes: number | null;
+  processRssBytes: number | null;
+  systemAvailableBytes: number | null;
+  safetyMarginBytes: number | null;
+  ledgerAgeSeconds: number | null;
+  stale: boolean;
+}
+
+export interface ResidentStatus {
+  models: ResidentModel[];
+  memory: MemoryLedger | null;
+  maxLoadedModels: number | null;
+}
+
+/** Per-model placement chosen at load time, kept separate from next-response settings. */
+export interface LoadOptions {
+  device: "auto" | "cpu" | "cuda";
+  dtype: "auto" | "float32" | "float16" | "bfloat16";
+  /** Fail instead of spilling layers into system RAM when the model does not fit in VRAM. */
+  strictVram: boolean;
+}
+
+export interface LoadResult {
+  model: ModelSummary;
+  modelKey?: string;
+  placement?: ResidentPlacement;
+  strictVram?: boolean;
+  evictedModelKeys: string[];
+}
+
+export interface UnloadResult {
+  unloadedModelKeys: string[];
+  freedBytes: number | null;
+  leakedBytes: number | null;
 }
 
 export interface AcceleratorSummary {
@@ -320,8 +388,10 @@ export interface RunDetails {
 
 export interface GenerationSettings {
   reasoning?: boolean;
-  device: "auto" | "cpu" | "cuda";
-  dtype: "auto" | "float32" | "float16" | "bfloat16";
+  /** Placement fields are filled from the model's resident copy or saved load options when a request is sent. */
+  device: LoadOptions["device"];
+  dtype: LoadOptions["dtype"];
+  strictVram?: boolean;
   instrumentation: "off" | "basic" | "token" | "full" | "expert";
   seed: string;
   maxOutputTokens: number;
@@ -372,7 +442,7 @@ export type RawRunEventEnvelope = Readonly<Record<string, unknown>>;
 
 type NormalizedRunStreamEvent =
   | { version: 1; sequence: number; type: "run.created"; run: Partial<RunDetails> }
-  | { version: 1; sequence: number; type: "stage.changed"; stage: RunDetails["status"]; detail?: string; metrics?: Partial<RunMetrics> }
+  | { version: 1; sequence: number; type: "stage.changed"; stage: RunDetails["status"]; detail?: string; metrics?: Partial<RunMetrics>; evictedModelKeys?: string[] }
   | { version: 1; sequence: number; type: "token"; token: TokenEvent }
   | { version: 1; sequence: number; type: "metrics"; metrics: Partial<RunMetrics>; reproducibility?: Partial<ReproducibilitySnapshot>; samplingPipeline?: string[] }
   | { version: 1; sequence: number; type: "warning"; message: string }
@@ -436,6 +506,7 @@ export interface ApiErrorPayload {
     code?: string;
     message?: string;
     hint?: string;
+    details?: Record<string, unknown>;
     request_id?: string;
   };
 }

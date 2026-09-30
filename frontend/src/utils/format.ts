@@ -20,7 +20,7 @@ export function formatDuration(ms: number | null | undefined): string {
 export function formatBytes(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined || !Number.isFinite(bytes)) return "—";
   if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${formatNumber(bytes / 1024 ** exponent, exponent === 0 ? 0 : 1)} ${units[exponent] ?? "B"}`;
 }

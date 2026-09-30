@@ -619,9 +619,9 @@ export function useWorkbench(): WorkbenchState {
   const toggleModelLoaded = useCallback(async (model: ModelSummary): Promise<void> => {
     setModels((current) => current.map((item) => item.id === model.id ? { ...item, lifecycle: model.lifecycle === "loaded" ? "unloading" : "loading" } : item));
     try {
-      const updated = model.lifecycle === "loaded"
-        ? await api.unloadModel(model.id, model)
-        : await api.loadModel(model.id, { device: settings.device, dtype: settings.dtype }, model);
+      const updated: ModelSummary = model.lifecycle === "loaded"
+        ? await api.unloadModel(model.id).then(() => ({ ...model, lifecycle: "unloaded", loadedDevice: null }))
+        : (await api.loadModel(model.id, { device: settings.device, dtype: settings.dtype, strictVram: true }, model)).model;
       setModels((current) => current.map((item) => item.id === updated.id
         ? updated
         : updated.lifecycle === "loaded" ? { ...item, lifecycle: "unloaded", loadedDevice: null } : item));

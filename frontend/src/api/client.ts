@@ -15,15 +15,22 @@ import type {
   GenerateResponse,
   HardwareSummary,
   HealthStatus,
+  LoadOptions,
+  LoadResult,
+  MemoryLedger,
   Message,
   ModelInspection,
   ModelSummary,
   ReasoningSlice,
+  ResidentModel,
+  ResidentStatus,
   RunDetails,
   RunStreamEvent,
   TokenAlternative,
   TokenEvent,
+  UnloadResult,
 } from "./types";
+import { formatBytes } from "../utils/format";
 import { AUTH_CHANGED_EVENT, getSessionAuthToken, notifyAuthenticationRequired } from "./auth";
 
 const API_BASE = (import.meta.env.VITE_API_BASE ?? "/api/v1").replace(/\/$/, "");
@@ -32,6 +39,8 @@ export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
   readonly requestId?: string;
+  readonly hint?: string;
+  readonly details?: Record<string, unknown>;
 
   constructor(message: string, status: number, payload?: ApiErrorPayload) {
     super(message);
@@ -39,10 +48,28 @@ export class ApiError extends Error {
     this.status = status;
     this.code = payload?.code ?? payload?.error?.code;
     this.requestId = payload?.requestId ?? payload?.error?.request_id;
+    this.hint = typeof payload?.error?.hint === "string" ? payload.error.hint : undefined;
+    this.details = payload?.error?.details;
   }
 }
 
+const OUT_OF_MEMORY_HINT = "Quantize the model, unload another model, or turn off Strict VRAM to allow system-RAM offload.";
+
+/** "Not enough GPU memory: needs 7.3 GiB, 5.9 GiB available. <hint>", or null without byte counts. */
+export function outOfMemoryMessage(details: unknown, hint?: string): string | null {
+  const raw = asRecord(details);
+  const required = asOptionalNumber(raw.required_bytes);
+  const available = asOptionalNumber(raw.available_bytes);
+  if (required === undefined || available === undefined) return null;
+  const memory = raw.memory_kind === "ram" ? "system memory" : "GPU memory";
+  return `Not enough ${memory}: needs ${formatBytes(required)}, ${formatBytes(available)} available. ${hint ?? OUT_OF_MEMORY_HINT}`;
+}
+
 function errorMessage(payload: ApiErrorPayload | undefined, fallback: string): string {
+  if (payload?.error?.code === "out_of_memory") {
+    const readable = outOfMemoryMessage(payload.error.details, payload.error.hint);
+    if (readable) return readable;
+  }
   if (typeof payload?.error?.message === "string") return payload.error.message;
   if (typeof payload?.message === "string") return payload.message;
   if (typeof payload?.detail === "string") return payload.detail;
@@ -115,6 +142,7 @@ const capabilityAliases: Record<string, CapabilityKey> = {
   deterministic_seed: "deterministic_seed",
   cpu: "cpu",
   cuda: "cuda",
+  cpu_offload: "cpu_offload",
 };
 
 function normalizeCapabilities(value: unknown): ModelSummary["capabilities"] {
@@ -175,6 +203,73 @@ function normalizeModel(value: unknown, fallback?: ModelSummary, lifecycleOverri
     contextLimits: Array.isArray(raw.contextLimits) ? raw.contextLimits as ModelSummary["contextLimits"] : contextValues ?? fallback?.contextLimits,
     diagnostics: diagnostics ?? fallback?.diagnostics,
     trustRemoteCode: raw.trustRemoteCode === true || raw.trust_decision === "reviewed_bundled_code" || fallback?.trustRemoteCode === true,
+  };
+}
+
+function asNullableString(value: unknown): string | null {
+  return typeof value === "string" && value ? value : null;
+}
+
+function asStringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function residentPlacement(value: unknown): ResidentModel["placement"] {
+  return value === "gpu" || value === "offload" || value === "cpu" ? value : null;
+}
+
+function normalizeResident(value: unknown): ResidentModel | null {
+  const raw = asRecord(value);
+  const modelId = asNullableString(raw.model_id);
+  if (!modelId) return null;
+  return {
+    modelKey: asNullableString(raw.model_key) ?? modelId,
+    modelId,
+    displayName: asNullableString(raw.display_name),
+    device: asNullableString(raw.device) ?? "unknown",
+    dtype: asNullableString(raw.dtype),
+    quantization: asNullableString(raw.quantization),
+    strictVram: typeof raw.strict_vram === "boolean" ? raw.strict_vram : null,
+    placement: residentPlacement(raw.placement),
+    gpuBytes: asNullableNumber(raw.gpu_bytes),
+    cpuBytes: asNullableNumber(raw.cpu_bytes),
+    kvReserveBytes: asNullableNumber(raw.kv_reserve_bytes),
+    loadSeconds: asNullableNumber(raw.load_seconds),
+    lastUsedAt: asNullableString(raw.last_used_at),
+    inUse: raw.in_use === true,
+  };
+}
+
+function normalizeResidents(value: unknown): ResidentModel[] {
+  return Array.isArray(value) ? value.map(normalizeResident).filter((item): item is ResidentModel => item !== null) : [];
+}
+
+function normalizeLedger(value: unknown): MemoryLedger | null {
+  const raw = asRecord(value);
+  const device = asNullableString(raw.device);
+  if (!device) return null;
+  return {
+    device,
+    totalBytes: asNullableNumber(raw.total_bytes),
+    freeBytes: asNullableNumber(raw.free_bytes),
+    torchAllocatedBytes: asNullableNumber(raw.torch_allocated_bytes),
+    torchReservedBytes: asNullableNumber(raw.torch_reserved_bytes),
+    capBytes: asNullableNumber(raw.cap_bytes),
+    processRssBytes: asNullableNumber(raw.process_rss_bytes),
+    systemAvailableBytes: asNullableNumber(raw.system_available_bytes),
+    safetyMarginBytes: asNullableNumber(raw.safety_margin_bytes),
+    ledgerAgeSeconds: asNullableNumber(raw.ledger_age_seconds),
+    stale: raw.stale === true,
+  };
+}
+
+function normalizeUnload(value: unknown): UnloadResult {
+  const outer = asRecord(value);
+  const raw = Object.keys(asRecord(outer.unload)).length ? asRecord(outer.unload) : outer;
+  return {
+    unloadedModelKeys: asStringList(raw.unloaded_model_keys),
+    freedBytes: asNullableNumber(raw.freed_bytes),
+    leakedBytes: asNullableNumber(raw.leaked_bytes),
   };
 }
 
@@ -422,7 +517,15 @@ function normalizeStreamEvent(value: unknown): RunStreamEvent | null {
   if (type === "stage.changed") return preserveEnvelope({ version, sequence, type, stage: runStatus(raw.stage, "running"), detail: typeof raw.detail === "string" ? raw.detail : undefined });
   if (type === "stage" || type === "model_loaded") {
     const stage = asString(payload.stage, "running");
-    return preserveEnvelope({ version, sequence, type: "stage.changed", stage: stage.includes("load") ? "loading" : "running", detail: stage, metrics: metricsFromPayload(payload) });
+    return preserveEnvelope({
+      version,
+      sequence,
+      type: "stage.changed",
+      stage: stage.includes("load") ? "loading" : "running",
+      detail: stage,
+      metrics: metricsFromPayload(payload),
+      ...(type === "model_loaded" ? { evictedModelKeys: asStringList(payload.evicted_model_keys) } : {}),
+    });
   }
   if (type === "token") return preserveEnvelope({ version, sequence, type, token: normalizeToken(raw.token ?? payload) });
   if (type === "metrics" || type === "metric") {
@@ -444,7 +547,11 @@ function normalizeStreamEvent(value: unknown): RunStreamEvent | null {
   if (type === "warning") return preserveEnvelope({ version, sequence, type, message: asString(raw.message ?? payload.message, "Run warning") });
   if (type === "completed") return preserveEnvelope({ version, sequence, type, run: { status: "complete", metrics: metricsFromPayload(raw.run ?? payload) } });
   if (type === "cancelled") return preserveEnvelope({ version, sequence, type, reason: typeof (raw.reason ?? payload.reason) === "string" ? String(raw.reason ?? payload.reason) : undefined, metrics: metricsFromPayload(payload) });
-  if (type === "error") return preserveEnvelope({ version, sequence, type, code: typeof (raw.code ?? payload.code) === "string" ? asString(raw.code ?? payload.code, "") : undefined, message: asString(raw.message ?? payload.message, "Generation failed") });
+  if (type === "error") {
+    const code = typeof (raw.code ?? payload.code) === "string" ? asString(raw.code ?? payload.code, "") : undefined;
+    const readable = code === "out_of_memory" ? outOfMemoryMessage(payload.details, typeof payload.hint === "string" ? payload.hint : undefined) : null;
+    return preserveEnvelope({ version, sequence, type, code, message: readable ?? asString(raw.message ?? payload.message, "Generation failed") });
+  }
   return preserveEnvelope({ version, sequence, type: "warning", message: type === "resync_required" ? "The live buffer rolled over; reconnecting from persisted events." : `Ignored unsupported event type “${type}”.` });
 }
 
@@ -688,6 +795,7 @@ export const api = {
     const raw = asRecord(await request<unknown>("/health"));
     const loadedModel = asRecord(raw.loadedModel ?? raw.loaded_model);
     return {
+      loadedModels: Array.isArray(raw.loaded_models) ? normalizeResidents(raw.loaded_models) : undefined,
       status: raw.status === "ok" || raw.status === "degraded" ? raw.status : "error",
       version: typeof raw.version === "string" ? raw.version : undefined,
       database: typeof raw.database === "string" ? raw.database : undefined,
@@ -731,11 +839,41 @@ export const api = {
     const value = await request<unknown[] | { items?: unknown[]; models?: unknown[] }>("/models/refresh", { method: "POST" });
     return unwrapList(value).map((model) => normalizeModel(model));
   },
-  async loadModel(id: string, options: { device: string; dtype: string }, current?: ModelSummary): Promise<ModelSummary> {
-    return normalizeModel(await request(`/models/${encodeURIComponent(id)}/load`, { method: "POST", body: JSON.stringify(options) }), current, "loaded");
+  async loadModel(id: string, options: LoadOptions, current?: ModelSummary): Promise<LoadResult> {
+    const raw = asRecord(await request(`/models/${encodeURIComponent(id)}/load`, { method: "POST", body: JSON.stringify(options) }));
+    return {
+      model: normalizeModel(raw, current, "loaded"),
+      modelKey: asNullableString(raw.model_key) ?? undefined,
+      placement: residentPlacement(raw.placement) ?? undefined,
+      strictVram: typeof raw.strict_vram === "boolean" ? raw.strict_vram : undefined,
+      evictedModelKeys: asStringList(raw.evicted_model_keys),
+    };
   },
-  async unloadModel(id: string, current?: ModelSummary): Promise<ModelSummary> {
-    return normalizeModel(await request(`/models/${encodeURIComponent(id)}/unload`, { method: "POST" }), current, "unloaded");
+  /** Unloads every resident copy of one model. */
+  async unloadModel(id: string): Promise<UnloadResult> {
+    return normalizeUnload(await request(`/models/${encodeURIComponent(id)}/unload`, { method: "POST" }));
+  },
+  async unloadResident(modelKey: string): Promise<UnloadResult> {
+    return normalizeUnload(await request(`/models/resident/${encodeURIComponent(modelKey)}/unload`, { method: "POST" }));
+  },
+  async unloadAll(): Promise<UnloadResult> {
+    return normalizeUnload(await request("/models/unload", { method: "POST" }));
+  },
+  /** Null when the backend predates multi-model residency and has no resident endpoint. */
+  async residentStatus(): Promise<ResidentStatus | null> {
+    let value: unknown;
+    try {
+      value = await request("/models/resident");
+    } catch (cause) {
+      if (cause instanceof ApiError && (cause.status === 404 || cause.status === 405)) return null;
+      throw cause;
+    }
+    const raw = asRecord(value);
+    return {
+      models: normalizeResidents(raw.models),
+      memory: normalizeLedger(raw.memory),
+      maxLoadedModels: asNullableNumber(raw.max_loaded_models),
+    };
   },
   async inspectModel(id: string): Promise<ModelInspection> {
     const raw = asRecord(await request(`/models/${encodeURIComponent(id)}/inspect`));
@@ -777,6 +915,7 @@ export const api = {
         instrumentation: body.settings.instrumentation,
         reasoning: body.settings.reasoning,
         deterministic_reference_mode: body.settings.deterministic,
+        strict_vram: body.settings.strictVram,
         sampling: {
           max_output_tokens: body.settings.maxOutputTokens,
           temperature: body.settings.temperature,
