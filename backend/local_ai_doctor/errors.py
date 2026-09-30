@@ -240,11 +240,6 @@ class ActiveRunConflictError(WorkbenchError):
     default_retryable = True
 
 
-class ModelNotLoadedError(WorkbenchError):
-    code = ErrorCode.MODEL_NOT_LOADED
-    http_status = 409
-
-
 class ModelNotResidentError(WorkbenchError):
     code = ErrorCode.MODEL_NOT_RESIDENT
     http_status = 409

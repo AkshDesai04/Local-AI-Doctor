@@ -376,6 +376,7 @@ Inside the worker (`GenerationSession`):
 ## 6. Frontend architecture
 - There is no global store.
   - `useWorkbench()` owns the domain state: health, config, models, chats (active and archived), messages, `selectedRun`, `runningRunId`, streaming, settings and their configured defaults, attachments, errors, and notices.
+  - It also owns the resident set (from `/models/resident`, falling back to health `loaded_models`) and per-model load options (device, dtype, Strict VRAM), persisted in localStorage `local-ai-doctor.load-options.v1`. Load options are separate from next-response settings; the Generation controls "Model loading" section edits the selected model's options, and a chat send to a non-resident model forwards them.
   - `App.tsx` owns only the UI state.
   - Components receive normalized, typed data.
   - All API normalization lives in `api/client.ts`, via `normalizeRun`, `normalizeToken`, `normalizeStreamEvent`, `normalizeModel`, and similar functions. **Don't cast raw API data inside components.**
