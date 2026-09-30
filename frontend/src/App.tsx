@@ -102,6 +102,7 @@ export default function App(): React.ReactNode {
           controlsOpen={controlsOpen}
           inspectorOpen={inspectorOpen}
           loadOptions={selectedLoadOptions}
+          memory={workbench.memory}
           models={workbench.models}
           nerdMode={nerdMode}
           onOpenRegistry={() => setView("models")}
@@ -112,6 +113,7 @@ export default function App(): React.ReactNode {
           onToggleInspector={() => setInspectorOpen((value) => !value)}
           onToggleLoaded={(model) => void workbench.toggleModelLoaded(model)}
           onToggleNerd={() => setNerdMode((value) => !value)}
+          residents={workbench.residents}
           selectedModel={workbench.selectedModel}
           selectedModelId={workbench.selectedModel?.id ?? workbench.selectedModelId}
         />

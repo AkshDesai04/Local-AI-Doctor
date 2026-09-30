@@ -87,6 +87,13 @@
 .model-status.loading i, .model-status.unloading i { animation: pulse 900ms infinite; background: var(--warning); }
 .model-status.error { border-color: var(--danger-border); color: var(--danger-text); }
 .model-status.error i { background: var(--danger); }
+.model-status.loaded.offload { background: var(--warning-subtle); border-color: var(--warning-border); color: var(--warning-text); }
+.model-status.loaded.offload i { background: var(--warning); }
+.vram-mini { align-items: center; display: inline-flex; flex: 0 0 auto; gap: 6px; }
+.vram-mini-track { background: var(--surface-3); border: 1px solid var(--border-default); border-radius: var(--radius-pill); display: block; height: 6px; overflow: hidden; width: 48px; }
+.vram-mini-fill { background: var(--accent); display: block; height: 100%; }
+.vram-mini.high .vram-mini-fill { background: var(--warning); }
+.vram-mini-text { color: var(--text-tertiary); font-family: var(--font-mono); font-size: var(--fs-11); font-variant-numeric: tabular-nums; line-height: var(--lh-11); white-space: nowrap; }
 .header-actions { align-items: center; display: flex; flex: 0 0 auto; gap: var(--space-1); }
 .header-divider { background: var(--border-default); height: 20px; margin: 0 var(--space-1); width: 1px; }
 .header-controls[aria-expanded="true"] { background: var(--surface-3); color: var(--text-primary); }
@@ -668,6 +675,7 @@ button.attention-source-token:hover { border-color: var(--accent-text); }
   :root { --sidebar-width: 224px; }
   .model-status-text { display: none; }
   .model-status { padding: 0 7px; }
+  .vram-mini-text { display: none; }
 }
 
 @media (max-width: 760px) {
@@ -713,6 +721,7 @@ button.attention-source-token:hover { border-color: var(--accent-text); }
   .nerd-switch { gap: 6px; padding: 0 6px; }
   .nerd-label-text { clip: rect(0 0 0 0); clip-path: inset(50%); height: 1px; overflow: hidden; position: absolute; white-space: nowrap; width: 1px; }
   .model-select { max-width: 38vw; min-width: 88px; }
+  .vram-mini { display: none; }
   .form-grid { grid-template-columns: 1fr; }
   .attention-coverage, .attention-method { grid-template-columns: 1fr; }
   .nerd-toolbar { align-items: flex-start; flex-direction: column; gap: 6px; }

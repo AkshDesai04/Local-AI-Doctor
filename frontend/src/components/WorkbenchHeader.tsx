@@ -1,12 +1,18 @@
 import { Bug, CircleOff, Database, Ellipsis, Menu, PanelRight, Play, RefreshCw, SlidersHorizontal, Square } from "lucide-react";
-import type { GenerationSettings, ModelSummary } from "../api/types";
+import type { LoadOptions, MemoryLedger, ModelSummary, ResidentModel } from "../api/types";
+import { isCudaLedger, residentsOf, residentSummary } from "../domain/residency";
+import { formatBytes, formatNumber } from "../utils/format";
 import { Button, IconButton, MenuButton, MenuItem, Select, Switch } from "./ui";
 
 interface WorkbenchHeaderProps {
   models: ModelSummary[];
   selectedModel: ModelSummary | null;
   selectedModelId: string;
-  loadOptions: Pick<GenerationSettings, "device" | "dtype">;
+  /** The selected model's saved load options, used by Load. */
+  loadOptions: LoadOptions;
+  /** Every resident copy of every model. */
+  residents: ResidentModel[];
+  memory: MemoryLedger | null;
   nerdMode: boolean;
   inspectorOpen: boolean;
   controlsOpen: boolean;
@@ -21,13 +27,43 @@ interface WorkbenchHeaderProps {
   onToggleInspector: () => void;
 }
 
-function modelStatusLabel(model: ModelSummary | null): string {
+function residentLabel(resident: ResidentModel): string {
+  const label = resident.dtype ? residentSummary(resident) : `${resident.device} · ready`;
+  return resident.placement === "offload" ? `${label} · offload` : label;
+}
+
+function modelStatusLabel(model: ModelSummary | null, own: ResidentModel[]): string {
   if (!model) return "No model";
-  if (model.lifecycle === "loaded") return `${model.loadedDevice ?? "device"} · ready`;
   if (model.lifecycle === "loading") return "Loading…";
   if (model.lifecycle === "unloading") return "Unloading…";
+  if (own.length > 1) return `${String(own.length)} resident`;
+  if (own[0]) return residentLabel(own[0]);
+  if (model.lifecycle === "loaded") return `${model.loadedDevice ?? "device"} · ready`;
   if (model.lifecycle === "error") return "Load error";
   return "Not loaded";
+}
+
+function residentDetail(resident: ResidentModel): string {
+  const placement = resident.placement === "offload" ? "offloaded to system RAM" : resident.placement === "cpu" ? "CPU" : resident.placement === "gpu" ? "GPU" : null;
+  return [resident.device, resident.dtype, placement, resident.strictVram ? "Strict VRAM" : null].filter(Boolean).join(" · ");
+}
+
+/** Compact used/total GPU memory; rendered only for a CUDA ledger. */
+function VramMiniBar({ memory, residentCount }: { memory: MemoryLedger | null; residentCount: number }): React.ReactNode {
+  if (!isCudaLedger(memory) || memory.freeBytes === null) return null;
+  const total = memory.totalBytes ?? 0;
+  const used = Math.max(0, total - memory.freeBytes);
+  const share = Math.min(100, (used / total) * 100);
+  const text = `${formatBytes(used)} of ${formatBytes(total)}`;
+  const title = `GPU memory on ${memory.device}: ${text} in use (${formatNumber(share, 0)}%) · ${String(residentCount)} resident ${residentCount === 1 ? "copy" : "copies"}${memory.stale ? " · last reported measurement" : ""}`;
+  return (
+    <span className={`vram-mini ${share >= 90 ? "high" : ""}`} title={title}>
+      <span aria-label="GPU memory in use" aria-valuemax={total} aria-valuemin={0} aria-valuenow={used} aria-valuetext={text} className="vram-mini-track" role="meter">
+        <span className="vram-mini-fill" style={{ width: `${String(share)}%` }} />
+      </span>
+      <span aria-hidden="true" className="vram-mini-text">{formatNumber(used / 1024 ** 3, 1)}/{formatNumber(total / 1024 ** 3, 0)} GiB</span>
+    </span>
+  );
 }
 
 export function WorkbenchHeader({
@@ -35,6 +71,8 @@ export function WorkbenchHeader({
   selectedModel,
   selectedModelId,
   loadOptions,
+  residents,
+  memory,
   nerdMode,
   inspectorOpen,
   controlsOpen,
@@ -49,17 +87,25 @@ export function WorkbenchHeader({
   onToggleInspector,
 }: WorkbenchHeaderProps): React.ReactNode {
   const lifecycle = selectedModel?.lifecycle ?? "none";
+  const own = selectedModel ? residentsOf(residents, selectedModel.id) : [];
   const busy = lifecycle === "loading" || lifecycle === "unloading";
   const loaded = lifecycle === "loaded";
+  const status = modelStatusLabel(selectedModel, own);
+  const statusTitle = own.length
+    ? `${own.length === 1 ? "Resident" : `${String(own.length)} resident copies`}: ${own.map(residentDetail).join("; ")}`
+    : status;
   const loadLabel = loaded ? "Unload" : lifecycle === "error" ? "Retry load" : busy ? (lifecycle === "loading" ? "Loading…" : "Unloading…") : "Load";
   const loadHint = !connected
     ? "Start the local backend first"
     : !selectedModel
       ? "Select a model first"
       : loaded
-        ? `Unload ${selectedModel.name} and free its memory`
-        : `Load ${selectedModel.name} with device ${loadOptions.device} and dtype ${loadOptions.dtype} (Generation controls › Model loading)`;
+        ? `Unload every resident copy of ${selectedModel.name} and free its memory`
+        : `Load ${selectedModel.name} with device ${loadOptions.device}, dtype ${loadOptions.dtype}, and Strict VRAM ${loadOptions.strictVram && loadOptions.device !== "cpu" ? "on" : "off"} (Model registry or Generation controls › Model loading)`;
   const toggleLoaded = (): void => { if (selectedModel) onToggleLoaded(selectedModel); };
+  const residentIds = new Set(residents.map((resident) => resident.modelId));
+  const residentModels = models.filter((model) => residentIds.has(model.id));
+  const idleModels = models.filter((model) => !residentIds.has(model.id));
 
   return (
     <header className="workbench-header">
@@ -77,11 +123,17 @@ export function WorkbenchHeader({
             wrapperClassName="model-select"
           >
             {models.length === 0 && <option value="">No models discovered</option>}
-            {models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+            {residentModels.length > 0 ? (
+              <>
+                <optgroup label="Resident">{residentModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</optgroup>
+                {idleModels.length > 0 && <optgroup label="Not loaded">{idleModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</optgroup>}
+              </>
+            ) : models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
           </Select>
-          <span className={`model-status ${lifecycle}`} title={selectedModel?.lifecycle === "loaded" ? `Loaded on ${selectedModel.loadedDevice ?? "an unreported device"}` : modelStatusLabel(selectedModel)}>
-            <i aria-hidden="true" /><span className="model-status-text">{modelStatusLabel(selectedModel)}</span>
+          <span className={`model-status ${lifecycle} ${own.some((resident) => resident.placement === "offload") ? "offload" : ""}`} title={statusTitle}>
+            <i aria-hidden="true" /><span className="model-status-text">{status}</span>
           </span>
+          <VramMiniBar memory={memory} residentCount={residents.length} />
         </div>
       </div>
       <div className="header-actions">
