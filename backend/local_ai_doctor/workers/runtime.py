@@ -196,7 +196,30 @@ def _mean_causal_self_attention(
     )
 
 
+class WorkerReportedError(RuntimeError):
+    """A failure the worker describes itself with codes and numbers only.
+
+    ``_safe_error`` passes the dict through verbatim, so it must never hold paths,
+    prompts, or exception text.
+    """
+
+    def __init__(self, error: Mapping[str, Any]) -> None:
+        self.error = dict(error)
+        super().__init__(str(self.error.get("code")))
+
+
+def _rope_state_owner(model: Any) -> Any:
+    """The module caching multimodal RoPE deltas between prefill and decode, if any."""
+
+    for candidate in (getattr(model, "model", None), model):
+        if candidate is not None and hasattr(candidate, "rope_deltas"):
+            return candidate
+    return None
+
+
 def _safe_error(exc: BaseException) -> dict[str, Any]:
+    if isinstance(exc, WorkerReportedError):
+        return dict(exc.error)
     # Exception messages from model libraries routinely contain absolute model
     # paths, prompt fragments, and environment details. They remain available in
     # the worker-only diagnostic traceback, but never cross the public event/API
@@ -716,6 +739,26 @@ class WorkerRuntime:
         self.cancel_event = cancel_event
         self.residents: dict[str, ResidentModel] = {}
         self._active: ResidentModel | None = None
+        self.sessions: list[GenerationSession] = []
+        self._deterministic_state: bool | None = None
+        self._vram_cap_fraction = 1.0
+
+    def _select_resident(self, model_key: Any) -> ResidentModel | None:
+        """Make the named resident active; no key means the active resident."""
+
+        if model_key is None:
+            return self._active
+        resident = self.residents.get(str(model_key))
+        if resident is None:
+            raise WorkerReportedError(
+                {
+                    "code": "model_not_resident",
+                    "message": "the requested model is not resident in the worker",
+                    "hint": "Load the model before running it.",
+                }
+            )
+        self._active = resident
+        return resident
 
     def run(self) -> None:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -928,6 +971,52 @@ class WorkerRuntime:
                 }
             )
         return result
+
+    def _ledger(self) -> dict[str, Any]:
+        """Process memory plus every resident's share, without initializing CUDA."""
+
+        import torch
+
+        ledger: dict[str, Any] = {
+            "device": "cpu",
+            "total_bytes": None,
+            "free_bytes": None,
+            "torch_allocated_bytes": None,
+            "torch_reserved_bytes": None,
+            "cap_bytes": None,
+            "process_rss_bytes": None,
+            "system_available_bytes": None,
+            "residents": [resident.summary() for resident in self.residents.values()],
+        }
+        try:
+            psutil: Any = __import__("psutil")
+
+            memory = psutil.virtual_memory()
+            ledger["process_rss_bytes"] = int(psutil.Process().memory_info().rss)
+            ledger["system_available_bytes"] = int(memory.available)
+            ledger["total_bytes"] = int(memory.total)
+            ledger["free_bytes"] = int(memory.available)
+        except (ImportError, OSError):
+            pass
+        cuda: Any = torch.cuda
+        if cuda.is_available():
+            # Querying device memory creates a CUDA context, which costs VRAM on its
+            # own; before the first CUDA load the device totals stay unknown.
+            ledger.update(device="cuda:0", total_bytes=None, free_bytes=None)
+            if cuda.is_initialized():
+                free, total = cuda.mem_get_info(0)
+                ledger.update(
+                    total_bytes=int(total),
+                    free_bytes=int(free),
+                    torch_allocated_bytes=int(cuda.memory_allocated(0)),
+                    torch_reserved_bytes=int(cuda.memory_reserved(0)),
+                    cap_bytes=(
+                        int(total * self._vram_cap_fraction)
+                        if self._vram_cap_fraction < 1.0
+                        else None
+                    ),
+                )
+        return ledger
 
     def _emit_run(self, run_id: str, event_type: str, payload: Mapping[str, Any]) -> None:
         _send(
@@ -1175,882 +1264,15 @@ class WorkerRuntime:
         return outputs.logits[:, -1, :], outputs.past_key_values, None
 
     def _generate(self, command: Mapping[str, Any]) -> None:
+        """Run one generation to completion (prefill, then one step per token)."""
+
         try:
-            self._generate_impl(command)
+            session = GenerationSession(self, command)
+            session.prefill()
+            while session.step():
+                pass
         finally:
             self._restore_attention_implementation()
-
-    def _generate_impl(self, command: Mapping[str, Any]) -> None:
-        if self.model is None or self.tokenizer is None or self.model_info is None:
-            raise RuntimeError("no generation model is loaded")
-        import torch
-
-        run_id = str(command["run_id"])
-        request_id = str(command["request_id"])
-        settings = dict(command["sampling"])
-        instrumentation = str(command.get("instrumentation", "token"))
-        detailed_metrics = instrumentation in {"token", "full", "expert"}
-        synchronize = instrumentation in {"full", "expert"} and self.device.startswith("cuda")
-        encoder_decoder = self.model_info.get("task") == "encoder_decoder_generation"
-        attention_capture_requested = instrumentation in {"full", "expert"}
-        attention_capture_active = False
-        attention_capture_warning_emitted = False
-        captured_attention_token_count = 0
-        if attention_capture_requested and not encoder_decoder:
-            attention_capture_active = self._select_attention_implementation("eager")
-            if not attention_capture_active:
-                self._emit_run(
-                    run_id,
-                    "warning",
-                    {
-                        "code": "attention_capture_unavailable",
-                        "message": (
-                            "This model cannot switch to an eager attention implementation, "
-                            "so exact attention weights are unavailable for this run."
-                        ),
-                    },
-                )
-                attention_capture_warning_emitted = True
-        elif attention_capture_requested:
-            self._emit_run(
-                run_id,
-                "warning",
-                {
-                    "code": "attention_capture_unavailable",
-                    "message": (
-                        "Encoder-decoder attention is split between decoder self-attention "
-                        "and encoder cross-attention; this causal attribution view does not "
-                        "combine those incomparable distributions."
-                    ),
-                },
-            )
-            attention_capture_warning_emitted = True
-        else:
-            self._restore_attention_implementation()
-        deterministic_reference_mode = bool(command.get("deterministic_reference_mode"))
-        # Set this on every request.  torch's switch is process-global, so merely
-        # enabling it for reference runs would silently affect every later run.
-        torch.use_deterministic_algorithms(
-            deterministic_reference_mode,
-            warn_only=deterministic_reference_mode,
-        )
-        cudnn = getattr(torch.backends, "cudnn", None)
-        if cudnn is not None:
-            # The reference worker keeps autotuning off for both modes.  This is
-            # stable across requests and is reported verbatim below.
-            cudnn.benchmark = False
-        messages = list(command["messages"])
-        if (
-            any(item.get("role") == "system" for item in messages)
-            and "deepseek" in self.model_info["display_name"].lower()
-        ):
-            self._emit_run(
-                run_id,
-                "warning",
-                {
-                    "code": "model_card_discourages_system_prompt",
-                    "message": "This model card recommends avoiding system prompts.",
-                },
-            )
-        template_started = time.monotonic_ns()
-        reasoning_requested = command.get("reasoning")
-        if reasoning_requested is not None and not isinstance(reasoning_requested, bool):
-            raise ValueError("reasoning must be a boolean when provided")
-        media_requested = any(item.get("attachments") for item in messages)
-        if media_requested and (self.processor is None or encoder_decoder):
-            raise ValueError("the loaded model has no chat media processor")
-        # Processors render the same chat templates from content-part messages,
-        # so media conversations reuse the tokenizer rendering path unchanged.
-        rendered_prompt, prompt_renderer = _render_messages(
-            self.processor if media_requested else self.tokenizer,
-            _processor_messages(messages) if media_requested else messages,
-            reasoning=reasoning_requested,
-            reasoning_delimiters=self.model_info.get("reasoning_delimiters"),
-        )
-        template_ended = time.monotonic_ns()
-        if prompt_renderer == "chat_template_system_merged":
-            self._emit_run(
-                run_id,
-                "warning",
-                {
-                    "code": "system_prompt_merged",
-                    "message": (
-                        "This model's chat template has no system role; the system prompt "
-                        "was prepended to the first user message."
-                    ),
-                },
-            )
-        if prompt_renderer == "plain_text_fallback":
-            self._emit_run(
-                run_id,
-                "warning",
-                {
-                    "code": "chat_template_unavailable",
-                    "message": (
-                        "The bundled tokenizer has no chat template; messages were rendered "
-                        "with the deterministic plain-text fallback."
-                    ),
-                },
-            )
-        if encoder_decoder and self.decoder_start_token_id is None:
-            (
-                self.decoder_start_token_id,
-                self.decoder_start_token_source,
-                self.decoder_start_warning,
-            ) = _decoder_start_token(self.model, self.tokenizer)
-        if encoder_decoder and self.decoder_start_warning:
-            self._emit_run(
-                run_id,
-                "warning",
-                {
-                    "code": "decoder_start_token_fallback",
-                    "message": self.decoder_start_warning,
-                    "source": self.decoder_start_token_source,
-                },
-            )
-        tokenization_started = time.monotonic_ns()
-        media_inputs: dict[str, Any] = {}
-        media_summary: dict[str, Any] | None = None
-        if media_requested:
-            images, videos, video_metadata = _load_media(self.processor, messages)
-            processor_kwargs: dict[str, Any] = {}
-            if images:
-                processor_kwargs["images"] = images
-            if videos:
-                processor_kwargs.update(
-                    videos=videos, video_metadata=video_metadata, do_sample_frames=False
-                )
-            encoded = self.processor(
-                text=[rendered_prompt],
-                return_tensors="pt",
-                add_special_tokens=False,
-                **processor_kwargs,
-            )
-            media_inputs = {
-                key: value
-                for key, value in encoded.items()
-                if key not in {"input_ids", "attention_mask"}
-            }
-            media_summary = {"images": len(images), "videos": len(videos)}
-        else:
-            encoded = self.tokenizer(
-                rendered_prompt,
-                return_tensors="pt",
-                add_special_tokens=False,
-            )
-        input_ids = encoded["input_ids"]
-        attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids))
-        fallback_bos = (
-            _default_bos_token_id(self.tokenizer)
-            if prompt_renderer == "plain_text_fallback"
-            else None
-        )
-        if fallback_bos is not None and input_ids[0].tolist()[:1] != [fallback_bos]:
-            input_ids = torch.cat(
-                [torch.tensor([[fallback_bos]], dtype=input_ids.dtype), input_ids], dim=-1
-            )
-            attention_mask = torch.cat(
-                [torch.ones((1, 1), dtype=attention_mask.dtype), attention_mask], dim=-1
-            )
-        input_ids = input_ids.to(self.device)
-        attention_mask = attention_mask.to(self.device)
-        media_inputs = {
-            key: value.to(self.device) if hasattr(value, "to") else value
-            for key, value in media_inputs.items()
-        }
-        tokenization_ended = time.monotonic_ns()
-        prompt_tokens = int(input_ids.shape[-1])
-        media_placeholders = {
-            int(token_id): kind
-            for kind, token_id in (
-                ("image", getattr(self.model.config, "image_token_id", None)),
-                ("video", getattr(self.model.config, "video_token_id", None)),
-            )
-            if media_summary is not None and isinstance(token_id, int)
-        }
-        if media_summary is not None:
-            prompt_ids = input_ids[0].tolist()
-            media_summary["placeholder_tokens"] = sum(
-                1 for token_id in prompt_ids if token_id in media_placeholders
-            )
-        context_limit = int(self.model_info.get("effective_context_limit") or 4096)
-        configured_prompt_limit = int(command.get("max_prompt_tokens", context_limit))
-        reserved_output_tokens = int(command.get("reserved_output_tokens", 0))
-        effective_prompt_limit = min(
-            configured_prompt_limit,
-            context_limit if encoder_decoder else max(1, context_limit - reserved_output_tokens),
-        )
-        if prompt_tokens > effective_prompt_limit:
-            raise ValueError(
-                "rendered prompt exceeds the effective prompt-token limit "
-                f"({prompt_tokens} > {effective_prompt_limit})"
-            )
-        forced_prefix_token_ids = [int(item) for item in command.get("forced_prefix_token_ids", ())]
-        available_output_tokens = (
-            max(0, context_limit - 1) if encoder_decoder else max(0, context_limit - prompt_tokens)
-        )
-        configured_max_output_tokens = int(settings["max_output_tokens"])
-        if len(forced_prefix_token_ids) > configured_max_output_tokens:
-            raise ValueError("forced generation prefix exceeds the configured output limit")
-        if len(forced_prefix_token_ids) > available_output_tokens:
-            raise ValueError("forced generation prefix exceeds the available model context")
-        max_new_tokens = min(
-            configured_max_output_tokens,
-            available_output_tokens,
-        )
-        if max_new_tokens <= 0:
-            raise ValueError("rendered prompt consumes the effective context limit")
-        # Decode the prompt-token catalogue only after every bounded context
-        # check succeeds. Rejected oversized prompts must not trigger an
-        # unbounded device-to-CPU copy plus one tokenizer call per token.
-        prompt_context_tokens = (
-            [
-                _token_source(
-                    self.tokenizer,
-                    int(token_id),
-                    context_index,
-                    source_kind="prompt",
-                )
-                for context_index, token_id in enumerate(input_ids[0].tolist())
-            ]
-            if attention_capture_active
-            else []
-        )
-        if prompt_context_tokens and media_placeholders:
-            # Media positions stay `prompt` sources for older readers; the extra
-            # `media` field says which attached image or video they carry.
-            labels = _media_labels(
-                [int(item["token_id"]) for item in prompt_context_tokens],
-                media_placeholders,
-                _media_token_counts(self.processor, media_inputs),
-            )
-            for source, label in zip(prompt_context_tokens, labels, strict=True):
-                if label is not None:
-                    source["media"] = label
-
-        configured_delimiters = self.model_info.get("reasoning_delimiters")
-        tagged_reasoning_enabled = (
-            reasoning_requested is not False
-            and isinstance(configured_delimiters, (list, tuple))
-            and len(configured_delimiters) == 2
-            and all(isinstance(item, str) and item for item in configured_delimiters)
-            and configured_delimiters[0] != configured_delimiters[1]
-        )
-        # ``max_output_tokens`` normally remains a hard limit. A tagged
-        # reasoning model is the one exception: if emitted reasoning reaches
-        # that boundary before any answer text, it receives one bounded
-        # additional output window. Otherwise a valid run can end with only
-        # reasoning (or just ``</think>``) and the non-Nerd UI has nothing to
-        # display. The allowance is still clipped to the remaining context.
-        reasoning_answer_allowance = (
-            min(
-                configured_max_output_tokens,
-                max(0, available_output_tokens - max_new_tokens),
-            )
-            if tagged_reasoning_enabled
-            else 0
-        )
-        generation_token_limit = max_new_tokens + reasoning_answer_allowance
-
-        generator = torch.Generator(device=self.device)
-        generator.manual_seed(int(command["effective_seed"]))
-        generated: list[int] = []
-        context_tokens: list[dict[str, Any]] = list(prompt_context_tokens)
-        full_ids = (
-            [self.decoder_start_token_id]
-            if encoder_decoder and self.decoder_start_token_id is not None
-            else input_ids[0].tolist()
-        )
-        previous_text = ""
-        cumulative_logprob = 0.0
-        raw_segment_logprobs: dict[str, list[float]] = {
-            "reasoning": [],
-            "answer": [],
-            "unknown": [],
-        }
-        segment_token_counts = {"reasoning": 0, "answer": 0, "unknown": 0}
-        reasoning_segmenter, reasoning_primed = _reasoning_segmenter(
-            self.model_info, rendered_prompt
-        )
-        pending_token_events: dict[int, dict[str, Any]] = {}
-        reasoning_observed = reasoning_primed
-        visible_answer_observed = False
-
-        def emit_segmented_tokens(tokens: Sequence[SegmentedToken]) -> None:
-            nonlocal reasoning_observed, visible_answer_observed
-            for token in tokens:
-                payload = pending_token_events.pop(token.token_index)
-                token_segment = token.classification.value
-                payload["segment"] = token_segment
-                payload["reasoning_slices"] = [
-                    item.model_dump(mode="json") for item in token.slices
-                ]
-                segment_token_counts[token_segment] += 1
-                raw_logprob = payload.get("raw_logprob")
-                if isinstance(raw_logprob, float):
-                    raw_segment_logprobs[token_segment].append(raw_logprob)
-                if any(item.classification is SegmentClass.REASONING for item in token.slices):
-                    reasoning_observed = True
-                if payload["token_id"] not in eos_set and _contains_visible_answer(token):
-                    visible_answer_observed = True
-                self._emit_run(run_id, "token", payload)
-
-        prefill_started = time.monotonic_ns()
-        self._emit_run(
-            run_id,
-            "stage",
-            {
-                "stage": "prefill",
-                "rendered_prompt": rendered_prompt,
-                "prompt_tokens": prompt_tokens,
-                "context_limit": context_limit,
-                "effective_prompt_limit": effective_prompt_limit,
-                "reserved_output_tokens": reserved_output_tokens,
-                "prompt_renderer": prompt_renderer,
-                "architecture_mode": "encoder_decoder" if encoder_decoder else "causal",
-                "decoder_start_token_id": self.decoder_start_token_id if encoder_decoder else None,
-                "decoder_start_token_source": self.decoder_start_token_source
-                if encoder_decoder
-                else None,
-                "reasoning_primed": reasoning_primed,
-                "reasoning_requested": reasoning_requested,
-                "configured_max_output_tokens": configured_max_output_tokens,
-                "generation_token_limit": generation_token_limit,
-                "reasoning_answer_allowance": reasoning_answer_allowance,
-                "attention_capture_requested": attention_capture_requested,
-                "attention_capture_active": attention_capture_active,
-                "attention_capture_method": (
-                    "mean_causal_self_attention" if attention_capture_active else None
-                ),
-                "attention_source_limit": (
-                    _ATTENTION_SOURCE_LIMIT if attention_capture_active else None
-                ),
-                "attention_implementation": (
-                    getattr(self.model.config, "_attn_implementation", None)
-                    if attention_capture_active
-                    else self.loaded_attention_implementation
-                ),
-                "template_ms": (template_ended - template_started) / 1e6,
-                "tokenization_ms": (tokenization_ended - tokenization_started) / 1e6,
-                "media": media_summary,
-            },
-        )
-        if synchronize:
-            torch.cuda.synchronize()
-        encoder_outputs: Any | None = None
-        decoder_attention_mask: Any | None = None
-        current_attentions: Any | None = None
-        with torch.inference_mode():
-            if encoder_decoder:
-                encoder_outputs = self._encode_source(input_ids, attention_mask)
-                decoder_input_ids = torch.tensor(
-                    [[self.decoder_start_token_id]],
-                    device=self.device,
-                    dtype=torch.long,
-                )
-                decoder_attention_mask = torch.ones_like(decoder_input_ids)
-                logits, past, current_attentions = self._forward_encoder_decoder(
-                    decoder_input_ids,
-                    decoder_attention_mask,
-                    encoder_outputs,
-                    attention_mask,
-                )
-            elif attention_capture_active and prompt_tokens > 1:
-                # A normal prompt prefill would materialize an O(context^2)
-                # attention matrix. Prefill all but the final prompt token into
-                # the KV cache with the configured efficient kernel, then ask
-                # eager attention for the single final query row that actually
-                # produces generated token zero.
-                self._restore_attention_implementation()
-                _, prefix_past, _ = self._forward_last(
-                    torch,
-                    input_ids[:, :-1],
-                    attention_mask[:, :-1],
-                    media=media_inputs,
-                )
-                attention_capture_active = self._select_attention_implementation("eager")
-                if not attention_capture_active and not attention_capture_warning_emitted:
-                    self._emit_run(
-                        run_id,
-                        "warning",
-                        {
-                            "code": "attention_capture_unavailable",
-                            "message": (
-                                "The model could not re-enable eager attention after prompt "
-                                "prefill, so exact attention weights are unavailable."
-                            ),
-                        },
-                    )
-                    attention_capture_warning_emitted = True
-                logits, past, current_attentions = self._forward_last(
-                    torch,
-                    input_ids[:, -1:],
-                    attention_mask,
-                    prefix_past,
-                    capture_attention=attention_capture_active,
-                )
-            else:
-                logits, past, current_attentions = self._forward_last(
-                    torch,
-                    input_ids,
-                    attention_mask,
-                    capture_attention=attention_capture_active,
-                    media=media_inputs,
-                )
-        media_inputs.clear()  # Pixel tensors are consumed by prefill; free them now.
-        if synchronize:
-            torch.cuda.synchronize()
-        prefill_ended = time.monotonic_ns()
-        prefill_ms = (prefill_ended - prefill_started) / 1e6
-        # The prompt forward produces the distribution for generated token 0.
-        # Attribute that work to token 0 so the first-token point includes
-        # prefill; subsequent token points receive their own decode forward.
-        forward_ms = prefill_ms
-        generation_started = prefill_started
-        previous_emitted_ns: int | None = None
-        emission_times_ns: list[int] = []
-        finish_reason = "length"
-        eos_set = _eos_token_ids(self.model, self.tokenizer)
-        reasoning_answer_allowance_active = False
-        stop_sequences = tuple(settings.get("stop_sequences", ()))
-        operation_order = [
-            "repetition_penalty",
-            "frequency_penalty",
-            "presence_penalty",
-            "temperature",
-            "top_k",
-            "top_p",
-            "min_p",
-            "renormalize",
-            "sample",
-        ]
-        self._emit_run(
-            run_id,
-            "metric",
-            {
-                "sampling_operation_order": operation_order,
-                "effective_seed": str(command["effective_seed"]),
-                "rng_algorithm": "torch.Generator",
-                "generator_device": self.device,
-                "seed_affected_token_selection": settings["temperature"] > 0,
-                "deterministic_reference_mode": deterministic_reference_mode,
-                "torch_use_deterministic_algorithms": deterministic_reference_mode,
-                "cudnn_benchmark": False if cudnn is not None else None,
-                "prefill_ms": prefill_ms,
-                "prompt_tokens_per_second": prompt_tokens
-                / max((prefill_ended - prefill_started) / 1e9, 1e-9),
-            },
-        )
-
-        for token_index in range(generation_token_limit):
-            if self.cancel_event.is_set():
-                finish_reason = "cancelled"
-                break
-            sample_started = time.monotonic_ns()
-            raw = logits[0].float()
-            processed = self._apply_penalties(
-                torch,
-                raw,
-                full_ids,
-                float(settings["repetition_penalty"]),
-                float(settings["frequency_penalty"]),
-                float(settings["presence_penalty"]),
-            )
-            forced_token_id = (
-                forced_prefix_token_ids[token_index]
-                if token_index < len(forced_prefix_token_ids)
-                else None
-            )
-            if forced_token_id is not None and not 0 <= forced_token_id < raw.numel():
-                raise ValueError("forced generation prefix contains an invalid token ID")
-            temperature = float(settings["temperature"])
-            if temperature == 0:
-                sampled_id = int(torch.argmax(processed).item())
-                chosen_id = forced_token_id if forced_token_id is not None else sampled_id
-                sampler_logprob: float | None = 0.0 if chosen_id == sampled_id else None
-                sampler_probability = 1.0 if chosen_id == sampled_id else 0.0
-                sampler_entropy: float | None = 0.0 if detailed_metrics else None
-                filtered = torch.full_like(processed, -torch.inf)
-                filtered[sampled_id] = 0.0
-                filters: list[str] = ["greedy_argmax"]
-                sampler_log_probs = filtered
-            else:
-                filtered, filters = self._filter_distribution(
-                    torch,
-                    processed,
-                    temperature=temperature,
-                    top_k=int(settings["top_k"]),
-                    top_p=float(settings["top_p"]),
-                    min_p=float(settings["min_p"]),
-                )
-                sampler_log_probs = torch.log_softmax(filtered, dim=-1)
-                sampler_probs = torch.exp(sampler_log_probs)
-                sampled_id = int(torch.multinomial(sampler_probs, 1, generator=generator).item())
-                chosen_id = forced_token_id if forced_token_id is not None else sampled_id
-                selected_sampler_logprob = float(sampler_log_probs[chosen_id].item())
-                sampler_logprob = (
-                    selected_sampler_logprob if math.isfinite(selected_sampler_logprob) else None
-                )
-                sampler_probability = float(sampler_probs[chosen_id].item())
-                if detailed_metrics:
-                    finite = torch.isfinite(sampler_log_probs)
-                    sampler_entropy = float(
-                        -(sampler_probs[finite] * sampler_log_probs[finite]).sum().item()
-                    )
-                else:
-                    sampler_entropy = None
-            if forced_token_id is not None:
-                filters.append("forced_prefix")
-            if detailed_metrics:
-                raw_log_probs = torch.log_softmax(raw, dim=-1)
-                raw_logprob_value = float(raw_log_probs[chosen_id].item())
-                raw_logprob: float | None = raw_logprob_value
-                raw_probability: float | None = float(torch.exp(raw_log_probs[chosen_id]).item())
-                raw_rank: int | None = int(
-                    1
-                    + (raw > raw[chosen_id]).sum().item()
-                    + (
-                        (raw == raw[chosen_id])
-                        & (torch.arange(raw.numel(), device=raw.device) < chosen_id)
-                    )
-                    .sum()
-                    .item()
-                )
-                cumulative_logprob += raw_logprob_value
-                running_perplexity: float | None = math.exp(
-                    min(700.0, -cumulative_logprob / (token_index + 1))
-                )
-            else:
-                raw_log_probs = None
-                raw_logprob = None
-                raw_probability = None
-                raw_rank = None
-                running_perplexity = None
-            generated.append(chosen_id)
-            full_ids.append(chosen_id)
-            piece = str(self.tokenizer.convert_ids_to_tokens(chosen_id))
-            current_text = self.tokenizer.decode(
-                generated,
-                skip_special_tokens=False,
-                clean_up_tokenization_spaces=False,
-            )
-            common = 0
-            for left, right in zip(previous_text, current_text, strict=False):
-                if left != right:
-                    break
-                common += 1
-            display_text = current_text[common:]
-            attention_attribution: dict[str, Any] | None = None
-            if attention_capture_active:
-                attention_attribution, capture_error = _mean_causal_self_attention(
-                    torch,
-                    current_attentions,
-                    context_tokens,
-                )
-                if attention_attribution is None:
-                    attention_capture_active = False
-                    if not attention_capture_warning_emitted:
-                        self._emit_run(
-                            run_id,
-                            "warning",
-                            {
-                                "code": "attention_capture_unavailable",
-                                "message": (
-                                    "The model did not expose usable causal self-attention "
-                                    "weights for this run."
-                                ),
-                                "reason": capture_error,
-                            },
-                        )
-                        attention_capture_warning_emitted = True
-                elif token_index == 0:
-                    # The complete prompt catalogue is stored once. Subsequent
-                    # generated entries are reconstructed from the run's token
-                    # stream using prompt_token_count + generated_token_index.
-                    attention_attribution["context_tokens"] = prompt_context_tokens
-                if attention_attribution is not None:
-                    captured_attention_token_count += 1
-            alternatives: dict[str, list[dict[str, Any]]] = {"raw": [], "sampling": []}
-            alternative_count = int(settings.get("alternatives", 10))
-            if detailed_metrics and alternative_count and raw_log_probs is not None:
-                top_count = min(alternative_count, raw.numel())
-                raw_values, raw_ids = torch.topk(raw, top_count, sorted=True)
-                for rank, (candidate_logit, candidate_id) in enumerate(
-                    zip(raw_values.tolist(), raw_ids.tolist(), strict=True), 1
-                ):
-                    candidate = int(candidate_id)
-                    alternatives["raw"].append(
-                        {
-                            "rank": rank,
-                            "token_id": candidate,
-                            "piece": str(self.tokenizer.convert_ids_to_tokens(candidate)),
-                            "logit": float(candidate_logit),
-                            "log_probability": float(raw_log_probs[candidate].item()),
-                            "probability": float(torch.exp(raw_log_probs[candidate]).item()),
-                            "survived_filter": bool(torch.isfinite(filtered[candidate]).item()),
-                        }
-                    )
-                finite_count = int(torch.isfinite(filtered).sum().item())
-                if finite_count:
-                    sample_count = min(top_count, finite_count)
-                    values, ids = torch.topk(sampler_log_probs, sample_count, sorted=True)
-                    for rank, (candidate_logprob, candidate_id) in enumerate(
-                        zip(values.tolist(), ids.tolist(), strict=True), 1
-                    ):
-                        candidate = int(candidate_id)
-                        alternatives["sampling"].append(
-                            {
-                                "rank": rank,
-                                "token_id": candidate,
-                                "piece": str(self.tokenizer.convert_ids_to_tokens(candidate)),
-                                "logit": float(filtered[candidate].item()),
-                                "log_probability": float(candidate_logprob),
-                                "probability": float(math.exp(candidate_logprob)),
-                                "survived_filter": True,
-                            }
-                        )
-            sample_ended = time.monotonic_ns()
-            emitted_ns = time.monotonic_ns()
-            inter_token_ms = (
-                (emitted_ns - previous_emitted_ns) / 1e6
-                if previous_emitted_ns is not None
-                else None
-            )
-            cumulative_ms = (emitted_ns - generation_started) / 1e6
-            instantaneous_tps = (
-                1000.0 / inter_token_ms if inter_token_ms and inter_token_ms > 0 else None
-            )
-            emission_times_ns.append(emitted_ns)
-            rolling_window = emission_times_ns[-10:]
-            if len(rolling_window) == 1:
-                rolling_tps = 1.0 / max((emitted_ns - generation_started) / 1e9, 1e-9)
-            else:
-                rolling_tps = (len(rolling_window) - 1) / max(
-                    (rolling_window[-1] - rolling_window[0]) / 1e9,
-                    1e-9,
-                )
-            pending_token_events[token_index] = {
-                "token_index": token_index,
-                "token_id": chosen_id,
-                "piece": piece,
-                "escaped_bytes": _escaped_bytes(display_text),
-                "display_text": display_text,
-                "replace_from": common,
-                "span_start": common,
-                "span_end": len(current_text),
-                "raw_logit": float(raw[chosen_id].item()),
-                "raw_logprob": raw_logprob,
-                "raw_probability": raw_probability,
-                "raw_rank": raw_rank,
-                "processed_logit": float(processed[chosen_id].item()),
-                "sample_logprob": sampler_logprob,
-                "sample_probability": sampler_probability,
-                "entropy": sampler_entropy,
-                "surprise": (
-                    -sampler_logprob if detailed_metrics and sampler_logprob is not None else None
-                ),
-                "cumulative_logprob": cumulative_logprob if detailed_metrics else None,
-                "running_perplexity": running_perplexity,
-                "alternatives": alternatives,
-                "decode_ms": forward_ms,
-                "includes_prefill": token_index == 0,
-                "sample_ms": (sample_ended - sample_started) / 1e6,
-                "emit_ms": 0.0,
-                "inter_token_ms": inter_token_ms,
-                "cumulative_ms": cumulative_ms,
-                "instantaneous_tps": instantaneous_tps,
-                "rolling_tps": rolling_tps,
-                "filters": filters,
-                "expert_routing": None,
-                "attention_attribution": attention_attribution,
-            }
-            emit_segmented_tokens(reasoning_segmenter.feed(token_index, display_text))
-            previous_emitted_ns = emitted_ns
-            previous_text = current_text
-            if attention_capture_active:
-                context_tokens.append(
-                    _token_source(
-                        self.tokenizer,
-                        chosen_id,
-                        prompt_tokens + token_index,
-                        source_kind="generated",
-                        generated_token_index=token_index,
-                        display_text=display_text,
-                    )
-                )
-            if chosen_id in eos_set:
-                finish_reason = "eos"
-                break
-            if stop_sequences and any(current_text.endswith(stop) for stop in stop_sequences):
-                finish_reason = "stop_sequence"
-                break
-            generated_count = token_index + 1
-            if generated_count >= max_new_tokens and not reasoning_answer_allowance_active:
-                reasoning_without_answer = (
-                    tagged_reasoning_enabled
-                    and reasoning_observed
-                    and isinstance(reasoning_segmenter, TagReasoningSegmenter)
-                    and not visible_answer_observed
-                )
-                if reasoning_answer_allowance and reasoning_without_answer:
-                    reasoning_answer_allowance_active = True
-                    self._emit_run(
-                        run_id,
-                        "warning",
-                        {
-                            "code": "reasoning_answer_allowance_activated",
-                            "message": (
-                                "Reasoning consumed the configured output limit before visible "
-                                "answer text; generation is continuing within a bounded answer "
-                                "allowance."
-                            ),
-                            "configured_max_output_tokens": configured_max_output_tokens,
-                            "reasoning_answer_allowance": reasoning_answer_allowance,
-                        },
-                    )
-                else:
-                    if reasoning_without_answer:
-                        self._emit_run(
-                            run_id,
-                            "warning",
-                            {
-                                "code": "reasoning_answer_allowance_unavailable",
-                                "message": (
-                                    "Reasoning consumed the output budget and the model context "
-                                    "has no remaining capacity for an answer."
-                                ),
-                                "configured_max_output_tokens": configured_max_output_tokens,
-                            },
-                        )
-                    break
-            if generated_count >= generation_token_limit:
-                break
-
-            selected_tensor = torch.tensor([[chosen_id]], device=self.device)
-            if encoder_decoder:
-                if decoder_attention_mask is None or encoder_outputs is None:
-                    raise RuntimeError("encoder-decoder prefill state was not initialized")
-                decoder_attention_mask = torch.cat(
-                    [
-                        decoder_attention_mask,
-                        torch.ones(
-                            (1, 1),
-                            device=self.device,
-                            dtype=decoder_attention_mask.dtype,
-                        ),
-                    ],
-                    dim=-1,
-                )
-            else:
-                attention_mask = torch.cat(
-                    [
-                        attention_mask,
-                        torch.ones((1, 1), device=self.device, dtype=attention_mask.dtype),
-                    ],
-                    dim=-1,
-                )
-            if synchronize:
-                torch.cuda.synchronize()
-            decode_started = time.monotonic_ns()
-            with torch.inference_mode():
-                if encoder_decoder:
-                    logits, past, current_attentions = self._forward_encoder_decoder(
-                        selected_tensor,
-                        decoder_attention_mask,
-                        encoder_outputs,
-                        attention_mask,
-                        past,
-                    )
-                else:
-                    logits, past, current_attentions = self._forward_last(
-                        torch,
-                        selected_tensor,
-                        attention_mask,
-                        past,
-                        capture_attention=attention_capture_active,
-                    )
-            if synchronize:
-                torch.cuda.synchronize()
-            decode_ended = time.monotonic_ns()
-            forward_ms = (decode_ended - decode_started) / 1e6
-
-        emit_segmented_tokens(reasoning_segmenter.finalize())
-        if pending_token_events:
-            raise RuntimeError("reasoning segmenter did not finalize every generated token")
-        for warning in getattr(reasoning_segmenter, "warnings", ()):
-            self._emit_run(
-                run_id,
-                "warning",
-                {"code": "reasoning_segmentation_warning", "message": warning},
-            )
-        if reasoning_answer_allowance_active and not visible_answer_observed:
-            self._emit_run(
-                run_id,
-                "warning",
-                {
-                    "code": "reasoning_answer_missing",
-                    "message": (
-                        "The model ended without visible answer text after using its bounded "
-                        "reasoning answer allowance."
-                    ),
-                },
-            )
-
-        completed_ns = time.monotonic_ns()
-        total_generation_seconds = max((completed_ns - generation_started) / 1e9, 1e-9)
-        if len(emission_times_ns) > 1:
-            steady_decode_seconds = max(
-                (emission_times_ns[-1] - emission_times_ns[0]) / 1e9,
-                1e-9,
-            )
-            decode_tokens_per_second = (len(emission_times_ns) - 1) / steady_decode_seconds
-        else:
-            decode_tokens_per_second = None
-        segment_metrics = {}
-        for name, segment_logprobs in raw_segment_logprobs.items():
-            segment_metrics[name] = {
-                "token_count": segment_token_counts[name],
-                "perplexity": math.exp(min(700.0, -sum(segment_logprobs) / len(segment_logprobs)))
-                if segment_logprobs
-                else None,
-                "mean_raw_logprob": sum(segment_logprobs) / len(segment_logprobs)
-                if segment_logprobs
-                else None,
-            }
-        status = "cancelled" if finish_reason == "cancelled" else "completed"
-        current_attentions = None
-        payload = {
-            "finish_reason": finish_reason,
-            "generated_token_count": len(generated),
-            "configured_max_output_tokens": configured_max_output_tokens,
-            "reasoning_answer_allowance": reasoning_answer_allowance,
-            "reasoning_answer_allowance_used": max(0, len(generated) - max_new_tokens),
-            "text": previous_text,
-            "conditional_response_perplexity": math.exp(
-                min(700.0, -cumulative_logprob / len(generated))
-            )
-            if generated and detailed_metrics
-            else None,
-            "segment_metrics": segment_metrics,
-            "total_generation_ms": (completed_ns - generation_started) / 1e6,
-            "engine_ttft_ms": (
-                (emission_times_ns[0] - generation_started) / 1e6 if emission_times_ns else None
-            ),
-            "prefill_ms": prefill_ms,
-            "decode_tokens_per_second": decode_tokens_per_second,
-            "end_to_end_tokens_per_second": len(generated) / total_generation_seconds,
-            "memory": self._memory_snapshot(torch),
-            "expert_routing": {"state": "not_applicable", "reason": "dense model"},
-            "attention_capture": {
-                "requested": attention_capture_requested,
-                "method": "mean_causal_self_attention" if captured_attention_token_count else None,
-                "captured_token_count": captured_attention_token_count,
-                "semantics": "attention_weights_not_causal_contributions",
-                "scope": "decoder_step_context_attention_independent_of_sampled_candidate",
-            },
-        }
-        self._emit_run(run_id, status, payload)
-        _send(self.output, "reply", request_id=request_id, ok=True, payload=payload)
 
     def _embed(self, command: Mapping[str, Any]) -> dict[str, Any]:
         if self.sentence_model is None or self.model_info is None:
@@ -2213,6 +1435,979 @@ class WorkerRuntime:
             "duration_ms": (time.monotonic_ns() - started) / 1e6,
             "definition": "exp(-mean shifted raw full-vocabulary log probability)",
         }
+
+
+class GenerationSession:
+    """One generation request, advanced one sampled token per ``step()``.
+
+    The constructor validates, renders, tokenizes, and emits the ``stage: prefill``
+    event; ``prefill()`` runs the forward pass that yields token-0 logits; each
+    ``step()`` samples and emits one token and runs the forward pass for the next.
+    The session operates on the runtime's active resident, so the scheduler makes
+    its resident active before every call.
+    """
+
+    def __init__(self, rt: WorkerRuntime, command: Mapping[str, Any]) -> None:
+        resident = rt._select_resident(command.get("model_key"))
+        if resident is None or rt.model is None or rt.tokenizer is None or rt.model_info is None:
+            raise RuntimeError("no generation model is loaded")
+        import torch
+
+        self.rt = rt
+        self.torch = torch
+        self.resident = resident
+        self.cancel_requested = False
+        self.finished = False
+        self.concurrent_sessions_max = len(rt.sessions) + 1
+        self.rope_deltas: Any = None
+        self.run_id = str(command["run_id"])
+        self.request_id = str(command["request_id"])
+        run_id = self.run_id
+        self.settings = settings = dict(command["sampling"])
+        self.command = command
+        self.device = device = resident.input_device
+        instrumentation = str(command.get("instrumentation", "token"))
+        self.detailed_metrics = instrumentation in {"token", "full", "expert"}
+        self.synchronize = instrumentation in {"full", "expert"} and device.startswith("cuda")
+        self.encoder_decoder = encoder_decoder = (
+            rt.model_info.get("task") == "encoder_decoder_generation"
+        )
+        self.attention_capture_requested = instrumentation in {"full", "expert"}
+        self.attention_capture_active = False
+        self.attention_capture_warning_emitted = False
+        self.captured_attention_token_count = 0
+        # The attention kernel this session runs with; the scheduler re-selects it
+        # when another session on the same resident switched the kernel.
+        self.attention_implementation: str | None = resident.loaded_attention_implementation
+        if self.attention_capture_requested and not encoder_decoder:
+            self.attention_capture_active = rt._select_attention_implementation("eager")
+            if self.attention_capture_active:
+                self.attention_implementation = "eager"
+            else:
+                rt._emit_run(
+                    run_id,
+                    "warning",
+                    {
+                        "code": "attention_capture_unavailable",
+                        "message": (
+                            "This model cannot switch to an eager attention implementation, "
+                            "so exact attention weights are unavailable for this run."
+                        ),
+                    },
+                )
+                self.attention_capture_warning_emitted = True
+        elif self.attention_capture_requested:
+            rt._emit_run(
+                run_id,
+                "warning",
+                {
+                    "code": "attention_capture_unavailable",
+                    "message": (
+                        "Encoder-decoder attention is split between decoder self-attention "
+                        "and encoder cross-attention; this causal attribution view does not "
+                        "combine those incomparable distributions."
+                    ),
+                },
+            )
+            self.attention_capture_warning_emitted = True
+        else:
+            rt._restore_attention_implementation()
+        self.deterministic_reference_mode = bool(command.get("deterministic_reference_mode"))
+        # Set this on every request.  torch's switch is process-global, so merely
+        # enabling it for reference runs would silently affect every later run.
+        torch.use_deterministic_algorithms(
+            self.deterministic_reference_mode,
+            warn_only=self.deterministic_reference_mode,
+        )
+        rt._deterministic_state = self.deterministic_reference_mode
+        self.cudnn = cudnn = getattr(torch.backends, "cudnn", None)
+        if cudnn is not None:
+            # The reference worker keeps autotuning off for both modes.  This is
+            # stable across requests and is reported verbatim below.
+            cudnn.benchmark = False
+        messages = list(command["messages"])
+        if (
+            any(item.get("role") == "system" for item in messages)
+            and "deepseek" in rt.model_info["display_name"].lower()
+        ):
+            rt._emit_run(
+                run_id,
+                "warning",
+                {
+                    "code": "model_card_discourages_system_prompt",
+                    "message": "This model card recommends avoiding system prompts.",
+                },
+            )
+        template_started = time.monotonic_ns()
+        reasoning_requested = command.get("reasoning")
+        if reasoning_requested is not None and not isinstance(reasoning_requested, bool):
+            raise ValueError("reasoning must be a boolean when provided")
+        media_requested = any(item.get("attachments") for item in messages)
+        if media_requested and (rt.processor is None or encoder_decoder):
+            raise ValueError("the loaded model has no chat media processor")
+        # Processors render the same chat templates from content-part messages,
+        # so media conversations reuse the tokenizer rendering path unchanged.
+        rendered_prompt, prompt_renderer = _render_messages(
+            rt.processor if media_requested else rt.tokenizer,
+            _processor_messages(messages) if media_requested else messages,
+            reasoning=reasoning_requested,
+            reasoning_delimiters=rt.model_info.get("reasoning_delimiters"),
+        )
+        template_ended = time.monotonic_ns()
+        if prompt_renderer == "chat_template_system_merged":
+            rt._emit_run(
+                run_id,
+                "warning",
+                {
+                    "code": "system_prompt_merged",
+                    "message": (
+                        "This model's chat template has no system role; the system prompt "
+                        "was prepended to the first user message."
+                    ),
+                },
+            )
+        if prompt_renderer == "plain_text_fallback":
+            rt._emit_run(
+                run_id,
+                "warning",
+                {
+                    "code": "chat_template_unavailable",
+                    "message": (
+                        "The bundled tokenizer has no chat template; messages were rendered "
+                        "with the deterministic plain-text fallback."
+                    ),
+                },
+            )
+        if encoder_decoder and rt.decoder_start_token_id is None:
+            (
+                rt.decoder_start_token_id,
+                rt.decoder_start_token_source,
+                rt.decoder_start_warning,
+            ) = _decoder_start_token(rt.model, rt.tokenizer)
+        if encoder_decoder and rt.decoder_start_warning:
+            rt._emit_run(
+                run_id,
+                "warning",
+                {
+                    "code": "decoder_start_token_fallback",
+                    "message": rt.decoder_start_warning,
+                    "source": rt.decoder_start_token_source,
+                },
+            )
+        self.decoder_start_token_id: int | None = rt.decoder_start_token_id
+        tokenization_started = time.monotonic_ns()
+        media_inputs: dict[str, Any] = {}
+        media_summary: dict[str, Any] | None = None
+        if media_requested:
+            images, videos, video_metadata = _load_media(rt.processor, messages)
+            processor_kwargs: dict[str, Any] = {}
+            if images:
+                processor_kwargs["images"] = images
+            if videos:
+                processor_kwargs.update(
+                    videos=videos, video_metadata=video_metadata, do_sample_frames=False
+                )
+            encoded = rt.processor(
+                text=[rendered_prompt],
+                return_tensors="pt",
+                add_special_tokens=False,
+                **processor_kwargs,
+            )
+            media_inputs = {
+                key: value
+                for key, value in encoded.items()
+                if key not in {"input_ids", "attention_mask"}
+            }
+            media_summary = {"images": len(images), "videos": len(videos)}
+        else:
+            encoded = rt.tokenizer(
+                rendered_prompt,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids))
+        fallback_bos = (
+            _default_bos_token_id(rt.tokenizer)
+            if prompt_renderer == "plain_text_fallback"
+            else None
+        )
+        if fallback_bos is not None and input_ids[0].tolist()[:1] != [fallback_bos]:
+            input_ids = torch.cat(
+                [torch.tensor([[fallback_bos]], dtype=input_ids.dtype), input_ids], dim=-1
+            )
+            attention_mask = torch.cat(
+                [torch.ones((1, 1), dtype=attention_mask.dtype), attention_mask], dim=-1
+            )
+        self.input_ids = input_ids = input_ids.to(device)
+        self.attention_mask = attention_mask.to(device)
+        self.media_inputs = media_inputs = {
+            key: value.to(device) if hasattr(value, "to") else value
+            for key, value in media_inputs.items()
+        }
+        tokenization_ended = time.monotonic_ns()
+        self.prompt_tokens = prompt_tokens = int(input_ids.shape[-1])
+        media_placeholders = {
+            int(token_id): kind
+            for kind, token_id in (
+                ("image", getattr(rt.model.config, "image_token_id", None)),
+                ("video", getattr(rt.model.config, "video_token_id", None)),
+            )
+            if media_summary is not None and isinstance(token_id, int)
+        }
+        if media_summary is not None:
+            prompt_ids = input_ids[0].tolist()
+            media_summary["placeholder_tokens"] = sum(
+                1 for token_id in prompt_ids if token_id in media_placeholders
+            )
+        context_limit = int(rt.model_info.get("effective_context_limit") or 4096)
+        configured_prompt_limit = int(command.get("max_prompt_tokens", context_limit))
+        reserved_output_tokens = int(command.get("reserved_output_tokens", 0))
+        effective_prompt_limit = min(
+            configured_prompt_limit,
+            context_limit if encoder_decoder else max(1, context_limit - reserved_output_tokens),
+        )
+        if prompt_tokens > effective_prompt_limit:
+            raise ValueError(
+                "rendered prompt exceeds the effective prompt-token limit "
+                f"({prompt_tokens} > {effective_prompt_limit})"
+            )
+        self.forced_prefix_token_ids = forced_prefix_token_ids = [
+            int(item) for item in command.get("forced_prefix_token_ids", ())
+        ]
+        available_output_tokens = (
+            max(0, context_limit - 1) if encoder_decoder else max(0, context_limit - prompt_tokens)
+        )
+        self.configured_max_output_tokens = configured_max_output_tokens = int(
+            settings["max_output_tokens"]
+        )
+        if len(forced_prefix_token_ids) > configured_max_output_tokens:
+            raise ValueError("forced generation prefix exceeds the configured output limit")
+        if len(forced_prefix_token_ids) > available_output_tokens:
+            raise ValueError("forced generation prefix exceeds the available model context")
+        self.max_new_tokens = max_new_tokens = min(
+            configured_max_output_tokens,
+            available_output_tokens,
+        )
+        if max_new_tokens <= 0:
+            raise ValueError("rendered prompt consumes the effective context limit")
+        # Decode the prompt-token catalogue only after every bounded context
+        # check succeeds. Rejected oversized prompts must not trigger an
+        # unbounded device-to-CPU copy plus one tokenizer call per token.
+        self.prompt_context_tokens = prompt_context_tokens = (
+            [
+                _token_source(
+                    rt.tokenizer,
+                    int(token_id),
+                    context_index,
+                    source_kind="prompt",
+                )
+                for context_index, token_id in enumerate(input_ids[0].tolist())
+            ]
+            if self.attention_capture_active
+            else []
+        )
+        if prompt_context_tokens and media_placeholders:
+            # Media positions stay `prompt` sources for older readers; the extra
+            # `media` field says which attached image or video they carry.
+            labels = _media_labels(
+                [int(item["token_id"]) for item in prompt_context_tokens],
+                media_placeholders,
+                _media_token_counts(rt.processor, media_inputs),
+            )
+            for source, label in zip(prompt_context_tokens, labels, strict=True):
+                if label is not None:
+                    source["media"] = label
+
+        configured_delimiters = rt.model_info.get("reasoning_delimiters")
+        self.tagged_reasoning_enabled = (
+            reasoning_requested is not False
+            and isinstance(configured_delimiters, (list, tuple))
+            and len(configured_delimiters) == 2
+            and all(isinstance(item, str) and item for item in configured_delimiters)
+            and configured_delimiters[0] != configured_delimiters[1]
+        )
+        # ``max_output_tokens`` normally remains a hard limit. A tagged
+        # reasoning model is the one exception: if emitted reasoning reaches
+        # that boundary before any answer text, it receives one bounded
+        # additional output window. Otherwise a valid run can end with only
+        # reasoning (or just ``</think>``) and the non-Nerd UI has nothing to
+        # display. The allowance is still clipped to the remaining context.
+        self.reasoning_answer_allowance = reasoning_answer_allowance = (
+            min(
+                configured_max_output_tokens,
+                max(0, available_output_tokens - max_new_tokens),
+            )
+            if self.tagged_reasoning_enabled
+            else 0
+        )
+        self.generation_token_limit = generation_token_limit = (
+            max_new_tokens + reasoning_answer_allowance
+        )
+
+        self.generator = torch.Generator(device=device)
+        self.generator.manual_seed(int(command["effective_seed"]))
+        self.generated: list[int] = []
+        self.context_tokens: list[dict[str, Any]] = list(prompt_context_tokens)
+        self.full_ids = (
+            [self.decoder_start_token_id]
+            if encoder_decoder and self.decoder_start_token_id is not None
+            else input_ids[0].tolist()
+        )
+        self.previous_text = ""
+        self.cumulative_logprob = 0.0
+        self.raw_segment_logprobs: dict[str, list[float]] = {
+            "reasoning": [],
+            "answer": [],
+            "unknown": [],
+        }
+        self.segment_token_counts = {"reasoning": 0, "answer": 0, "unknown": 0}
+        self.reasoning_segmenter, reasoning_primed = _reasoning_segmenter(
+            rt.model_info, rendered_prompt
+        )
+        self.pending_token_events: dict[int, dict[str, Any]] = {}
+        self.reasoning_observed = reasoning_primed
+        self.visible_answer_observed = False
+        self.eos_set: set[int] = set()
+        self.token_index = 0
+        self.finish_reason = "length"
+        self.reasoning_answer_allowance_active = False
+        self.stop_sequences = tuple(settings.get("stop_sequences", ()))
+        self.previous_emitted_ns: int | None = None
+        self.emission_times_ns: list[int] = []
+        self.logits: Any = None
+        self.past: Any = None
+        self.current_attentions: Any = None
+        self.encoder_outputs: Any = None
+        self.decoder_attention_mask: Any = None
+
+        self.prefill_started = time.monotonic_ns()
+        rt._emit_run(
+            run_id,
+            "stage",
+            {
+                "stage": "prefill",
+                "rendered_prompt": rendered_prompt,
+                "prompt_tokens": prompt_tokens,
+                "context_limit": context_limit,
+                "effective_prompt_limit": effective_prompt_limit,
+                "reserved_output_tokens": reserved_output_tokens,
+                "prompt_renderer": prompt_renderer,
+                "architecture_mode": "encoder_decoder" if encoder_decoder else "causal",
+                "decoder_start_token_id": self.decoder_start_token_id if encoder_decoder else None,
+                "decoder_start_token_source": rt.decoder_start_token_source
+                if encoder_decoder
+                else None,
+                "reasoning_primed": reasoning_primed,
+                "reasoning_requested": reasoning_requested,
+                "configured_max_output_tokens": configured_max_output_tokens,
+                "generation_token_limit": generation_token_limit,
+                "reasoning_answer_allowance": reasoning_answer_allowance,
+                "attention_capture_requested": self.attention_capture_requested,
+                "attention_capture_active": self.attention_capture_active,
+                "attention_capture_method": (
+                    "mean_causal_self_attention" if self.attention_capture_active else None
+                ),
+                "attention_source_limit": (
+                    _ATTENTION_SOURCE_LIMIT if self.attention_capture_active else None
+                ),
+                "attention_implementation": (
+                    getattr(rt.model.config, "_attn_implementation", None)
+                    if self.attention_capture_active
+                    else rt.loaded_attention_implementation
+                ),
+                "template_ms": (template_ended - template_started) / 1e6,
+                "tokenization_ms": (tokenization_ended - tokenization_started) / 1e6,
+                "media": media_summary,
+                "model_key": resident.key,
+                "placement": resident.placement,
+                "quantization": resident.quantization,
+                "concurrent_sessions": self.concurrent_sessions_max,
+            },
+        )
+
+    def _save_rope_state(self) -> None:
+        owner = _rope_state_owner(self.rt.model)
+        if owner is not None:
+            self.rope_deltas = owner.rope_deltas
+
+    def prefill(self) -> None:
+        rt = self.rt
+        torch = self.torch
+        run_id = self.run_id
+        input_ids = self.input_ids
+        attention_mask = self.attention_mask
+        media_inputs = self.media_inputs
+        prefill_started = self.prefill_started
+        if self.synchronize:
+            torch.cuda.synchronize()
+        with torch.inference_mode():
+            if self.encoder_decoder:
+                self.encoder_outputs = rt._encode_source(input_ids, attention_mask)
+                decoder_input_ids = torch.tensor(
+                    [[self.decoder_start_token_id]],
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                self.decoder_attention_mask = torch.ones_like(decoder_input_ids)
+                self.logits, self.past, self.current_attentions = rt._forward_encoder_decoder(
+                    decoder_input_ids,
+                    self.decoder_attention_mask,
+                    self.encoder_outputs,
+                    attention_mask,
+                )
+            elif self.attention_capture_active and self.prompt_tokens > 1:
+                # A normal prompt prefill would materialize an O(context^2)
+                # attention matrix. Prefill all but the final prompt token into
+                # the KV cache with the configured efficient kernel, then ask
+                # eager attention for the single final query row that actually
+                # produces generated token zero.
+                rt._restore_attention_implementation()
+                _, prefix_past, _ = rt._forward_last(
+                    torch,
+                    input_ids[:, :-1],
+                    attention_mask[:, :-1],
+                    media=media_inputs,
+                )
+                self.attention_capture_active = rt._select_attention_implementation("eager")
+                self.attention_implementation = (
+                    "eager"
+                    if self.attention_capture_active
+                    else self.resident.loaded_attention_implementation
+                )
+                if not self.attention_capture_active and not self.attention_capture_warning_emitted:
+                    rt._emit_run(
+                        run_id,
+                        "warning",
+                        {
+                            "code": "attention_capture_unavailable",
+                            "message": (
+                                "The model could not re-enable eager attention after prompt "
+                                "prefill, so exact attention weights are unavailable."
+                            ),
+                        },
+                    )
+                    self.attention_capture_warning_emitted = True
+                self.logits, self.past, self.current_attentions = rt._forward_last(
+                    torch,
+                    input_ids[:, -1:],
+                    attention_mask,
+                    prefix_past,
+                    capture_attention=self.attention_capture_active,
+                )
+            else:
+                self.logits, self.past, self.current_attentions = rt._forward_last(
+                    torch,
+                    input_ids,
+                    attention_mask,
+                    capture_attention=self.attention_capture_active,
+                    media=media_inputs,
+                )
+        self._save_rope_state()
+        media_inputs.clear()  # Pixel tensors are consumed by prefill; free them now.
+        if self.synchronize:
+            torch.cuda.synchronize()
+        prefill_ended = time.monotonic_ns()
+        self.prefill_ms = prefill_ms = (prefill_ended - prefill_started) / 1e6
+        # The prompt forward produces the distribution for generated token 0.
+        # Attribute that work to token 0 so the first-token point includes
+        # prefill; subsequent token points receive their own decode forward.
+        self.forward_ms = prefill_ms
+        self.generation_started = prefill_started
+        self.eos_set = _eos_token_ids(rt.model, rt.tokenizer)
+        operation_order = [
+            "repetition_penalty",
+            "frequency_penalty",
+            "presence_penalty",
+            "temperature",
+            "top_k",
+            "top_p",
+            "min_p",
+            "renormalize",
+            "sample",
+        ]
+        rt._emit_run(
+            run_id,
+            "metric",
+            {
+                "sampling_operation_order": operation_order,
+                "effective_seed": str(self.command["effective_seed"]),
+                "rng_algorithm": "torch.Generator",
+                "generator_device": self.device,
+                "seed_affected_token_selection": self.settings["temperature"] > 0,
+                "deterministic_reference_mode": self.deterministic_reference_mode,
+                "torch_use_deterministic_algorithms": self.deterministic_reference_mode,
+                "cudnn_benchmark": False if self.cudnn is not None else None,
+                "prefill_ms": prefill_ms,
+                "prompt_tokens_per_second": self.prompt_tokens
+                / max((prefill_ended - prefill_started) / 1e9, 1e-9),
+            },
+        )
+
+    def _emit_segmented_tokens(self, tokens: Sequence[SegmentedToken]) -> None:
+        for token in tokens:
+            payload = self.pending_token_events.pop(token.token_index)
+            token_segment = token.classification.value
+            payload["segment"] = token_segment
+            payload["reasoning_slices"] = [item.model_dump(mode="json") for item in token.slices]
+            self.segment_token_counts[token_segment] += 1
+            raw_logprob = payload.get("raw_logprob")
+            if isinstance(raw_logprob, float):
+                self.raw_segment_logprobs[token_segment].append(raw_logprob)
+            if any(item.classification is SegmentClass.REASONING for item in token.slices):
+                self.reasoning_observed = True
+            if payload["token_id"] not in self.eos_set and _contains_visible_answer(token):
+                self.visible_answer_observed = True
+            self.rt._emit_run(self.run_id, "token", payload)
+
+    def step(self) -> bool:
+        """Emit one token and prepare the next; False once the run has ended."""
+
+        if self.finished:
+            return False
+        rt = self.rt
+        torch = self.torch
+        run_id = self.run_id
+        settings = self.settings
+        detailed_metrics = self.detailed_metrics
+        token_index = self.token_index
+        if token_index >= self.generation_token_limit:
+            return self._finish()
+        if rt.cancel_event.is_set() or self.cancel_requested:
+            self.finish_reason = "cancelled"
+            return self._finish()
+        sample_started = time.monotonic_ns()
+        raw = self.logits[0].float()
+        processed = rt._apply_penalties(
+            torch,
+            raw,
+            self.full_ids,
+            float(settings["repetition_penalty"]),
+            float(settings["frequency_penalty"]),
+            float(settings["presence_penalty"]),
+        )
+        forced_token_id = (
+            self.forced_prefix_token_ids[token_index]
+            if token_index < len(self.forced_prefix_token_ids)
+            else None
+        )
+        if forced_token_id is not None and not 0 <= forced_token_id < raw.numel():
+            raise ValueError("forced generation prefix contains an invalid token ID")
+        temperature = float(settings["temperature"])
+        if temperature == 0:
+            sampled_id = int(torch.argmax(processed).item())
+            chosen_id = forced_token_id if forced_token_id is not None else sampled_id
+            sampler_logprob: float | None = 0.0 if chosen_id == sampled_id else None
+            sampler_probability = 1.0 if chosen_id == sampled_id else 0.0
+            sampler_entropy: float | None = 0.0 if detailed_metrics else None
+            filtered = torch.full_like(processed, -torch.inf)
+            filtered[sampled_id] = 0.0
+            filters: list[str] = ["greedy_argmax"]
+            sampler_log_probs = filtered
+        else:
+            filtered, filters = rt._filter_distribution(
+                torch,
+                processed,
+                temperature=temperature,
+                top_k=int(settings["top_k"]),
+                top_p=float(settings["top_p"]),
+                min_p=float(settings["min_p"]),
+            )
+            sampler_log_probs = torch.log_softmax(filtered, dim=-1)
+            sampler_probs = torch.exp(sampler_log_probs)
+            sampled_id = int(torch.multinomial(sampler_probs, 1, generator=self.generator).item())
+            chosen_id = forced_token_id if forced_token_id is not None else sampled_id
+            selected_sampler_logprob = float(sampler_log_probs[chosen_id].item())
+            sampler_logprob = (
+                selected_sampler_logprob if math.isfinite(selected_sampler_logprob) else None
+            )
+            sampler_probability = float(sampler_probs[chosen_id].item())
+            if detailed_metrics:
+                finite = torch.isfinite(sampler_log_probs)
+                sampler_entropy = float(
+                    -(sampler_probs[finite] * sampler_log_probs[finite]).sum().item()
+                )
+            else:
+                sampler_entropy = None
+        if forced_token_id is not None:
+            filters.append("forced_prefix")
+        if detailed_metrics:
+            raw_log_probs = torch.log_softmax(raw, dim=-1)
+            raw_logprob_value = float(raw_log_probs[chosen_id].item())
+            raw_logprob: float | None = raw_logprob_value
+            raw_probability: float | None = float(torch.exp(raw_log_probs[chosen_id]).item())
+            raw_rank: int | None = int(
+                1
+                + (raw > raw[chosen_id]).sum().item()
+                + (
+                    (raw == raw[chosen_id])
+                    & (torch.arange(raw.numel(), device=raw.device) < chosen_id)
+                )
+                .sum()
+                .item()
+            )
+            self.cumulative_logprob += raw_logprob_value
+            running_perplexity: float | None = math.exp(
+                min(700.0, -self.cumulative_logprob / (token_index + 1))
+            )
+        else:
+            raw_log_probs = None
+            raw_logprob = None
+            raw_probability = None
+            raw_rank = None
+            running_perplexity = None
+        self.generated.append(chosen_id)
+        self.full_ids.append(chosen_id)
+        piece = str(rt.tokenizer.convert_ids_to_tokens(chosen_id))
+        current_text = rt.tokenizer.decode(
+            self.generated,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        common = 0
+        for left, right in zip(self.previous_text, current_text, strict=False):
+            if left != right:
+                break
+            common += 1
+        display_text = current_text[common:]
+        attention_attribution: dict[str, Any] | None = None
+        if self.attention_capture_active:
+            attention_attribution, capture_error = _mean_causal_self_attention(
+                torch,
+                self.current_attentions,
+                self.context_tokens,
+            )
+            if attention_attribution is None:
+                self.attention_capture_active = False
+                if not self.attention_capture_warning_emitted:
+                    rt._emit_run(
+                        run_id,
+                        "warning",
+                        {
+                            "code": "attention_capture_unavailable",
+                            "message": (
+                                "The model did not expose usable causal self-attention "
+                                "weights for this run."
+                            ),
+                            "reason": capture_error,
+                        },
+                    )
+                    self.attention_capture_warning_emitted = True
+            elif token_index == 0:
+                # The complete prompt catalogue is stored once. Subsequent
+                # generated entries are reconstructed from the run's token
+                # stream using prompt_token_count + generated_token_index.
+                attention_attribution["context_tokens"] = self.prompt_context_tokens
+            if attention_attribution is not None:
+                self.captured_attention_token_count += 1
+        alternatives: dict[str, list[dict[str, Any]]] = {"raw": [], "sampling": []}
+        alternative_count = int(settings.get("alternatives", 10))
+        if detailed_metrics and alternative_count and raw_log_probs is not None:
+            top_count = min(alternative_count, raw.numel())
+            raw_values, raw_ids = torch.topk(raw, top_count, sorted=True)
+            for rank, (candidate_logit, candidate_id) in enumerate(
+                zip(raw_values.tolist(), raw_ids.tolist(), strict=True), 1
+            ):
+                candidate = int(candidate_id)
+                alternatives["raw"].append(
+                    {
+                        "rank": rank,
+                        "token_id": candidate,
+                        "piece": str(rt.tokenizer.convert_ids_to_tokens(candidate)),
+                        "logit": float(candidate_logit),
+                        "log_probability": float(raw_log_probs[candidate].item()),
+                        "probability": float(torch.exp(raw_log_probs[candidate]).item()),
+                        "survived_filter": bool(torch.isfinite(filtered[candidate]).item()),
+                    }
+                )
+            finite_count = int(torch.isfinite(filtered).sum().item())
+            if finite_count:
+                sample_count = min(top_count, finite_count)
+                values, ids = torch.topk(sampler_log_probs, sample_count, sorted=True)
+                for rank, (candidate_logprob, candidate_id) in enumerate(
+                    zip(values.tolist(), ids.tolist(), strict=True), 1
+                ):
+                    candidate = int(candidate_id)
+                    alternatives["sampling"].append(
+                        {
+                            "rank": rank,
+                            "token_id": candidate,
+                            "piece": str(rt.tokenizer.convert_ids_to_tokens(candidate)),
+                            "logit": float(filtered[candidate].item()),
+                            "log_probability": float(candidate_logprob),
+                            "probability": float(math.exp(candidate_logprob)),
+                            "survived_filter": True,
+                        }
+                    )
+        sample_ended = time.monotonic_ns()
+        emitted_ns = time.monotonic_ns()
+        previous_emitted_ns = self.previous_emitted_ns
+        inter_token_ms = (
+            (emitted_ns - previous_emitted_ns) / 1e6 if previous_emitted_ns is not None else None
+        )
+        cumulative_ms = (emitted_ns - self.generation_started) / 1e6
+        instantaneous_tps = (
+            1000.0 / inter_token_ms if inter_token_ms and inter_token_ms > 0 else None
+        )
+        self.emission_times_ns.append(emitted_ns)
+        rolling_window = self.emission_times_ns[-10:]
+        if len(rolling_window) == 1:
+            rolling_tps = 1.0 / max((emitted_ns - self.generation_started) / 1e9, 1e-9)
+        else:
+            rolling_tps = (len(rolling_window) - 1) / max(
+                (rolling_window[-1] - rolling_window[0]) / 1e9,
+                1e-9,
+            )
+        self.pending_token_events[token_index] = {
+            "token_index": token_index,
+            "token_id": chosen_id,
+            "piece": piece,
+            "escaped_bytes": _escaped_bytes(display_text),
+            "display_text": display_text,
+            "replace_from": common,
+            "span_start": common,
+            "span_end": len(current_text),
+            "raw_logit": float(raw[chosen_id].item()),
+            "raw_logprob": raw_logprob,
+            "raw_probability": raw_probability,
+            "raw_rank": raw_rank,
+            "processed_logit": float(processed[chosen_id].item()),
+            "sample_logprob": sampler_logprob,
+            "sample_probability": sampler_probability,
+            "entropy": sampler_entropy,
+            "surprise": (
+                -sampler_logprob if detailed_metrics and sampler_logprob is not None else None
+            ),
+            "cumulative_logprob": self.cumulative_logprob if detailed_metrics else None,
+            "running_perplexity": running_perplexity,
+            "alternatives": alternatives,
+            "decode_ms": self.forward_ms,
+            "includes_prefill": token_index == 0,
+            "sample_ms": (sample_ended - sample_started) / 1e6,
+            "emit_ms": 0.0,
+            "inter_token_ms": inter_token_ms,
+            "cumulative_ms": cumulative_ms,
+            "instantaneous_tps": instantaneous_tps,
+            "rolling_tps": rolling_tps,
+            "filters": filters,
+            "expert_routing": None,
+            "attention_attribution": attention_attribution,
+        }
+        self._emit_segmented_tokens(self.reasoning_segmenter.feed(token_index, display_text))
+        self.previous_emitted_ns = emitted_ns
+        self.previous_text = current_text
+        if self.attention_capture_active:
+            self.context_tokens.append(
+                _token_source(
+                    rt.tokenizer,
+                    chosen_id,
+                    self.prompt_tokens + token_index,
+                    source_kind="generated",
+                    generated_token_index=token_index,
+                    display_text=display_text,
+                )
+            )
+        if chosen_id in self.eos_set:
+            self.finish_reason = "eos"
+            return self._finish()
+        if self.stop_sequences and any(current_text.endswith(stop) for stop in self.stop_sequences):
+            self.finish_reason = "stop_sequence"
+            return self._finish()
+        generated_count = token_index + 1
+        if generated_count >= self.max_new_tokens and not self.reasoning_answer_allowance_active:
+            reasoning_without_answer = (
+                self.tagged_reasoning_enabled
+                and self.reasoning_observed
+                and isinstance(self.reasoning_segmenter, TagReasoningSegmenter)
+                and not self.visible_answer_observed
+            )
+            if self.reasoning_answer_allowance and reasoning_without_answer:
+                self.reasoning_answer_allowance_active = True
+                rt._emit_run(
+                    run_id,
+                    "warning",
+                    {
+                        "code": "reasoning_answer_allowance_activated",
+                        "message": (
+                            "Reasoning consumed the configured output limit before visible "
+                            "answer text; generation is continuing within a bounded answer "
+                            "allowance."
+                        ),
+                        "configured_max_output_tokens": self.configured_max_output_tokens,
+                        "reasoning_answer_allowance": self.reasoning_answer_allowance,
+                    },
+                )
+            else:
+                if reasoning_without_answer:
+                    rt._emit_run(
+                        run_id,
+                        "warning",
+                        {
+                            "code": "reasoning_answer_allowance_unavailable",
+                            "message": (
+                                "Reasoning consumed the output budget and the model context "
+                                "has no remaining capacity for an answer."
+                            ),
+                            "configured_max_output_tokens": self.configured_max_output_tokens,
+                        },
+                    )
+                return self._finish()
+        if generated_count >= self.generation_token_limit:
+            return self._finish()
+
+        device = self.device
+        selected_tensor = torch.tensor([[chosen_id]], device=device)
+        if self.encoder_decoder:
+            if self.decoder_attention_mask is None or self.encoder_outputs is None:
+                raise RuntimeError("encoder-decoder prefill state was not initialized")
+            self.decoder_attention_mask = torch.cat(
+                [
+                    self.decoder_attention_mask,
+                    torch.ones(
+                        (1, 1),
+                        device=device,
+                        dtype=self.decoder_attention_mask.dtype,
+                    ),
+                ],
+                dim=-1,
+            )
+        else:
+            self.attention_mask = torch.cat(
+                [
+                    self.attention_mask,
+                    torch.ones((1, 1), device=device, dtype=self.attention_mask.dtype),
+                ],
+                dim=-1,
+            )
+        if self.synchronize:
+            torch.cuda.synchronize()
+        decode_started = time.monotonic_ns()
+        with torch.inference_mode():
+            if self.encoder_decoder:
+                self.logits, self.past, self.current_attentions = rt._forward_encoder_decoder(
+                    selected_tensor,
+                    self.decoder_attention_mask,
+                    self.encoder_outputs,
+                    self.attention_mask,
+                    self.past,
+                )
+            else:
+                self.logits, self.past, self.current_attentions = rt._forward_last(
+                    torch,
+                    selected_tensor,
+                    self.attention_mask,
+                    self.past,
+                    capture_attention=self.attention_capture_active,
+                )
+        self._save_rope_state()
+        if self.synchronize:
+            torch.cuda.synchronize()
+        decode_ended = time.monotonic_ns()
+        self.forward_ms = (decode_ended - decode_started) / 1e6
+        self.token_index += 1
+        return True
+
+    def _finish(self) -> bool:
+        """Emit the terminal event and reply, then drop every tensor this run holds."""
+
+        rt = self.rt
+        run_id = self.run_id
+        self._emit_segmented_tokens(self.reasoning_segmenter.finalize())
+        if self.pending_token_events:
+            raise RuntimeError("reasoning segmenter did not finalize every generated token")
+        for warning in getattr(self.reasoning_segmenter, "warnings", ()):
+            rt._emit_run(
+                run_id,
+                "warning",
+                {"code": "reasoning_segmentation_warning", "message": warning},
+            )
+        if self.reasoning_answer_allowance_active and not self.visible_answer_observed:
+            rt._emit_run(
+                run_id,
+                "warning",
+                {
+                    "code": "reasoning_answer_missing",
+                    "message": (
+                        "The model ended without visible answer text after using its bounded "
+                        "reasoning answer allowance."
+                    ),
+                },
+            )
+
+        generated = self.generated
+        emission_times_ns = self.emission_times_ns
+        generation_started = self.generation_started
+        completed_ns = time.monotonic_ns()
+        total_generation_seconds = max((completed_ns - generation_started) / 1e9, 1e-9)
+        if len(emission_times_ns) > 1:
+            steady_decode_seconds = max(
+                (emission_times_ns[-1] - emission_times_ns[0]) / 1e9,
+                1e-9,
+            )
+            decode_tokens_per_second = (len(emission_times_ns) - 1) / steady_decode_seconds
+        else:
+            decode_tokens_per_second = None
+        segment_metrics = {}
+        for name, segment_logprobs in self.raw_segment_logprobs.items():
+            segment_metrics[name] = {
+                "token_count": self.segment_token_counts[name],
+                "perplexity": math.exp(min(700.0, -sum(segment_logprobs) / len(segment_logprobs)))
+                if segment_logprobs
+                else None,
+                "mean_raw_logprob": sum(segment_logprobs) / len(segment_logprobs)
+                if segment_logprobs
+                else None,
+            }
+        status = "cancelled" if self.finish_reason == "cancelled" else "completed"
+        # Drop the cache and activations before measuring memory for the payload.
+        self._release_tensors()
+        payload = {
+            "finish_reason": self.finish_reason,
+            "generated_token_count": len(generated),
+            "configured_max_output_tokens": self.configured_max_output_tokens,
+            "reasoning_answer_allowance": self.reasoning_answer_allowance,
+            "reasoning_answer_allowance_used": max(0, len(generated) - self.max_new_tokens),
+            "text": self.previous_text,
+            "conditional_response_perplexity": math.exp(
+                min(700.0, -self.cumulative_logprob / len(generated))
+            )
+            if generated and self.detailed_metrics
+            else None,
+            "segment_metrics": segment_metrics,
+            "total_generation_ms": (completed_ns - generation_started) / 1e6,
+            "engine_ttft_ms": (
+                (emission_times_ns[0] - generation_started) / 1e6 if emission_times_ns else None
+            ),
+            "prefill_ms": self.prefill_ms,
+            "decode_tokens_per_second": decode_tokens_per_second,
+            "end_to_end_tokens_per_second": len(generated) / total_generation_seconds,
+            "memory": rt._memory_snapshot(self.torch),
+            "expert_routing": {"state": "not_applicable", "reason": "dense model"},
+            "attention_capture": {
+                "requested": self.attention_capture_requested,
+                "method": "mean_causal_self_attention"
+                if self.captured_attention_token_count
+                else None,
+                "captured_token_count": self.captured_attention_token_count,
+                "semantics": "attention_weights_not_causal_contributions",
+                "scope": "decoder_step_context_attention_independent_of_sampled_candidate",
+            },
+            "ledger": rt._ledger(),
+            "scheduling": {
+                "concurrent_sessions_max": self.concurrent_sessions_max,
+                "interleaved": self.concurrent_sessions_max > 1,
+            },
+        }
+        self.finished = True
+        rt._emit_run(run_id, status, payload)
+        _send(rt.output, "reply", request_id=self.request_id, ok=True, payload=payload)
+        return False
+
+    def _release_tensors(self) -> None:
+        self.logits = self.past = self.current_attentions = None
+        self.encoder_outputs = self.decoder_attention_mask = None
+        self.input_ids = self.attention_mask = None
+        self.media_inputs = {}
 
 
 def worker_main(commands: Queue[Any], output: Queue[Any], cancel_event: Any) -> None:
