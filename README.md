@@ -10,6 +10,7 @@ Despite the name, this is a model-diagnostics tool. It is not a medical product 
 - Local causal and generic encoder-decoder generation through explicit reference loops, with cache reuse, cancellation, and replayable WebSocket events. Both paths have deterministic fixture coverage; individual real checkpoints still require validation.
 - Tiered token instrumentation: lightweight selected-token/timing fields at `off` and `basic`, and exact raw full-vocabulary likelihood, rank, entropy, perplexity, and bounded alternatives at `token`, `full`, and `expert`.
 - Bounded causal self-attention inspection for decoder-only generation at `full` and `expert`: selecting a generated token shows the rendered prompt, conversation history, and earlier generated tokens shaded by their mean post-softmax attention weight. This is an attention-allocation view, not proof of causal influence, grounding, or hallucination.
+- Image and video chat input for vision-language generators that ship a processor (validated on Qwen3-VL).
 - Teacher-forced prompt scoring for causal generation models.
 - SentenceTransformers text, image, video, and mixed-input embeddings where the selected checkpoint exposes those modalities, with truncation and re-normalization only for reviewed model-specific dimension contracts.
 - Persistent chats, runs, partial output, telemetry, attachments, portable chat-workspace import/export, branch-aware run replay, and confirmed terminal-run retention in SQLite and content-addressed storage.

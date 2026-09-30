@@ -20,11 +20,13 @@ The configured root later grew to eleven folders. Every row below is **Metadata/
 | Ministral-3-3B-Reasoning-2512-GGUF | — | — | — | — | — | empty folder | root diagnostic `empty_model_directory` | scan only |
 | Phi-3-mini-4k-instruct | text generation | yes | 4,096 `config.max_position_embeddings` (tokenizer 4,096) | none | text | 7.12 GiB BF16; exceeds the ~6.9 GiB free VRAM before activations | — | skipped: needs quantization or CPU offload, not yet implemented |
 | Qwen3-1.7B | text generation | yes | 40,960 `config.max_position_embeddings` (tokenizer 131,072) | `<think>` (`enable_thinking` template) | text | 3.78 GiB BF16, fits | — | runtime: pass, including reasoning on/off |
-| Qwen3-VL-2B-Thinking | text generation | yes | 262,144 `config.text_config.max_position_embeddings` (tokenizer 262,144) | `<think>` (template-primed) | text, image, video | 3.96 GiB BF16, fits | — | runtime: pass (text prompts) |
+| Qwen3-VL-2B-Thinking | text generation | yes | 262,144 `config.text_config.max_position_embeddings` (tokenizer 262,144) | `<think>` (template-primed) | text, image, video | 3.96 GiB BF16, fits | — | runtime: pass (text, image, and short-video chat input) |
 | Qwen3-VL-Embedding-2B | multimodal embedding | yes | 262,144 `config.text_config.max_position_embeddings` (tokenizer 262,144) | none (no longer inferred from added tokens) | text, image, video | 3.96 GiB BF16, fits | — | runtime: pass, 2,048-wide normalized vectors |
 | Vyakyarth | text embedding | yes | 128 `sentence_bert_config.max_seq_length` (positions 514, tokenizer 128) | none | text | 1.04 GiB FP32, fits | — | runtime: pass, 768-wide vectors (run in BF16 on CUDA) |
 
 The Qwen3-VL row records a fixed defect. Before the worker passed `cache_position`, Qwen3-VL placed every decoded token at position zero. On this checkpoint the old decode loop diverged from `generate()` at the fifth generated token for the prompt "Name three primary colors." and then repeated itself; the fixed loop matches `generate()` for all 20 tokens. The other runtime-verified generators also match `generate()` with the change in place. The Phi-3 skip is a memory limit of this 8 GiB card, not a compatibility result.
+
+Chat media on Qwen3-VL-2B-Thinking was exercised through the worker with synthetic inputs and reasoning disabled: a 64×48 red PNG became 70 image placeholder tokens (95 prompt tokens) and the greedy answer was "Red"; a 24-frame, 3-second 64×64 clip that brightens from black was sampled by the processor to 6 frames, became 12 video placeholder tokens, and was described as going from black to brighter. The opt-in matrix repeats this with a 96×96 PNG and a 16-frame clip and checks that every media position is labelled in the `full`-tier attention catalogue. These are smoke results for the preprocessing and prefill path, not a visual-quality evaluation.
 
 ## Evidence labels
 

@@ -17,6 +17,7 @@ This project follows a Keep a Changelog-style structure. Versions and dates are 
 - Unit, integration, security, real-model classification, frontend component, and browser test foundations, with a checked-in CPU CI workflow.
 - Architecture, adapter, configuration, API, metrics, benchmarking, deployment, security, contribution, model-capability, and limitations documentation.
 - Per-chat system prompt: edited in the composer's prompt controls, persisted on the chat (migration `0004`), prepended to generation, snapshotted in each run's settings so replay and token branching reuse the original, carried in portable chat workspaces, and merged into the first user message with a `system_prompt_merged` warning for chat templates that have no system role.
+- Image and video attachments in chat for vision-language generators with a processor (validated on Qwen3-VL-2B-Thinking). Media turns are rendered with the checkpoint processor's chat template, pixel inputs reach only the prefill forward, earlier attachments are re-sent with history, replay, and token branches, and the attention catalogue labels media positions. Generator `vision`/`video` capabilities are reported `partial`.
 
 ### Fixed
 

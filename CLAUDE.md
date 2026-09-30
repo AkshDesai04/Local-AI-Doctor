@@ -274,7 +274,7 @@ Anything outside `/api` and `/ws` falls back to `frontend/dist/index.html`.
 
 ### 5.7 Generation (`services/runs.py` RunManager + `workers/runtime.py`)
 `create_generation` runs these steps:
-1. Validates the task, rejects attachments (the generation adapter has no media), checks that parent lineage is in the same chat, and checks rendered history bytes.
+1. Validates the task and resolves attachments through `UploadStore` (image/video only, and only when the model's `vision`/`video` capability is `full|partial`; else 409 before any row is written), checks that parent lineage is in the same chat, re-resolves attachments linked to earlier lineage messages (`repository.list_message_attachments`), and checks rendered history bytes. Worker messages carry `attachments: [{kind, path}]`; replay and token branches resolve them the same way.
 2. `reserve_inference`.
 3. Chooses hardware and the effective seed (`secrets.randbits(64)` if omitted; seed 0 is valid). Merges only caller-set sampling fields over config defaults (`_effective_sampling`).
 4. Builds the `reproducibility` record.
@@ -297,7 +297,7 @@ Cancel works in two ways. A run still waiting in the queue is cancelled in place
 
 Inside the worker (`_generate_impl`):
 1. Renders the chat template with `add_generation_prompt=True`. `create_generation` leads the branch with the chat's `system_prompt` (unless the lineage already starts with a system message) and snapshots it as `settings.system_prompt`; replay and token branch reuse the source run's snapshot. `_render_messages` folds the system text into the first user turn when the template raises or drops it and reports renderer `chat_template_system_merged`, which emits a `system_prompt_merged` warning. The request's `reasoning` is forwarded as `enable_thinking` only to compatible templates. Without a template, a deterministic "Role: content" fallback is used and a `chat_template_unavailable` warning is emitted.
-2. Tokenizes with `add_special_tokens=False`. Only for the plain-text fallback, the BOS the tokenizer inserts by default (`_default_bos_token_id`) is prepended, because no template wrote it.
+2. Tokenizes with `add_special_tokens=False`. Media turns instead go through the processor loaded for models with `media_modalities` (`worker_model_payload`): content-part messages render via the processor's chat template, images decode with Pillow, videos with `transformers.video_utils.load_video` (pyav, processor frame sampler), and processor outputs (`pixel_values`, grids) go to the prefill forward only. Attention catalogue positions holding media get a `media` field while staying `prompt` sources. Only for the plain-text fallback, the BOS the tokenizer inserts by default (`_default_bos_token_id`) is prepended, because no template wrote it.
 3. Causal models prefill, then reuse the KV cache. Every decoder-body call passes `cache_position` (derived from attention-mask length minus new tokens); Qwen3-VL computes decode positions from it plus prefill `rope_deltas`, so omitting it put every decoded token at position 0. Families rejecting the keyword fall back without it. Encoder-decoder models encode once and resolve the decoder start token.
 4. The owned sampler runs, penalties first (`_apply_penalties`), then `_filter_distribution`. Fixed order: repetition → frequency → presence → temperature (0 = argmax) → top-k → top-p → min-p → renormalize → `torch.multinomial` with a seeded `torch.Generator`.
 5. Stop sequences are detected **after** a token is decoded, so the matched stop text stays in the output.

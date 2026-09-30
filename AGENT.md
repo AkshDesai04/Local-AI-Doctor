@@ -760,7 +760,7 @@ Currently recognized signatures include PNG, JPEG, GIF, WebP, MP4, WebM, WAV, FL
 - Accept a native modality only if the selected model and runtime adapter support it.
 - The supplied embedding model supports text/image/video/mixed, not audio.
 - Plain text/PDF upload inference is rejected because no extracted-text adapter is registered.
-- Generation attachments are rejected by the current generation adapter.
+- Generation accepts image and video attachments only when the selected causal generator reports `vision`/`video` as `full` or `partial` (processor-backed; validated on Qwen3-VL). Rejection happens before chat/run rows are written. The worker renders media turns with the checkpoint processor's chat template, decodes only upload-store files the parent resolved, and passes pixel inputs to the prefill forward only. Earlier messages' attachments are re-sent when history is rendered, including replay and token branches. Audio chat input is unsupported.
 
 Validate images and fully decode bounded media before recording an attachment. Current portable defaults include:
 

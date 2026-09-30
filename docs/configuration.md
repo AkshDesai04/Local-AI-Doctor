@@ -141,7 +141,7 @@ Sampling also includes `min_p=0`, repetition penalty `1`, frequency/presence pen
 | `upload_bytes` | 100 MiB | Exact uploaded-file limit, enforced while streaming to temporary storage. Multipart request bodies are independently capped at this value plus a 1 MiB framing allowance. |
 | `prompt_bytes` | 4 MiB | Enforced on rendered generation prompts, embedding text, prompt scoring, and standalone message content. Non-multipart POST/PUT/PATCH bodies are independently capped at this value plus a 1 MiB JSON/form envelope allowance. |
 | `trace_bytes_per_run` | 128 MiB | Caps persisted per-token payload bytes for token rows/raw token events. Live inference continues and emits a warning when token-row persistence is truncated. |
-| `attachment_count` | 16 | Enforced for standalone-message and generation attachment IDs, plus attachment-backed embedding inputs. Generation media is still rejected by the reference adapter. |
+| `attachment_count` | 16 | Enforced for standalone-message and generation attachment IDs, plus attachment-backed embedding inputs. Generation accepts image/video attachments only for generators whose `vision`/`video` capability is usable. |
 | `telemetry_events_per_run` | 100,000 | Caps persisted token events per run. It does not cap live WebSocket delivery or stop inference. |
 | `image_pixels` | 40,000,000 | Maximum decoded width times height for an uploaded image. |
 | `video_frames` | 256 | Maximum decoded frames for video and maximum frames for an animated image. |
