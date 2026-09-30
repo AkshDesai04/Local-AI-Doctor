@@ -239,3 +239,14 @@ ignored `.env`. Application-level RAM/VRAM budgets and inference behavior belong
 configuration. Keep one Uvicorn process unless the isolated worker design and SQLite write behavior
 have been validated with a higher value; additional web workers do not make a single loaded model
 faster.
+
+## Windows desktop installer
+
+The Electron installer is a separate, non-container deployment on the same fixed ports (`6969` UI,
+`6767` API), so stop the Compose stack before starting it. Every installer bundles the pinned
+CUDA 12.8 PyTorch runtime from `requirements-cuda.lock` and is named
+`Local-AI-Doctor-<version>-cuda.exe`. It is built from the dedicated `.venv-desktop` created by
+`desktop/scripts/prepare-build-env.ps1`, and the build fails if the bundled PyTorch variant, its CUDA
+DLL set, the packaged self-check, or the 1.95 GiB size limit is not met. A CPU-only installer
+(`-cpu.exe`) is built only when `LAD_DESKTOP_TORCH_VARIANT=cpu` is set explicitly. See
+[desktop/README.md](../desktop/README.md) for build, smoke-test, and variant details.

@@ -114,12 +114,13 @@ npm --prefix frontend run dev                                        # http://12
 node scripts/release-version.mjs check | current | patch | minor | major
 npm --prefix desktop test                       # node --test desktop/test/*.test.cjs
 npm --prefix desktop start                      # dev Electron; uses .venv python or $env:LAD_DESKTOP_PYTHON; needs frontend/dist
-npm --prefix desktop run dist                   # frontend build + PyInstaller + NSIS -> release/Local-AI-Doctor-<ver>.exe
+.\desktop\scripts\prepare-build-env.ps1         # (re)creates .venv-desktop with the pinned cu128 wheels; -Variant cpu only on request
+npm --prefix desktop run dist                   # frontend build + PyInstaller + NSIS -> release/Local-AI-Doctor-<ver>-cuda.exe
 .\desktop\scripts\smoke-backend.ps1; .\desktop\scripts\smoke-desktop.ps1   # ports 6767/6969 must be free (stop Docker first)
 npm audit --package-lock-only --prefix desktop --audit-level=high
 ```
-- `$env:PYTHON` selects the packaging interpreter.
-- `build-backend.ps1` refuses to package if the installed `local-ai-doctor` version differs from `VERSION`.
+- Packaging uses `.venv-desktop` (never `.venv` or PATH python); `$env:PYTHON` overrides it. `LAD_DESKTOP_TORCH_VARIANT` selects `cuda` (default) or `cpu`.
+- The build fails if torch is not the requested variant (`+cu128`/CUDA 12.8 or `+cpu`), the installed `local-ai-doctor` version differs from `VERSION`, a required CUDA DLL is missing or one comes from outside the pinned wheels, the packaged `--self-check` fails (with CUDA kernels when `nvidia-smi` exists), or the installer is ≥ 1.95 GiB. Validation logic lives in `desktop/scripts/build-guard.cjs`.
 
 ## 4. Repository map
 
@@ -429,7 +430,7 @@ Inside the worker (`_generate_impl`):
   3. Show the native `startup.html` window immediately.
   4. Spawn the backend: the packaged PyInstaller `backend_launcher.py`, or in development `.venv` python / `LAD_DESKTOP_PYTHON`.
      - Env: `LAD_CONFIG`, `LAD_USER_CONFIG`=`userData/config/local.yaml`, `LAD_PROFILE=native-windows`, host and port 127.0.0.1:6767, allowed origins, `LAD_PATHS__*` under `userData/data`.
-     - Packaged builds also set `LAD_RUNTIME__DEVICE=auto`.
+     - `runtime.device` is not overridden: the profile default `auto` applies unless the user's `local.yaml` sets it.
   5. Poll health (`lib/lifecycle.cjs` `isBackendReady`).
   6. Confirm the backend hasn't exited.
   7. Start `lib/frontend-server.cjs` (static server and proxy on 6969).
@@ -437,7 +438,7 @@ Inside the worker (`_generate_impl`):
 - **Shutdown** writes a private per-launch marker file (`LAD_DESKTOP_SHUTDOWN_FILE`). The launcher watches it and triggers uvicorn lifespan cleanup. After 20 s it falls back to `taskkill` of the exact child tree.
 - Logs go to `userData/logs`.
 - `multiprocessing.freeze_support()` in the launcher is required so spawned workers don't start a second server.
-- GitHub builds bundle CPU torch because of the 2 GiB asset limit. Local builds bundle whatever torch the build environment has. The installer is unsigned per-user NSIS. Models are never bundled.
+- Every installer (GitHub and local) bundles the pinned CUDA 12.8 torch; `backend.spec` drops CUDA DLLs not from the wheels, unused `cusolverMg64_11.dll`/`nvrtc64_120_0.alt.dll`, `accelerate.test_utils`, and non-cu128 bitsandbytes libraries. The installer is unsigned per-user NSIS. Models are never bundled.
 
 ### CI and release (`.github/workflows/ci.yml`)
 - Runs on pushes to `dev`/`main` and on PRs. Jobs:
@@ -447,7 +448,8 @@ Inside the worker (`_generate_impl`):
 - `desktop-release` runs on push only, on Windows:
   - `dev` → prerelease `vX.Y.Z-beta.<run_number>`.
   - `main` → stable, immutable `vX.Y.Z`.
-  - Exactly one asset, `Local-AI-Doctor-<version>.exe`, under 2 GiB, verified by SHA-256 and an integrity marker in the release body.
+  - Builds the CUDA variant (`LAD_DESKTOP_TORCH_VARIANT: cuda`) via `prepare-build-env.ps1`; the runner has no GPU, so kernels are not exercised there.
+  - Exactly one asset, `Local-AI-Doctor-<version>-cuda.exe`, under 1.95 GiB, verified by SHA-256 and an integrity marker in the release body.
   - If a tag already points at another commit, the job fails and you must bump `VERSION`.
 - `VERSION` is the source of truth. `scripts/release-version.mjs` syncs `pyproject.toml` and the frontend and desktop `package.json`/lock files, so never hand-edit a manifest version. A completed feature or fix gets a **patch** bump. **minor/major** only on explicit owner request. Docs-only changes don't need a bump.
 

@@ -102,34 +102,38 @@ For a frontend development loop, keep the backend on port 8000 and run `npm run 
 The Electron desktop build starts its packaged backend on `127.0.0.1:6767`,
 shows a native startup window immediately, waits for the backend to become
 fully ready (database initialized, model-worker startup handshake received, and
-registry scan complete), holds for exactly 16 seconds, and only then starts and
-opens the frontend on `127.0.0.1:6969`.
+registry scan complete), and only then starts and opens the frontend on
+`127.0.0.1:6969`. There is no fixed delay; readiness is the only gate.
 
-Beginning with `0.1.3`, the release EXE is a persistent per-user installer, not
-a portable self-extracting launcher. Run the downloaded EXE once and complete
-the installation; use the desktop or Start menu shortcut for every later
-session. The one-time installation can take several minutes while Windows
-extracts and scans the multi-gigabyte CUDA runtime, but it displays installer
-progress. Normal launches reuse those installed files and immediately show a
-native startup screen instead of extracting the runtime again. Do not keep
-opening the downloaded installer to start the application.
+The release EXE is a persistent per-user installer, not a portable
+self-extracting launcher. Run the downloaded EXE once and complete the
+installation; use the desktop or Start menu shortcut for every later session.
+The one-time installation can take several minutes while Windows extracts and
+scans the multi-gigabyte CUDA runtime, but it displays installer progress.
+Normal launches reuse those installed files and immediately show a native
+startup screen instead of extracting the runtime again. Do not keep opening the
+downloaded installer to start the application.
 
-The final `0.1.3` local CUDA build reached backend readiness in about 20 seconds
-and the complete interface in about 38 seconds on the validation machine; the
-latter includes the required 16-second hold. Actual timings depend on storage,
-antivirus scanning, and hardware. A single-instance lock focuses an existing
-application window when the installed shortcut is opened twice. Models remain
-external and are selected through the model-directory setting. Configuration,
-chats, uploads, and cache persist in Electron's user-data directory.
+Actual startup timings depend on storage, antivirus scanning, and hardware. A
+single-instance lock focuses an existing application window when the installed
+shortcut is opened twice. Models remain external and are selected through the
+model-directory setting. Configuration, chats, uploads, and cache persist in
+Electron's user-data directory.
+
+Every installer bundles the pinned PyTorch 2.8.0 CUDA 12.8 runtime and is named
+`Local-AI-Doctor-<version>-cuda.exe`, where `<version>` comes from the root
+`VERSION` file. With an NVIDIA driver that supports CUDA 12.8, automatic device
+selection uses the GPU; other machines run on CPU and the hardware view says
+why. A `runtime.device` set in the desktop user configuration is honored. The
+build refuses to produce an installer whose PyTorch is not the requested
+variant, whose CUDA DLLs are missing or come from a local CUDA Toolkit, or that
+is 1.95 GiB or larger.
 
 Successful `dev` pushes publish beta prereleases and successful `main` pushes
-publish stable releases. Each release has one uploaded asset,
-`Local-AI-Doctor-<version>.exe`; GitHub's automatic source-code links cannot be
-removed. The GitHub-built EXE contains the CPU runtime because the pinned CUDA
-wheel alone exceeds GitHub's 2 GiB asset limit. A local desktop build made from
-the pinned CUDA Python environment can use CUDA; the shell discovers the best
-runtime actually bundled into that EXE. See [desktop/README.md](desktop/README.md)
-for local build instructions. The current executable is unsigned, so Windows
+publish stable releases. Each release has one uploaded asset, the CUDA
+installer; GitHub's automatic source-code links cannot be removed. See
+[desktop/README.md](desktop/README.md) for local build instructions, including
+an explicit CPU-only variant. The current executable is unsigned, so Windows
 SmartScreen may show a warning.
 
 ## Native WSL quick start

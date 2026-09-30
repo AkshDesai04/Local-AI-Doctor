@@ -106,8 +106,8 @@ The following requirements came directly from the project conversation and are b
 - An ordinary completed feature or fix receives a patch bump. Use a minor or major bump only when the owner explicitly asks for that release level.
 - A successful `dev` push creates a beta prerelease `vX.Y.Z-beta.<workflow-run>` with a matching beta-suffixed EXE.
 - A successful `main` push creates the immutable stable `vX.Y.Z` release. Promotion normally occurs by merging the tested `dev` revision into `main`.
-- The release workflow uploads exactly one custom asset: `Local-AI-Doctor-<version>.exe`. GitHub's automatic source ZIP/TAR links cannot be removed and are not custom release assets.
-- The GitHub-built EXE is CPU-only because the complete CUDA runtime exceeds GitHub's 2 GiB asset limit. A local EXE built from the pinned CUDA environment may use CUDA; native and Docker CUDA paths remain available.
+- The release workflow uploads exactly one custom asset: `Local-AI-Doctor-<version>-cuda.exe`. GitHub's automatic source ZIP/TAR links cannot be removed and are not custom release assets.
+- Every desktop installer, GitHub-built or local, bundles the pinned CUDA 12.8 PyTorch runtime and must stay below 1.95 GiB. The build fails rather than silently shipping CPU PyTorch; a CPU-only `-cpu.exe` is built only when `LAD_DESKTOP_TORCH_VARIANT=cpu` is set explicitly.
 - The EXE is currently unsigned and may trigger SmartScreen. Installation can take time because the local CUDA payload is large, but normal launches must not re-extract it.
 
 ### 3.8 Git and delivery
@@ -1260,14 +1260,15 @@ Desktop persistent state uses Electron `app.getPath('userData')`, including writ
 
 Packaged shutdown writes a private per-launch random marker so a backend watcher can trigger normal Uvicorn lifespan cleanup. A Windows `taskkill` fallback targets the exact child tree only after the 20-second grace. Preserve graceful cleanup.
 
-The desktop shell requests automatic device selection. Actual capability comes from the PyTorch runtime bundled at build time: GitHub releases bundle CPU PyTorch, while a local build from the pinned CUDA environment can select CUDA. Never force every packaged build to CPU, and never advertise CUDA when the bundled runtime cannot import or use it.
+The desktop shell does not override `runtime.device`; the `native-windows` profile default `auto` applies unless the user's desktop `local.yaml` sets a device. Every installer bundles the pinned CUDA 12.8 PyTorch runtime, so `auto` selects a usable NVIDIA GPU and otherwise CPU with the reason reported. Never force every packaged build to CPU, and never advertise CUDA when the bundled runtime cannot import or use it.
 
 ### 18.1 Local desktop build
 
-Use a Python 3.12 environment with the locked base, matching PyTorch/Torchvision flavor, ML, desktop, and current project packages installed. GitHub uses CPU wheels; a local CUDA-capable build uses the pinned CUDA wheels. Then:
+Packaging uses the dedicated `.venv-desktop` environment created by `desktop/scripts/prepare-build-env.ps1` (Python 3.12, the base/ML/desktop locks, then the exact `requirements-cuda.lock` wheels, then the current project). `LAD_DESKTOP_TORCH_VARIANT` selects `cuda` (default) or `cpu`. The build strips CUDA Toolkit directories from `PATH`, and fails when the PyTorch variant, the CUDA DLL set, the packaged `--self-check` (CUDA kernels when `nvidia-smi` exists), or the 1.95 GiB installer limit is not met. Then:
 
 ```powershell
 node scripts/release-version.mjs check
+.\desktop\scripts\prepare-build-env.ps1
 npm --prefix frontend ci
 npm --prefix desktop ci
 npm --prefix desktop test
@@ -1278,7 +1279,7 @@ npm --prefix desktop run dist
 
 The two fixed ports must be free during desktop smoke tests, so stop the Docker stack first and restore it afterward if needed.
 
-The only distributable result is `release/Local-AI-Doctor-<version>.exe`. The build checks installed project/version agreement and removes other generated items only within the bounded `release` directory.
+The only distributable result is `release/Local-AI-Doctor-<version>-<variant>.exe`. The build checks installed project/version agreement and removes other generated items only within the bounded `release` directory.
 
 ## 19. Versioning and GitHub release automation
 
@@ -1305,10 +1306,10 @@ Default rule:
 
 ### 19.2 Branch channels
 
-- `dev` push -> beta prerelease `vX.Y.Z-beta.<github.run_number>` and `Local-AI-Doctor-X.Y.Z-beta.<run>.exe`.
-- `main` push -> stable immutable `vX.Y.Z` and `Local-AI-Doctor-X.Y.Z.exe`.
+- `dev` push -> beta prerelease `vX.Y.Z-beta.<github.run_number>` and `Local-AI-Doctor-X.Y.Z-beta.<run>-cuda.exe`.
+- `main` push -> stable immutable `vX.Y.Z` and `Local-AI-Doctor-X.Y.Z-cuda.exe`.
 
-The release job runs only after backend, frontend, and desktop validation. It uses Windows and the CPU runtime, builds/smokes the EXE, enforces less than 2 GiB, exact filename, SHA-256 digest, target commit, channel, and exactly one uploaded custom asset.
+The release job runs only after backend, frontend, and desktop validation. It uses Windows and the pinned CUDA 12.8 runtime (the runner has no GPU, so the self-check verifies the `+cu128` build and DLL set without running kernels), builds/smokes the EXE, enforces less than 1.95 GiB, exact filename, SHA-256 digest, target commit, channel, and exactly one uploaded custom asset.
 
 Published releases/tags are immutable. An interrupted draft may be recovered and verified by immutable release ID, target SHA, unique title, asset digest, and integrity marker. Do not manually replace a published asset or retarget a tag. If a stable tag points elsewhere, bump `VERSION` and publish a new release.
 
@@ -1493,7 +1494,7 @@ The model-root update route uses HTTP `PUT`. Same-origin production does not req
 - No general document text extraction, PDF inference, remote URL fetch, or archive extraction.
 - No vector index/nearest-neighbor service or persisted dimensionality-reduction service.
 - No TLS, identity system, multi-tenancy, or production internet exposure.
-- CPU-only GitHub desktop binary; unsigned installer EXE.
+- Unsigned installer EXE.
 - No selected open-source license.
 
 If a UI section represents one of these goals, keep it disabled/explained. Never substitute fixture/demo values in a real session.
