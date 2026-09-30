@@ -163,6 +163,7 @@ class ModelRegistry:
 
         if not reservation.active:
             raise RuntimeError("worker model load requires an active inference reservation")
+        self._in_use_keys()  # forget finished jobs
         job_keys = self._job_keys.setdefault(reservation.inference_id, (reservation, set()))[1]
         loaded = await self._ensure_resident(
             model_id,
