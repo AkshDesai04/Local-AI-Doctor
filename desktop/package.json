@@ -1,6 +1,6 @@
 {
   "name": "local-ai-doctor-desktop",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "private": true,
   "description": "Windows desktop distribution for Local AI Doctor",
   "main": "main.cjs",
