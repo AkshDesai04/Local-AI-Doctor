@@ -67,12 +67,14 @@ function Registry({ residents = [], onLoad = vi.fn(), onUnloadResident = vi.fn()
       connected
       loadOptionsFor={(id) => options[id] ?? defaults}
       maxLoadedModels={4}
+      memory={null}
       models={[gpuModel, cpuOnlyModel]}
       onLoad={onLoad}
       onLoadOptionsChange={(id, value) => setOptions((current) => ({ ...current, [id]: value }))}
       onRefresh={vi.fn()}
       onSelectModel={vi.fn()}
       onSynchronize={vi.fn()}
+      onUnloadAll={vi.fn()}
       onUnloadResident={onUnloadResident}
       residents={residents}
     />

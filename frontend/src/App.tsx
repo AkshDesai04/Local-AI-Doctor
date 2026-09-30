@@ -180,12 +180,14 @@ export default function App(): React.ReactNode {
                 connected={workbench.connected}
                 loadOptionsFor={workbench.loadOptionsFor}
                 maxLoadedModels={workbench.maxLoadedModels}
+                memory={workbench.memory}
                 models={workbench.models}
                 onLoad={(model, options) => void workbench.loadModel(model, options)}
                 onLoadOptionsChange={workbench.setLoadOptions}
                 onRefresh={() => void workbench.refreshModels()}
                 onSelectModel={workbench.setSelectedModelId}
                 onSynchronize={() => void workbench.synchronizeRuntimeState()}
+                onUnloadAll={() => void workbench.unloadAll()}
                 onUnloadResident={(resident) => void workbench.unloadResident(resident)}
                 residents={workbench.residents}
               />

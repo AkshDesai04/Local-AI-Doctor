@@ -166,6 +166,12 @@ export interface LedgerSegment {
   detail: string;
 }
 
+/** Categorical colour (1-7) shared by a resident's ledger segment and its registry row; null when it holds no GPU memory. */
+export function residentColor(residents: readonly ResidentModel[], modelKey: string): number | null {
+  const index = residents.filter((resident) => (resident.gpuBytes ?? 0) > 0).findIndex((resident) => resident.modelKey === modelKey);
+  return index < 0 ? null : (index % 7) + 1;
+}
+
 /**
  * Splits device memory into resident weights, other use, PyTorch's reserved-but-free cache,
  * the load safety margin, and free memory. Null when the ledger has no totals.
@@ -180,12 +186,12 @@ export function ledgerSegments(memory: MemoryLedger, residents: readonly Residen
   const other = Math.max(0, total - free - residentBytes - reservedFree);
   const margin = Math.min(Math.max(0, memory.safetyMarginBytes ?? 0), Math.max(0, free));
   const segments: Array<Omit<LedgerSegment, "percent">> = [
-    ...onDevice.map((resident, index) => ({
+    ...onDevice.map((resident) => ({
       id: `resident-${resident.modelKey}`,
       kind: "resident" as const,
       label: residentName(resident, models),
       bytes: resident.gpuBytes ?? 0,
-      color: (index % 7) + 1,
+      color: residentColor(onDevice, resident.modelKey) ?? 1,
       detail: `${residentSummary(resident)}${resident.placement === "offload" ? " · offloaded" : ""}`,
     })),
     { id: "other", kind: "other", label: "Other GPU use", bytes: other, detail: "CUDA context, active runs, and other processes" },

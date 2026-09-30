@@ -16,23 +16,26 @@ import {
 } from "lucide-react";
 import { Fragment, useState } from "react";
 import { api } from "../api/client";
-import type { CapabilityKey, CapabilityState, LoadOptions, ModelInspection, ModelSummary, ResidentModel } from "../api/types";
+import type { CapabilityKey, CapabilityState, LoadOptions, MemoryLedger, ModelInspection, ModelSummary, ResidentModel } from "../api/types";
 import { capabilityKeys, capabilityLabel, capabilityOf } from "../domain/capabilities";
-import { residentsOf, residentSummary } from "../domain/residency";
+import { residentColor, residentsOf, residentSummary } from "../domain/residency";
 import { formatBytes, formatNumber, shortFingerprint } from "../utils/format";
 import { LoadOptionsFields } from "./LoadOptionsFields";
+import { MemoryLedgerCard } from "./MemoryLedger";
 import { ModelRootSettings } from "./ModelRootSettings";
 import { Badge, type BadgeTone, Button, Callout, Card, EmptyState, IconButton, Stat } from "./ui";
 
 interface ModelRegistryProps {
   models: ModelSummary[];
   residents: ResidentModel[];
+  memory: MemoryLedger | null;
   maxLoadedModels: number | null;
   connected: boolean;
   loadOptionsFor: (modelId: string) => LoadOptions;
   onLoadOptionsChange: (modelId: string, options: LoadOptions) => void;
   onLoad: (model: ModelSummary, options: LoadOptions) => void;
   onUnloadResident: (resident: ResidentModel) => void;
+  onUnloadAll: () => void;
   onRefresh: () => void;
   onSynchronize: () => void;
   onSelectModel: (id: string) => void;
@@ -86,7 +89,7 @@ function contextSummary(model: ModelSummary): { text: string; conflict: boolean 
 
 const placementLabels: Record<NonNullable<ResidentModel["placement"]>, string | null> = { gpu: "GPU", cpu: "CPU", offload: null };
 
-function ResidentRow({ model, resident, busy, onUnload }: { model: ModelSummary; resident: ResidentModel; busy: boolean; onUnload: (resident: ResidentModel) => void }): React.ReactNode {
+function ResidentRow({ model, resident, color, busy, onUnload }: { model: ModelSummary; resident: ResidentModel; color: number | null; busy: boolean; onUnload: (resident: ResidentModel) => void }): React.ReactNode {
   const summary = [residentSummary(resident), resident.placement ? placementLabels[resident.placement] : null].filter(Boolean).join(" · ");
   const usage: Array<[string, string]> = [
     ...(resident.gpuBytes !== null ? [["GPU", formatBytes(resident.gpuBytes)] as [string, string]] : []),
@@ -97,6 +100,7 @@ function ResidentRow({ model, resident, busy, onUnload }: { model: ModelSummary;
   return (
     <li className="resident-row">
       <div className="resident-badges">
+        {color !== null && <i aria-hidden="true" className="resident-swatch" style={{ "--swatch": `var(--viz-${String(color)})` } as React.CSSProperties} title="Colour of this copy in the GPU memory bar" />}
         <Badge tone="accent">{summary}</Badge>
         {resident.placement === "offload" && <Badge icon={<AlertTriangle aria-hidden="true" size={11} />} title="Layers that did not fit in VRAM run from system RAM, which is much slower." tone="warning">Offloaded to system RAM</Badge>}
         {resident.strictVram && resident.placement === "gpu" && <Badge title="Loaded with Strict VRAM: this copy never spills into system RAM.">Strict VRAM</Badge>}
@@ -120,6 +124,7 @@ function ResidentRow({ model, resident, busy, onUnload }: { model: ModelSummary;
 interface ModelCardProps {
   model: ModelSummary;
   residents: ResidentModel[];
+  colorOf: (modelKey: string) => number | null;
   connected: boolean;
   loadOptions: LoadOptions;
   onLoadOptionsChange: (modelId: string, options: LoadOptions) => void;
@@ -128,7 +133,7 @@ interface ModelCardProps {
   onSelectModel: (id: string) => void;
 }
 
-function ModelCard({ model, residents, connected, loadOptions, onLoadOptionsChange, onLoad, onUnloadResident, onSelectModel }: ModelCardProps): React.ReactNode {
+function ModelCard({ model, residents, colorOf, connected, loadOptions, onLoadOptionsChange, onLoad, onUnloadResident, onSelectModel }: ModelCardProps): React.ReactNode {
   const [expanded, setExpanded] = useState(false);
   const [inspection, setInspection] = useState<ModelInspection | null>(null);
   const [inspectionOpen, setInspectionOpen] = useState(false);
@@ -195,7 +200,7 @@ function ModelCard({ model, residents, connected, loadOptions, onLoadOptionsChan
       )}
       {residents.length > 0 && (
         <ul aria-label={`Resident copies of ${model.name}`} className="resident-list">
-          {residents.map((resident) => <ResidentRow busy={model.lifecycle === "unloading"} key={resident.modelKey} model={model} onUnload={onUnloadResident} resident={resident} />)}
+          {residents.map((resident) => <ResidentRow busy={model.lifecycle === "unloading"} color={colorOf(resident.modelKey)} key={resident.modelKey} model={model} onUnload={onUnloadResident} resident={resident} />)}
         </ul>
       )}
       {expanded && (
@@ -285,13 +290,14 @@ function CapabilityMatrix({ models }: { models: ModelSummary[] }): React.ReactNo
   );
 }
 
-export function ModelRegistry({ models, residents, maxLoadedModels, connected, loadOptionsFor, onLoadOptionsChange, onLoad, onUnloadResident, onRefresh, onSynchronize, onSelectModel }: ModelRegistryProps): React.ReactNode {
+export function ModelRegistry({ models, residents, memory, maxLoadedModels, connected, loadOptionsFor, onLoadOptionsChange, onLoad, onUnloadResident, onUnloadAll, onRefresh, onSynchronize, onSelectModel }: ModelRegistryProps): React.ReactNode {
   return (
     <main className="workspace model-registry">
       <header className="page-header">
         <div><h1>Model registry</h1><p>Read-only discovery. Capabilities are adapter claims with reasons—not guesses based on architecture names.</p></div>
         <Button disabled={!connected} icon={<RefreshCw size={14} />} onClick={onRefresh}>Rescan roots</Button>
       </header>
+      {connected && <MemoryLedgerCard connected={connected} maxLoadedModels={maxLoadedModels} memory={memory} models={models} onUnloadAll={onUnloadAll} residents={residents} />}
       <ModelRootSettings connected={connected} modelLoaded={residents.length > 0} onRefresh={onSynchronize} />
       {!models.length ? (
         <EmptyState description={connected ? "Check the effective configuration for a readable model root, then rescan. Model roots are never modified." : "Start the local backend before scanning configured roots."} icon={Database} title={connected ? "No model folders discovered" : "Backend offline"} />
@@ -307,6 +313,7 @@ export function ModelRegistry({ models, residents, maxLoadedModels, connected, l
             <div className="model-list">
               {models.map((model) => (
                 <ModelCard
+                  colorOf={(key) => residentColor(residents, key)}
                   connected={connected}
                   key={model.id}
                   loadOptions={loadOptionsFor(model.id)}
