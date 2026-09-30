@@ -9,14 +9,33 @@ import type {
   GenerateRequest,
   GenerationSettings,
   HealthStatus,
+  LoadOptions,
+  MemoryLedger,
   Message,
   ModelSummary,
+  ResidentModel,
+  ResidentStatus,
   RunDetails,
   RunMetrics,
   RunStreamEvent,
   TokenAlternative,
+  UnloadResult,
 } from "../api/types";
 import { isUsable } from "../domain/capabilities";
+import {
+  defaultLoadOptions,
+  evictionNotice,
+  type ModelTransition,
+  mostRecent,
+  readStoredLoadOptions,
+  residentName,
+  residentPlacement,
+  residentsFrom,
+  residentsOf,
+  storeLoadOptions,
+  unloadNotice,
+  withResidency,
+} from "../domain/residency";
 import { cleanAssistantOutput } from "../utils/markdown";
 
 export const defaultGenerationSettings: GenerationSettings = {
@@ -86,11 +105,10 @@ function readableError(error: unknown): string {
   return "Something went wrong.";
 }
 
-function reflectLoadedModel(models: ModelSummary[], health: HealthStatus | null): ModelSummary[] {
-  if (!health?.loadedModelId) return models;
-  return models.map((model) => model.id === health.loadedModelId
-    ? { ...model, lifecycle: "loaded", loadedDevice: health.loadedDevice ?? model.loadedDevice }
-    : { ...model, lifecycle: "unloaded", loadedDevice: null });
+/** Keeps a still-discovered selection, otherwise prefers the most recently used resident. */
+function pickModelId(current: string, discovered: ModelSummary[], health: HealthStatus | null): string {
+  if (discovered.some((model) => model.id === current)) return current;
+  return discovered.find((model) => model.id === health?.loadedModelId)?.id ?? discovered[0]?.id ?? "";
 }
 
 function mergeMetrics(current: RunMetrics | undefined, update: Partial<RunMetrics>): RunMetrics {
@@ -256,6 +274,10 @@ export interface WorkbenchState {
   connected: boolean;
   booting: boolean;
   models: ModelSummary[];
+  /** Every resident model copy; empty when nothing is loaded or residency is unknown. */
+  residents: ResidentModel[];
+  memory: MemoryLedger | null;
+  maxLoadedModels: number | null;
   chats: ChatSummary[];
   archivedChats: ChatSummary[];
   activeChatId: string | null;
@@ -287,6 +309,12 @@ export interface WorkbenchState {
   refreshModels: () => Promise<void>;
   synchronizeRuntimeState: () => Promise<void>;
   toggleModelLoaded: (model: ModelSummary) => Promise<void>;
+  loadOptionsFor: (modelId: string) => LoadOptions;
+  setLoadOptions: (modelId: string, options: LoadOptions) => void;
+  loadModel: (model: ModelSummary, options?: LoadOptions) => Promise<void>;
+  unloadModel: (model: ModelSummary) => Promise<void>;
+  unloadResident: (resident: ResidentModel) => Promise<void>;
+  unloadAll: () => Promise<void>;
   submit: (content: string, parentMessageId?: string | null) => Promise<void>;
   stop: () => Promise<void>;
   inspectRun: (id: string) => Promise<void>;
@@ -302,7 +330,10 @@ export function useWorkbench(): WorkbenchState {
   const [configuration, setConfiguration] = useState<ConfigurationSnapshot | null>(null);
   const [connected, setConnected] = useState(false);
   const [booting, setBooting] = useState(true);
-  const [models, setModels] = useState<ModelSummary[]>([]);
+  const [discoveredModels, setDiscoveredModels] = useState<ModelSummary[]>([]);
+  const [residentStatus, setResidentStatus] = useState<ResidentStatus | null>(null);
+  const [transitions, setTransitions] = useState<Record<string, ModelTransition>>({});
+  const [storedLoadOptions, setStoredLoadOptions] = useState(readStoredLoadOptions);
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [archivedChats, setArchivedChats] = useState<ChatSummary[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
@@ -331,6 +362,27 @@ export function useWorkbench(): WorkbenchState {
   const systemPromptTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const systemPromptPending = useRef<{ chatId: string; value: string } | null>(null);
   const systemPromptSave = useRef<Promise<void>>(Promise.resolve());
+
+  const knownResidents = useMemo(() => residentsFrom(health, residentStatus), [health, residentStatus]);
+  const models = useMemo(
+    () => discoveredModels.map((model) => withResidency(model, knownResidents, transitions[model.id])),
+    [discoveredModels, knownResidents, transitions],
+  );
+  const residents = useMemo(() => knownResidents ?? [], [knownResidents]);
+  // A backend that lists resident keys also accepts per-load placement fields such as strictVram.
+  const residencySupported = health?.loadedModels !== undefined;
+  const loadDefaults = useMemo(() => defaultLoadOptions(configuration), [configuration]);
+  const loadOptionsFor = useCallback(
+    (modelId: string): LoadOptions => ({ ...loadDefaults, ...storedLoadOptions[modelId] }),
+    [loadDefaults, storedLoadOptions],
+  );
+  const configuredMaxLoaded = asRecord(configuration?.effective.runtime).max_loaded_models;
+  const maxLoadedModels = residentStatus?.maxLoadedModels ?? (typeof configuredMaxLoaded === "number" ? configuredMaxLoaded : null);
+  // Callbacks read the latest resident set through a ref so eviction notices can name what was unloaded.
+  const runtimeRef = useRef({ residents, models });
+  useEffect(() => {
+    runtimeRef.current = { residents, models };
+  }, [models, residents]);
 
   const selectedModel = useMemo(
     () => models.find((model) => model.id === selectedModelId) ?? (selectedModelId ? null : models[0] ?? null),
@@ -384,23 +436,24 @@ export function useWorkbench(): WorkbenchState {
     let alive = true;
     const bootstrap = async (): Promise<void> => {
       setBooting(true);
-      const [healthResult, modelsResult, chatsResult, archivedResult, configurationResult] = await Promise.allSettled([
+      const [healthResult, modelsResult, chatsResult, archivedResult, configurationResult, residentResult] = await Promise.allSettled([
         api.health(),
         api.models(),
         api.chats(false),
         api.chats(true),
         api.configuration(),
+        api.residentStatus(),
       ]);
       if (!alive) return;
       if (healthResult.status === "fulfilled") {
         setHealth(healthResult.value);
         setConnected(healthResult.value.status !== "error");
       }
+      setResidentStatus(residentResult.status === "fulfilled" ? residentResult.value : null);
       if (modelsResult.status === "fulfilled") {
         const backendHealth = healthResult.status === "fulfilled" ? healthResult.value : null;
-        const discovered = reflectLoadedModel(modelsResult.value, backendHealth);
-        setModels(discovered);
-        setSelectedModelId((current) => current || discovered.find((model) => model.lifecycle === "loaded")?.id || discovered[0]?.id || "");
+        setDiscoveredModels(modelsResult.value);
+        setSelectedModelId((current) => pickModelId(current, modelsResult.value, backendHealth));
       }
       if (chatsResult.status === "fulfilled") {
         setChats(chatsResult.value);
@@ -582,56 +635,133 @@ export function useWorkbench(): WorkbenchState {
     }
   }, []);
 
+  /** The resident endpoint is optional: an older backend or a transient failure falls back to health. */
+  const fetchResidentStatus = useCallback((): Promise<ResidentStatus | null> => api.residentStatus().catch(() => null), []);
+
+  const refreshResidents = useCallback(async (): Promise<void> => {
+    const [backendHealth, status] = await Promise.all([api.health().catch(() => null), fetchResidentStatus()]);
+    if (backendHealth) {
+      setHealth(backendHealth);
+      setConnected(backendHealth.status !== "error");
+    }
+    setResidentStatus(status);
+  }, [fetchResidentStatus]);
+
   const synchronizeRuntimeState = useCallback(async (): Promise<void> => {
+    const status = fetchResidentStatus();
     try {
       const [discovered, backendHealth] = await Promise.all([api.models(), api.health()]);
-      const synchronized = reflectLoadedModel(discovered, backendHealth);
       setHealth(backendHealth);
-      setModels(synchronized);
-      setSelectedModelId((current) => synchronized.some((model) => model.id === current)
-        ? current
-        : synchronized.find((model) => model.lifecycle === "loaded")?.id || synchronized[0]?.id || "");
+      setResidentStatus(await status);
+      setDiscoveredModels(discovered);
+      setSelectedModelId((current) => pickModelId(current, discovered, backendHealth));
       setConnected(backendHealth.status !== "error");
     } catch {
       // Preserve the completed inference and the last coherent runtime snapshot
       // when the follow-up GETs are temporarily unavailable.
     }
-  }, []);
+  }, [fetchResidentStatus]);
 
   const refreshModels = useCallback(async (): Promise<void> => {
     setNotice("Scanning configured model roots…");
+    const status = fetchResidentStatus();
     try {
       const [scanned, backendHealth] = await Promise.all([api.refreshModels(), api.health()]);
-      const discovered = reflectLoadedModel(scanned, backendHealth);
       setHealth(backendHealth);
-      setModels(discovered);
-      setSelectedModelId((current) => discovered.some((model) => model.id === current)
-        ? current
-        : discovered.find((model) => model.lifecycle === "loaded")?.id || discovered[0]?.id || "");
-      setNotice(`Model scan complete: ${String(discovered.length)} found.`);
+      setResidentStatus(await status);
+      setDiscoveredModels(scanned);
+      setSelectedModelId((current) => pickModelId(current, scanned, backendHealth));
+      setNotice(`Model scan complete: ${String(scanned.length)} found.`);
       setConnected(true);
     } catch (cause) {
       setError(readableError(cause));
       setNotice(null);
     }
+  }, [fetchResidentStatus]);
+
+  const setTransition = useCallback((modelIds: string[], transition: ModelTransition | null, only?: ModelTransition): void => {
+    setTransitions((current) => {
+      const next = { ...current };
+      for (const id of modelIds) {
+        if (only && next[id] !== only) continue;
+        if (transition) next[id] = transition;
+        else delete next[id];
+      }
+      return next;
+    });
   }, []);
 
-  const toggleModelLoaded = useCallback(async (model: ModelSummary): Promise<void> => {
-    setModels((current) => current.map((item) => item.id === model.id ? { ...item, lifecycle: model.lifecycle === "loaded" ? "unloading" : "loading" } : item));
+  const setLoadOptions = useCallback((modelId: string, options: LoadOptions): void => {
+    setStoredLoadOptions((current) => ({ ...current, [modelId]: options }));
+  }, []);
+
+  useEffect(() => {
+    storeLoadOptions(storedLoadOptions);
+  }, [storedLoadOptions]);
+
+  const loadModel = useCallback(async (model: ModelSummary, options?: LoadOptions): Promise<void> => {
+    const placement = options ?? loadOptionsFor(model.id);
+    const before = runtimeRef.current;
+    setTransition([model.id], "loading");
     try {
-      const updated: ModelSummary = model.lifecycle === "loaded"
-        ? await api.unloadModel(model.id).then(() => ({ ...model, lifecycle: "unloaded", loadedDevice: null }))
-        : (await api.loadModel(model.id, { device: settings.device, dtype: settings.dtype, strictVram: true }, model)).model;
-      setModels((current) => current.map((item) => item.id === updated.id
-        ? updated
-        : updated.lifecycle === "loaded" ? { ...item, lifecycle: "unloaded", loadedDevice: null } : item));
+      const result = await api.loadModel(
+        model.id,
+        residencySupported ? placement : { device: placement.device, dtype: placement.dtype },
+        model,
+      );
+      await refreshResidents();
+      setTransition([model.id], null);
+      if (result.evictedModelKeys.length) setNotice(evictionNotice(result.evictedModelKeys, model.name, before.residents, before.models));
     } catch (cause) {
-      setModels((current) => current.map((item) => item.id === model.id ? { ...item, lifecycle: "error" } : item));
+      await refreshResidents();
+      setTransition([model.id], "error");
       setError(readableError(cause));
     }
-  }, [settings.device, settings.dtype]);
+  }, [loadOptionsFor, refreshResidents, residencySupported, setTransition]);
 
-  const handleStreamEvent = useCallback((event: RunStreamEvent, runId: string, assistantId: string, chatId: string): void => {
+  const runUnload = useCallback(async (modelIds: string[], subject: string, unload: () => Promise<UnloadResult>): Promise<void> => {
+    setTransition(modelIds, "unloading");
+    try {
+      const result = await unload();
+      await refreshResidents();
+      setNotice(unloadNotice(subject, result));
+    } catch (cause) {
+      await refreshResidents();
+      setError(readableError(cause));
+    } finally {
+      setTransition(modelIds, null);
+    }
+  }, [refreshResidents, setTransition]);
+
+  const unloadModel = useCallback(
+    (model: ModelSummary): Promise<void> => runUnload([model.id], model.name, () => api.unloadModel(model.id)),
+    [runUnload],
+  );
+
+  const unloadResident = useCallback((resident: ResidentModel): Promise<void> => runUnload(
+    [resident.modelId],
+    residentName(resident, runtimeRef.current.models),
+    () => residencySupported ? api.unloadResident(resident.modelKey) : api.unloadModel(resident.modelId),
+  ), [residencySupported, runUnload]);
+
+  const unloadAll = useCallback((): Promise<void> => runUnload(
+    [...new Set(runtimeRef.current.residents.map((resident) => resident.modelId))],
+    "every resident model",
+    () => api.unloadAll(),
+  ), [runUnload]);
+
+  const toggleModelLoaded = useCallback(
+    (model: ModelSummary): Promise<void> => model.lifecycle === "loaded" ? unloadModel(model) : loadModel(model),
+    [loadModel, unloadModel],
+  );
+
+  /** Reuses the model's most recent resident copy, otherwise its saved load options. */
+  const requestPlacement = useCallback((modelId: string): LoadOptions => {
+    const resident = mostRecent(residentsOf(runtimeRef.current.residents, modelId));
+    return resident ? residentPlacement(resident) : loadOptionsFor(modelId);
+  }, [loadOptionsFor]);
+
+  const handleStreamEvent = useCallback((event: RunStreamEvent, runId: string, assistantId: string, chatId: string, modelId: string): void => {
     const receipt = performance.now();
     const resolvedEvent: RunStreamEvent = event.type === "token" ? {
       ...event,
@@ -715,6 +845,17 @@ export function useWorkbench(): WorkbenchState {
       }
     });
 
+    if (resolvedEvent.type === "stage.changed" && resolvedEvent.detail === "model_loading" && !residentsOf(runtimeRef.current.residents, modelId).length) {
+      setTransition([modelId], "loading");
+    }
+    if (resolvedEvent.type === "stage.changed" && resolvedEvent.evictedModelKeys) {
+      const before = runtimeRef.current;
+      if (resolvedEvent.evictedModelKeys.length) {
+        const target = before.models.find((model) => model.id === modelId)?.name ?? modelId;
+        setNotice(evictionNotice(resolvedEvent.evictedModelKeys, target, before.residents, before.models));
+      }
+      void refreshResidents().then(() => setTransition([modelId], null, "loading"));
+    }
     if (resolvedEvent.type === "token") setMessages((current) => appendTokenContent(current, assistantId, resolvedEvent.token.displayText, resolvedEvent.token.replaceFrom));
     if (resolvedEvent.type === "completed" || resolvedEvent.type === "cancelled" || resolvedEvent.type === "error") {
       const status = resolvedEvent.type === "completed" ? "complete" : resolvedEvent.type === "cancelled" ? "cancelled" : "failed";
@@ -725,7 +866,7 @@ export function useWorkbench(): WorkbenchState {
       lastClientReceipt.current = null;
       streamVisibility.current.delete(runId);
       locallyCreatedChat.current = null;
-      void synchronizeRuntimeState();
+      void synchronizeRuntimeState().then(() => setTransition([modelId], null, "loading"));
       void api.run(runId).then((persistedRun) => {
         const restored = restoreClientTelemetry(persistedRun);
         setSelectedRun((current) => current?.id === runId
@@ -743,7 +884,7 @@ export function useWorkbench(): WorkbenchState {
         // The completed stream remains usable even if the persistence refresh is temporarily unavailable.
       });
     }
-  }, [synchronizeRuntimeState]);
+  }, [refreshResidents, setTransition, synchronizeRuntimeState]);
 
   const submit = useCallback(async (content: string, parentMessageId?: string | null): Promise<void> => {
     if (!content.trim() || !selectedModel || runningRunId || branchPending.current) return;
@@ -777,6 +918,7 @@ export function useWorkbench(): WorkbenchState {
         attachments,
       };
       setMessages((current) => [...current, userMessage]);
+      const placement = requestPlacement(selectedModel.id);
       const requestBody: GenerateRequest = {
         chatId: resolvedChatId,
         modelId: selectedModel.id,
@@ -785,6 +927,9 @@ export function useWorkbench(): WorkbenchState {
         settings: {
           ...settings,
           reasoning: isUsable(selectedModel, "reasoning_segments") ? settings.reasoning !== false : undefined,
+          device: placement.device,
+          dtype: placement.dtype,
+          strictVram: residencySupported ? placement.strictVram : undefined,
         },
         parentMessageId: resolvedParentMessageId,
       };
@@ -832,7 +977,7 @@ export function useWorkbench(): WorkbenchState {
       streamCleanup.current?.();
       streamCleanup.current = subscribeToRun(
         response.runId,
-        (event) => handleStreamEvent(event, response.runId, assistantId, resolvedChatId),
+        (event) => handleStreamEvent(event, response.runId, assistantId, resolvedChatId, run.modelId),
         setStreamConnected,
         response.websocketUrl,
       );
@@ -842,7 +987,7 @@ export function useWorkbench(): WorkbenchState {
       if (temporaryUserId) setMessages((current) => current.filter((message) => message.id !== temporaryUserId));
       setError(readableError(cause));
     }
-  }, [activeChatId, attachments, flushSystemPrompt, handleStreamEvent, messages, runningRunId, selectedModel, settings, systemPrompt]);
+  }, [activeChatId, attachments, flushSystemPrompt, handleStreamEvent, messages, requestPlacement, residencySupported, runningRunId, selectedModel, settings, systemPrompt]);
 
   const stop = useCallback(async (): Promise<void> => {
     if (!runningRunId) return;
@@ -938,7 +1083,7 @@ export function useWorkbench(): WorkbenchState {
       streamCleanup.current?.();
       streamCleanup.current = subscribeToRun(
         response.runId,
-        (event) => handleStreamEvent(event, response.runId, assistantId, chatId),
+        (event) => handleStreamEvent(event, response.runId, assistantId, chatId, run.modelId),
         setStreamConnected,
         response.websocketUrl,
       );
@@ -1036,7 +1181,7 @@ export function useWorkbench(): WorkbenchState {
       streamCleanup.current?.();
       streamCleanup.current = subscribeToRun(
         response.runId,
-        (event) => handleStreamEvent(event, response.runId, assistantId, chatId),
+        (event) => handleStreamEvent(event, response.runId, assistantId, chatId, run.modelId),
         setStreamConnected,
         response.websocketUrl,
       );
@@ -1054,6 +1199,9 @@ export function useWorkbench(): WorkbenchState {
     connected,
     booting,
     models,
+    residents,
+    memory: residentStatus?.memory ?? null,
+    maxLoadedModels,
     chats,
     archivedChats,
     activeChatId,
@@ -1085,6 +1233,12 @@ export function useWorkbench(): WorkbenchState {
     refreshModels,
     synchronizeRuntimeState,
     toggleModelLoaded,
+    loadOptionsFor,
+    setLoadOptions,
+    loadModel,
+    unloadModel,
+    unloadResident,
+    unloadAll,
     submit,
     stop,
     inspectRun,

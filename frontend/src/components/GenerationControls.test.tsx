@@ -2,10 +2,12 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { AUTH_SESSION_KEY } from "../api/auth";
-import type { ModelSummary } from "../api/types";
+import type { LoadOptions, ModelSummary } from "../api/types";
 import { SAMPLING_LIMITS } from "../domain/sampling";
 import { defaultGenerationSettings } from "../hooks/useWorkbench";
 import { GenerationControls } from "./GenerationControls";
+
+const loadOptions: LoadOptions = { device: "auto", dtype: "auto", strictVram: true };
 
 function modelWithCuda(state: "full" | "unavailable_on_backend", reason?: string): ModelSummary {
   return {
@@ -30,8 +32,10 @@ describe("runtime authentication settings", () => {
       <GenerationControls
         authRequired
         model={null}
+        loadOptions={loadOptions}
         onChange={vi.fn()}
         onClose={vi.fn()}
+        onLoadOptionsChange={vi.fn()}
         open
         settings={defaultGenerationSettings}
       />,
@@ -56,8 +60,10 @@ describe("runtime device settings", () => {
       <GenerationControls
         authRequired={false}
         model={modelWithCuda("unavailable_on_backend", "No usable CUDA runtime was discovered on this host.")}
+        loadOptions={loadOptions}
         onChange={vi.fn()}
         onClose={vi.fn()}
+        onLoadOptionsChange={vi.fn()}
         open
         settings={defaultGenerationSettings}
       />,
@@ -70,15 +76,18 @@ describe("runtime device settings", () => {
     expect(screen.getByText("CUDA unavailable")).toBeInTheDocument();
   });
 
-  it("keeps CUDA selectable when the backend reports full support", async () => {
+  it("keeps CUDA selectable when the backend reports full support and edits the model's load options", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
+    const onLoadOptionsChange = vi.fn();
     render(
       <GenerationControls
         authRequired={false}
+        loadOptions={loadOptions}
         model={modelWithCuda("full")}
         onChange={onChange}
         onClose={vi.fn()}
+        onLoadOptionsChange={onLoadOptionsChange}
         open
         settings={defaultGenerationSettings}
       />,
@@ -87,10 +96,13 @@ describe("runtime device settings", () => {
     const cudaOption = screen.getByRole("option", { name: "CUDA" });
     expect(cudaOption).toBeEnabled();
     await user.selectOptions(screen.getByRole("combobox", { name: "Device" }), "cuda");
+    await user.click(screen.getByRole("switch", { name: /Strict VRAM/ }));
 
-    expect(onChange).toHaveBeenCalledOnce();
-    const update = onChange.mock.calls[0]?.[0] as (current: typeof defaultGenerationSettings) => typeof defaultGenerationSettings;
-    expect(update(defaultGenerationSettings)).toMatchObject({ device: "cuda" });
+    expect(onChange).not.toHaveBeenCalled();
+    expect(onLoadOptionsChange.mock.calls).toEqual([
+      [{ ...loadOptions, device: "cuda" }],
+      [{ ...loadOptions, strictVram: false }],
+    ]);
   });
 });
 
@@ -100,8 +112,10 @@ describe("generation control sections", () => {
       <GenerationControls
         authRequired={false}
         model={modelWithCuda("full")}
+        loadOptions={loadOptions}
         onChange={vi.fn()}
         onClose={vi.fn()}
+        onLoadOptionsChange={vi.fn()}
         open
         settings={defaultGenerationSettings}
       />,

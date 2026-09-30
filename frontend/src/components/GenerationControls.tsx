@@ -1,8 +1,9 @@
 import { KeyRound, RotateCcw, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { AUTH_CHANGED_EVENT, clearSessionAuthToken, hasSessionAuthToken, saveSessionAuthToken } from "../api/auth";
-import type { GenerationSettings, ModelSummary } from "../api/types";
+import type { GenerationSettings, LoadOptions, ModelSummary } from "../api/types";
 import { SAMPLING_LIMITS } from "../domain/sampling";
+import { LoadOptionsFields } from "./LoadOptionsFields";
 import { Badge, Button, Callout, Drawer, Field, Input, NumberInput, Select, Switch, Textarea } from "./ui";
 
 interface GenerationControlsProps {
@@ -10,6 +11,9 @@ interface GenerationControlsProps {
   model: ModelSummary | null;
   settings: GenerationSettings;
   defaultSettings?: GenerationSettings;
+  /** The selected model's saved load options. */
+  loadOptions: LoadOptions;
+  onLoadOptionsChange: (options: LoadOptions) => void;
   authRequired: boolean;
   onChange: React.Dispatch<React.SetStateAction<GenerationSettings>>;
   onClose: () => void;
@@ -17,7 +21,7 @@ interface GenerationControlsProps {
 
 type NumericKey = keyof typeof SAMPLING_LIMITS;
 
-export function GenerationControls({ open, model, settings, defaultSettings, authRequired, onChange, onClose }: GenerationControlsProps): React.ReactNode {
+export function GenerationControls({ open, model, settings, defaultSettings, loadOptions, authRequired, onChange, onLoadOptionsChange, onClose }: GenerationControlsProps): React.ReactNode {
   const [tokenInput, setTokenInput] = useState("");
   const [hasToken, setHasToken] = useState(hasSessionAuthToken);
 
@@ -36,10 +40,7 @@ export function GenerationControls({ open, model, settings, defaultSettings, aut
     </Field>
   );
   const profiling = settings.instrumentation === "full" || settings.instrumentation === "expert";
-  const cudaCapability = model?.capabilities.cuda;
-  const cudaUnavailable = cudaCapability?.state === "unavailable_on_backend";
-  const cudaUnavailableReason = cudaCapability?.reason ?? "No usable CUDA runtime was discovered on this backend.";
-  const summary = `${model?.name ?? "No model"} · ${settings.device}/${settings.dtype} · ${settings.instrumentation} · ${settings.temperature === 0 ? "greedy" : `temp ${String(settings.temperature)}`}`;
+  const summary = `${model?.name ?? "No model"} · ${loadOptions.device}/${loadOptions.dtype} · ${settings.instrumentation} · ${settings.temperature === 0 ? "greedy" : `temp ${String(settings.temperature)}`}`;
 
   return (
     <Drawer
@@ -105,24 +106,10 @@ export function GenerationControls({ open, model, settings, defaultSettings, aut
       <section aria-labelledby="controls-model-loading" className="controls-section">
         <header className="controls-section-head">
           <h3 id="controls-model-loading">Model loading</h3>
-          <p>Used by Load and by the next response. Choosing a different device or data type reloads the model before it runs.</p>
+          <p>{model ? `Saved for ${model.name}. ` : ""}Used by Load and when a response has to load the model; a resident copy is reused as it is.</p>
         </header>
         <div className="form-grid">
-          <Field addon={cudaUnavailable ? <Badge tone="warning">CUDA unavailable</Badge> : undefined} hint={cudaUnavailable ? cudaUnavailableReason : undefined} label="Device">
-            <Select onChange={(event) => update("device", event.target.value as GenerationSettings["device"])} value={settings.device}>
-              <option value="auto">Auto</option>
-              <option value="cpu">CPU</option>
-              <option disabled={cudaUnavailable} value="cuda">{cudaUnavailable ? "CUDA (unavailable)" : "CUDA"}</option>
-            </Select>
-          </Field>
-          <Field label="Data type">
-            <Select onChange={(event) => update("dtype", event.target.value as GenerationSettings["dtype"])} value={settings.dtype}>
-              <option value="auto">Auto</option>
-              <option value="float32">FP32</option>
-              <option value="float16">FP16</option>
-              <option value="bfloat16">BF16</option>
-            </Select>
-          </Field>
+          <LoadOptionsFields disabled={!model} model={model} onChange={onLoadOptionsChange} value={loadOptions} />
         </div>
       </section>
 

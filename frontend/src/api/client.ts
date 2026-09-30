@@ -839,7 +839,8 @@ export const api = {
     const value = await request<unknown[] | { items?: unknown[]; models?: unknown[] }>("/models/refresh", { method: "POST" });
     return unwrapList(value).map((model) => normalizeModel(model));
   },
-  async loadModel(id: string, options: LoadOptions, current?: ModelSummary): Promise<LoadResult> {
+  /** `strictVram` is omitted for a backend that predates per-load placement, which rejects unknown fields. */
+  async loadModel(id: string, options: Omit<LoadOptions, "strictVram"> & Partial<Pick<LoadOptions, "strictVram">>, current?: ModelSummary): Promise<LoadResult> {
     const raw = asRecord(await request(`/models/${encodeURIComponent(id)}/load`, { method: "POST", body: JSON.stringify(options) }));
     return {
       model: normalizeModel(raw, current, "loaded"),

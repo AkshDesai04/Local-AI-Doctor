@@ -17,10 +17,15 @@ vi.mock("../api/client", async (importOriginal) => {
       createChat: vi.fn(),
       generate: vi.fn(),
       health: vi.fn(),
+      loadModel: vi.fn(),
       messages: vi.fn(),
       models: vi.fn(),
+      residentStatus: vi.fn(),
       run: vi.fn(),
       runEvents: vi.fn(),
+      unloadAll: vi.fn(),
+      unloadModel: vi.fn(),
+      unloadResident: vi.fn(),
       updateChat: vi.fn(),
     },
     subscribeToRun: vi.fn(),
@@ -83,6 +88,7 @@ describe("runtime lifecycle synchronization", () => {
       .mockResolvedValueOnce({ status: "ok" })
       .mockResolvedValue({ status: "ok", loadedModelId: model.id, loadedDevice: "cpu" });
     mockedApi.models.mockReset().mockResolvedValue([model]);
+    mockedApi.residentStatus.mockReset().mockResolvedValue(null);
     mockedApi.chats.mockReset().mockImplementation((archived = false) => Promise.resolve(archived ? [] : [chat]));
     mockedApi.configuration.mockReset().mockResolvedValue({ effective: {}, precedence: [] });
     mockedApi.messages.mockReset().mockResolvedValue([]);

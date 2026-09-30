@@ -70,6 +70,7 @@ export default function App(): React.ReactNode {
     return () => window.removeEventListener("keydown", handleShortcut);
   }, [connected, createChat]);
 
+  const selectedLoadOptions = workbench.loadOptionsFor(selectedModel?.id ?? "");
   const openInspector = (): void => setInspectorOpen(true);
   const inspectToken = (index: number): void => {
     setSelectedToken(index);
@@ -100,7 +101,7 @@ export default function App(): React.ReactNode {
           connected={workbench.connected}
           controlsOpen={controlsOpen}
           inspectorOpen={inspectorOpen}
-          loadOptions={workbench.settings}
+          loadOptions={selectedLoadOptions}
           models={workbench.models}
           nerdMode={nerdMode}
           onOpenRegistry={() => setView("models")}
@@ -204,9 +205,11 @@ export default function App(): React.ReactNode {
         <GenerationControls
           authRequired={authRequired}
           defaultSettings={workbench.defaultSettings}
+          loadOptions={selectedLoadOptions}
           model={workbench.selectedModel}
           onChange={workbench.setSettings}
           onClose={() => setControlsOpen(false)}
+          onLoadOptionsChange={(options) => { if (selectedModel) workbench.setLoadOptions(selectedModel.id, options); }}
           open={controlsOpen}
           settings={workbench.settings}
         />
