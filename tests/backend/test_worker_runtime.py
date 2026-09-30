@@ -1618,3 +1618,207 @@ def test_encoder_decoder_cancellation_preserves_consistent_terminal_event(
     assert events[-1]["event_type"] == "cancelled"
     assert events[-1]["payload"]["finish_reason"] == "cancelled"
     assert events[-1]["payload"]["generated_token_count"] == 0
+
+
+class CountingCausalModel:
+    """Greedy fixture emitting token 2 until its last call, which emits EOS (3)."""
+
+    def __init__(self, tokens: int, *, fail_on_call: int | None = None) -> None:
+        self.config = SimpleNamespace(is_encoder_decoder=False, eos_token_id=3)
+        self.generation_config = SimpleNamespace(eos_token_id=3)
+        self.tokens = tokens
+        self.fail_on_call = fail_on_call
+        self.calls = 0
+
+    def __call__(self, **_kwargs: Any) -> Any:
+        self.calls += 1
+        if self.calls == self.fail_on_call:
+            raise RuntimeError("fixture forward failure")
+        values = np.full((1, 1, 5), -10.0, dtype=np.float32)
+        values[0, 0, 3 if self.calls >= self.tokens else 2] = 10.0
+        return SimpleNamespace(logits=FakeTensor(values), past_key_values=f"cache-{self.calls}")
+
+
+class ScriptedCommands:
+    """Hands the worker its commands, then shutdown once it blocks while idle."""
+
+    def __init__(self, commands: list[dict[str, Any]]) -> None:
+        self.commands = commands
+
+    def get(self) -> dict[str, Any]:
+        return self.commands.pop(0) if self.commands else {"op": "shutdown", "request_id": "end"}
+
+    def get_nowait(self) -> dict[str, Any]:
+        import queue
+
+        if not self.commands:
+            raise queue.Empty
+        return self.commands.pop(0)
+
+
+def _two_resident_runtime(
+    commands: list[dict[str, Any]], model_a: Any, model_b: Any
+) -> tuple[WorkerRuntime, FakeQueue]:
+    from local_ai_doctor.workers.runtime import ResidentModel
+
+    output = FakeQueue()
+    runtime = WorkerRuntime(
+        cast(Any, ScriptedCommands(commands)), cast(Any, output), FakeCancelEvent()
+    )
+    runtime.max_concurrent_runs = 2
+    for key, model in (("a", model_a), ("b", model_b)):
+        runtime.residents[key] = ResidentModel(
+            key=key,
+            model=model,
+            tokenizer=FakeTokenizer(),
+            model_info={
+                "id": f"model-{key}",
+                "display_name": f"Fixture {key}",
+                "task": "text_generation",
+                "effective_context_limit": 32,
+            },
+        )
+    return runtime, output
+
+
+def _keyed_command(run: str, key: str, tokens: int = 8) -> dict[str, Any]:
+    command = generation_command()
+    command.update(op="generate", run_id=run, request_id=f"request-{run}", model_key=key)
+    command["sampling"]["max_output_tokens"] = tokens
+    return command
+
+
+def _run_events(output: FakeQueue) -> list[tuple[str, str]]:
+    return [
+        (item["run_id"], item["event_type"])
+        for item in output.items
+        if item["kind"] == "run_event" and item["event_type"] in {"token", "completed", "cancelled"}
+    ]
+
+
+def test_two_residents_interleave_round_robin_and_both_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, output = _two_resident_runtime(
+        [_keyed_command("run-a", "a"), _keyed_command("run-b", "b")],
+        CountingCausalModel(3),
+        CountingCausalModel(3),
+    )
+
+    runtime.run()
+
+    assert _run_events(output) == [
+        ("run-a", "token"),
+        ("run-a", "token"),
+        ("run-b", "token"),
+        ("run-a", "token"),
+        ("run-a", "completed"),
+        ("run-b", "token"),
+        ("run-b", "token"),
+        ("run-b", "completed"),
+    ]
+    completed = [item["payload"] for item in output.items if item.get("event_type") == "completed"]
+    assert [item["scheduling"] for item in completed] == [
+        {"concurrent_sessions_max": 2, "interleaved": True}
+    ] * 2
+    assert all(item["text"] == "hellohello</s>" for item in completed)
+    stages = [item["payload"] for item in output.items if item.get("event_type") == "stage"]
+    assert [item["model_key"] for item in stages] == ["a", "b"]
+    replies = [item for item in output.items if item["kind"] == "reply"]
+    assert [(item["request_id"], item["ok"]) for item in replies] == [
+        ("request-run-a", True),
+        ("request-run-b", True),
+        ("end", True),
+    ]
+    assert runtime.sessions == []
+
+
+def test_per_run_cancel_stops_only_that_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, output = _two_resident_runtime(
+        [
+            _keyed_command("run-a", "a"),
+            _keyed_command("run-b", "b"),
+            {"op": "cancel", "run_id": "run-b"},
+            {"op": "cancel", "run_id": "unknown-run"},
+        ],
+        CountingCausalModel(6),
+        CountingCausalModel(6),
+    )
+
+    runtime.run()
+
+    terminal = {
+        run: event for run, event in _run_events(output) if event in {"completed", "cancelled"}
+    }
+    assert terminal == {"run-a": "completed", "run-b": "cancelled"}
+    assert [run for run, event in _run_events(output) if event == "token"].count("run-a") == 6
+
+
+def test_shared_cancel_event_stops_every_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, output = _two_resident_runtime([], CountingCausalModel(6), CountingCausalModel(6))
+    runtime._handle(_keyed_command("run-a", "a"))
+    runtime._handle(_keyed_command("run-b", "b"))
+    assert len(runtime.sessions) == 2
+
+    runtime.cancel_event.cancelled = True
+    runtime._step_round()
+
+    assert runtime.sessions == []
+    assert [event for _run, event in _run_events(output) if event != "token"] == [
+        "cancelled",
+        "cancelled",
+    ]
+
+
+def test_a_failing_session_reports_once_while_the_other_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, output = _two_resident_runtime(
+        [_keyed_command("run-a", "a"), _keyed_command("run-b", "b")],
+        CountingCausalModel(4),
+        CountingCausalModel(4, fail_on_call=3),
+    )
+
+    runtime.run()
+
+    errors = [item for item in output.items if item.get("event_type") == "error"]
+    assert [item["run_id"] for item in errors] == ["run-b"]
+    assert errors[0]["payload"]["code"] == "model_worker_error"
+    failed = [item for item in output.items if item["kind"] == "reply" and not item["ok"]]
+    assert [item["request_id"] for item in failed] == ["request-run-b"]
+    assert sum(item["kind"] == "diagnostic" for item in output.items) == 1
+    terminal = [event for run, event in _run_events(output) if run == "run-a"]
+    assert terminal[-1] == "completed"
+    assert terminal.count("token") == 4
+
+
+def test_sessions_beyond_the_concurrency_limit_are_refused_as_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, output = _two_resident_runtime([], CountingCausalModel(6), CountingCausalModel(6))
+    runtime.max_concurrent_runs = 1
+    runtime._handle(_keyed_command("run-a", "a"))
+    runtime._handle(_keyed_command("run-b", "b"))
+
+    assert [session.run_id for session in runtime.sessions] == ["run-a"]
+    error = next(item for item in output.items if item.get("event_type") == "error")
+    assert (error["run_id"], error["payload"]["code"]) == ("run-b", "worker_busy")
+
+
+def test_unknown_model_key_is_reported_as_not_resident(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    runtime, output = _two_resident_runtime([], CountingCausalModel(2), CountingCausalModel(2))
+
+    runtime._handle(_keyed_command("run-z", "missing"))
+
+    error = next(item for item in output.items if item.get("event_type") == "error")
+    assert error["payload"] == {
+        "code": "model_not_resident",
+        "message": "the requested model is not resident in the worker",
+        "hint": "Load the model before running it.",
+    }

@@ -7,6 +7,7 @@ import gc
 import json
 import math
 import os
+import queue
 import signal
 import time
 import traceback
@@ -740,6 +741,7 @@ class WorkerRuntime:
         self.residents: dict[str, ResidentModel] = {}
         self._active: ResidentModel | None = None
         self.sessions: list[GenerationSession] = []
+        self.max_concurrent_runs = 1
         self._deterministic_state: bool | None = None
         self._vram_cap_fraction = 1.0
 
@@ -766,52 +768,154 @@ class WorkerRuntime:
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
         _send(self.output, "ready")
         while True:
-            command = self.commands.get()
-            operation = command.get("op")
-            request_id = str(command.get("request_id", ""))
+            # Block only while idle; running sessions poll so a cancel or a second
+            # generation reaches the worker between decode steps.
+            command = self._next_command(block=not self.sessions)
+            if command is not None and self._handle(command):
+                return
+            if self.sessions:
+                self._step_round()
+
+    def _next_command(self, *, block: bool) -> dict[str, Any] | None:
+        if block:
+            return dict(self.commands.get())
+        try:
+            return dict(self.commands.get_nowait())
+        except queue.Empty:
+            return None
+
+    def _handle(self, command: Mapping[str, Any]) -> bool:
+        """Run one command; True once the worker should exit."""
+
+        operation = command.get("op")
+        request_id = str(command.get("request_id", ""))
+        try:
+            if operation == "shutdown":
+                self._end_sessions(self.sessions)
+                self._unload()
+                _send(self.output, "reply", request_id=request_id, ok=True, payload={})
+                return True
+            if operation == "cancel":
+                # Fire and forget: an unknown run already finished or never started.
+                for session in self.sessions:
+                    if session.run_id == str(command.get("run_id")):
+                        session.cancel_requested = True
+                return False
+            if operation == "generate":
+                self._start_session(command)
+                return False
+            if operation == "load":
+                payload = self._load(command)
+            elif operation == "unload":
+                payload = self._unload()
+            elif operation == "embed":
+                payload = self._embed(command)
+            elif operation == "score_prompt":
+                payload = self._score_prompt(command)
+            else:
+                raise ValueError(f"unknown worker operation: {operation!r}")
+            _send(self.output, "reply", request_id=request_id, ok=True, payload=payload)
+        except BaseException as exc:  # worker boundary must report model/runtime crashes
+            run_id = command.get("run_id")
+            self._report_failure(str(run_id) if run_id else None, request_id, exc)
+        return False
+
+    def _report_failure(self, run_id: str | None, request_id: str, exc: BaseException) -> None:
+        # A full-instrumentation run may temporarily select eager
+        # attention so Transformers can return attention probabilities.
+        # Never let a failed request silently change later run kernels.
+        self._restore_attention_implementation()
+        error = _safe_error(exc)
+        if run_id:
+            _send(self.output, "run_event", run_id=run_id, event_type="error", payload=error)
+        _send(self.output, "reply", request_id=request_id, ok=False, error=error)
+        # The traceback stays inside the isolated process and is bounded.
+        _send(
+            self.output,
+            "diagnostic",
+            request_id=request_id,
+            payload={"traceback": "".join(traceback.format_exception(exc))[-8000:]},
+        )
+
+    def _start_session(self, command: Mapping[str, Any]) -> None:
+        """Prefill and emit the first token at once, so every session gets a clean TTFT."""
+
+        if len(self.sessions) >= self.max_concurrent_runs:
+            raise WorkerReportedError(
+                {
+                    "code": "worker_busy",
+                    "message": "the worker is already running its maximum concurrent generations",
+                    "hint": "Wait for a running generation or raise runtime.max_concurrent_runs.",
+                    "max_concurrent_runs": self.max_concurrent_runs,
+                }
+            )
+        session = GenerationSession(self, command)
+        session.prefill()
+        if session.step():
+            self.sessions.append(session)
+        else:
+            self._restore_attention_implementation()
+
+    def _activate(self, session: GenerationSession) -> None:
+        """Restore the process-wide state one session expects before it steps."""
+
+        self._active = session.resident
+        mode = session.deterministic_reference_mode
+        if self._deterministic_state != mode:
+            session.torch.use_deterministic_algorithms(mode, warn_only=mode)
+            self._deterministic_state = mode
+        wanted = session.attention_implementation
+        config = getattr(self.model, "config", None)
+        if wanted is not None and getattr(config, "_attn_implementation", None) != wanted:
+            self._select_attention_implementation(wanted)
+        owner = _rope_state_owner(self.model)
+        if owner is not None:
+            owner.rope_deltas = session.rope_deltas
+
+    def _step_round(self) -> None:
+        # ponytail: round-robin one step per session; a long prefill blocks the other
+        # session; chunked prefill if it matters
+        running = len(self.sessions)
+        for session in list(self.sessions):
+            session.concurrent_sessions_max = max(session.concurrent_sessions_max, running)
             try:
-                if operation == "shutdown":
-                    self._unload()
-                    _send(self.output, "reply", request_id=request_id, ok=True, payload={})
-                    return
-                if operation == "load":
-                    payload = self._load(command)
-                    _send(self.output, "reply", request_id=request_id, ok=True, payload=payload)
-                elif operation == "unload":
-                    payload = self._unload()
-                    _send(self.output, "reply", request_id=request_id, ok=True, payload=payload)
-                elif operation == "generate":
-                    self._generate(command)
-                elif operation == "embed":
-                    payload = self._embed(command)
-                    _send(self.output, "reply", request_id=request_id, ok=True, payload=payload)
-                elif operation == "score_prompt":
-                    payload = self._score_prompt(command)
-                    _send(self.output, "reply", request_id=request_id, ok=True, payload=payload)
-                else:
-                    raise ValueError(f"unknown worker operation: {operation!r}")
-            except BaseException as exc:  # worker boundary must report model/runtime crashes
-                # A full-instrumentation run may temporarily select eager
-                # attention so Transformers can return attention probabilities.
-                # Never let a failed request silently change later run kernels.
+                self._activate(session)
+                alive = session.step()
+            except BaseException as exc:  # one failing session must not stop the others
+                alive = False
+                session.finished = True
+                session._release_tensors()
+                self._report_failure(session.run_id, session.request_id, exc)
+            else:
+                if not alive:
+                    self._restore_attention_implementation()
+            if not alive:
+                self.sessions.remove(session)
+        if not self.sessions:
+            self._empty_cache()
+
+    def _end_sessions(self, sessions: Sequence[GenerationSession]) -> None:
+        """Cancel sessions now; each still emits its terminal event and reply."""
+
+        for session in list(sessions):
+            session.cancel_requested = True
+            try:
+                self._activate(session)
+                session.step()
                 self._restore_attention_implementation()
-                error = _safe_error(exc)
-                if command.get("run_id"):
-                    _send(
-                        self.output,
-                        "run_event",
-                        run_id=command["run_id"],
-                        event_type="error",
-                        payload=error,
-                    )
-                _send(self.output, "reply", request_id=request_id, ok=False, error=error)
-                # The traceback stays inside the isolated process and is bounded.
-                _send(
-                    self.output,
-                    "diagnostic",
-                    request_id=request_id,
-                    payload={"traceback": "".join(traceback.format_exception(exc))[-8000:]},
-                )
+            except BaseException as exc:
+                session._release_tensors()
+                self._report_failure(session.run_id, session.request_id, exc)
+            if session in self.sessions:
+                self.sessions.remove(session)
+
+    @staticmethod
+    def _empty_cache() -> None:
+        import torch
+
+        if torch.cuda.is_available():
+            with contextlib.suppress(RuntimeError):
+                torch.cuda.empty_cache()
 
     def _load(self, command: Mapping[str, Any]) -> dict[str, Any]:
         self._unload()
@@ -825,6 +929,7 @@ class WorkerRuntime:
                 f"configured model directory {model_path.name!r} is unavailable"
             )
         key = str(command.get("model_key") or "default")
+        self.max_concurrent_runs = max(1, int(runtime.get("max_concurrent_runs", 1)))
         self._active = self.residents[key] = ResidentModel(key=key)
         self.device = str(runtime.get("device", "cpu"))
         self.dtype = str(runtime.get("dtype", "float32"))
