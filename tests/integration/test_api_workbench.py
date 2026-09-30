@@ -36,6 +36,7 @@ def test_health_configuration_redaction_and_model_scan(
         "database": "ready",
         "worker": "ready",
         "loaded_model": None,
+        "loaded_models": [],
         "protocol_version": 1,
     }
     assert health.headers["x-content-type-options"] == "nosniff"
@@ -249,6 +250,7 @@ def test_health_degrades_after_worker_exit_and_next_operation_restarts_it(
         "database": "ready",
         "worker": "unavailable",
         "loaded_model": None,
+        "loaded_models": [],
         "protocol_version": 1,
     }
 
@@ -737,7 +739,7 @@ def test_resource_and_conflict_errors_use_the_error_envelope(
         OrderedDict(k={"model_key": "k", "model_id": "some-other-model"}),
     )
     other = api_client.post(f"/api/v1/models/{model_id}/unload", headers=API_HEADERS)
-    error_of(other, 409, "model_not_loaded")
+    error_of(other, 409, "model_not_resident")
 
 
 def test_unknown_browser_settings_key_is_a_422_invalid_request(api_client: TestClient) -> None:

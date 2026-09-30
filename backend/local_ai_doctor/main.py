@@ -63,7 +63,6 @@ from .errors import (
     ConfigurationError,
     ConfirmationRequiredError,
     InvalidRequestError,
-    ModelNotLoadedError,
     NotFoundError,
     PayloadTooLargeError,
     RunNotCancellableError,
@@ -625,6 +624,21 @@ def create_app(
             "database": "ready",
             "worker": "ready" if worker_ready else "unavailable",
             "loaded_model": services.worker.loaded,
+            "loaded_models": [
+                {
+                    field: entry.get(field)
+                    for field in (
+                        "model_key",
+                        "model_id",
+                        "device",
+                        "dtype",
+                        "quantization",
+                        "placement",
+                        "strict_vram",
+                    )
+                }
+                for entry in services.worker.resident
+            ],
             "protocol_version": 1,
         }
         if not worker_ready:
@@ -719,8 +733,20 @@ def create_app(
     ) -> dict[str, Any]:
         body = body or ModelLoadRequest()
         return await _services(request).registry.load(
-            model_id, device=body.device, dtype=body.dtype
+            model_id,
+            device=body.device,
+            dtype=body.dtype,
+            quantization=body.quantization,
+            strict_vram=body.strict_vram,
         )
+
+    @api.get("/models/resident")
+    async def resident_models(request: Request) -> dict[str, Any]:
+        return await _services(request).registry.resident_status()
+
+    @api.post("/models/resident/{model_key}/unload")
+    async def unload_resident(request: Request, model_key: str) -> dict[str, Any]:
+        return await _services(request).registry.unload(model_key)
 
     @api.post("/models/unload")
     async def unload_model(request: Request) -> dict[str, Any]:
@@ -730,14 +756,7 @@ def create_app(
     async def unload_selected_model(request: Request, model_id: str) -> dict[str, Any]:
         services = _services(request)
         descriptor = services.registry.get(model_id)
-        loaded = services.worker.loaded
-        if loaded is not None and loaded.get("model_id") != model_id:
-            raise ModelNotLoadedError(
-                "a different model is loaded",
-                hint="Only the resident model can be unloaded by ID; use POST /models/unload instead.",
-                details={"model_id": model_id},
-            )
-        unload = await services.registry.unload()
+        unload = await services.registry.unload_model(model_id)
         return {
             **descriptor.public_dict(reveal_path=False),
             "lifecycle": "unloaded",
