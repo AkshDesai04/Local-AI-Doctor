@@ -1,9 +1,10 @@
-import { ArrowUp, BrainCircuit, FileText, Image, Mic, Paperclip, ScrollText, SlidersHorizontal, Square, Video, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { ArrowUp, FileText, Image, Mic, Paperclip, ScrollText, SlidersHorizontal, Square, Video, X } from "lucide-react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import type { Attachment, GenerationSettings, ModelSummary } from "../api/types";
 import { capabilityReason, generationCapabilityReason, isUsable, supportsGeneration } from "../domain/capabilities";
 import { SAMPLING_LIMITS } from "../domain/sampling";
 import { formatBytes } from "../utils/format";
+import { Badge, Button, Field, IconButton, Popover, Slider, Switch, Textarea } from "./ui";
 
 interface ComposerProps {
   model: ModelSummary | null;
@@ -12,7 +13,10 @@ interface ComposerProps {
   running: boolean;
   attachments: Attachment[];
   settings: GenerationSettings;
+  /** Rendered at the end of the toolbar, beside the send button. */
+  contextMeter?: ReactNode;
   onSettingsChange: React.Dispatch<React.SetStateAction<GenerationSettings>>;
+  onOpenControls?: () => void;
   onSubmit: (value: string) => void;
   onStop: () => void;
   onAttach: (file: File) => void;
@@ -24,51 +28,36 @@ interface ComposerProps {
 // UI-only soft cap; the backend bounds the prompt by limits.prompt_bytes.
 const SYSTEM_PROMPT_MAX_CHARACTERS = 32_000;
 
-function PromptRange({
-  label,
-  hint,
-  value,
-  min,
-  max,
-  step,
-  onChange,
-}: {
-  label: string;
-  hint: string;
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  onChange: (value: number) => void;
-}): React.ReactNode {
-  return (
-    <label className="prompt-range" title={hint}>
-      <span><span>{label}</span><output>{String(value)}</output></span>
-      <input aria-label={label} max={max} min={min} onChange={(event) => onChange(Number(event.target.value))} step={step} type="range" value={value} />
-    </label>
-  );
+function AttachmentIcon({ kind }: { kind: Attachment["kind"] }): React.ReactNode {
+  if (kind === "image") return <Image size={15} />;
+  if (kind === "audio") return <Mic size={15} />;
+  if (kind === "video") return <Video size={15} />;
+  return <FileText size={15} />;
 }
 
-export function Composer({ model, connected, busy, running, attachments, settings, onSettingsChange, onSubmit, onStop, onAttach, onRemoveAttachment, systemPrompt, onSystemPromptChange }: ComposerProps): React.ReactNode {
+export function Composer({ model, connected, busy, running, attachments, settings, contextMeter, onSettingsChange, onOpenControls, onSubmit, onStop, onAttach, onRemoveAttachment, systemPrompt, onSystemPromptChange }: ComposerProps): React.ReactNode {
   const [value, setValue] = useState("");
   const [attachmentMenu, setAttachmentMenu] = useState(false);
   const [promptControlsOpen, setPromptControlsOpen] = useState(false);
   const textarea = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const attachButton = useRef<HTMLButtonElement>(null);
+  const controlsButton = useRef<HTMLButtonElement>(null);
   const generationSupported = supportsGeneration(model);
   const reasoningSupported = isUsable(model, "reasoning_segments");
   const canSubmit = connected && Boolean(model) && generationSupported && value.trim().length > 0;
+  // Native file input covers the media kinds below; documents need text extraction.
+  const documentSupported = isUsable(model, "extracted_text_input");
   const accepted: string[] = [];
   if (isUsable(model, "vision")) accepted.push("image/*");
   if (isUsable(model, "video")) accepted.push("video/*");
   if (isUsable(model, "audio")) accepted.push("audio/*");
-  // Native file input covers the media kinds above; documents need text extraction.
-  if (isUsable(model, "extracted_text_input")) accepted.push(".txt,.md,.pdf,.docx");
+  if (documentSupported) accepted.push(".txt,.md,.pdf,.docx");
 
   useEffect(() => {
     if (!textarea.current) return;
     textarea.current.style.height = "0px";
-    textarea.current.style.height = `${String(Math.min(textarea.current.scrollHeight, 180))}px`;
+    textarea.current.style.height = `${String(Math.min(textarea.current.scrollHeight, 200))}px`;
   }, [value]);
 
   useEffect(() => {
@@ -86,57 +75,26 @@ export function Composer({ model, connected, busy, running, attachments, setting
     setValue("");
   };
 
+  const reasoningSummary = reasoningSupported ? settings.reasoning !== false ? "Reasoning on" : "Reasoning off" : "Reasoning unavailable";
+
   return (
     <div className="composer-shell">
       {attachments.length > 0 && (
         <div className="attachment-strip">
           {attachments.map((attachment) => (
             <div className={`attachment-chip ${attachment.status}`} key={attachment.id}>
-              <div className="attachment-icon">{attachment.kind === "image" ? <Image size={15} /> : attachment.kind === "audio" ? <Mic size={15} /> : attachment.kind === "video" ? <Video size={15} /> : <FileText size={15} />}</div>
-              <div><strong>{attachment.name}</strong><span>{formatBytes(attachment.sizeBytes)} · {attachment.status}</span>{attachment.detail && <span className="attachment-error">{attachment.detail}</span>}</div>
-              <button aria-label={`Remove ${attachment.name}`} className="bare-button" onClick={() => onRemoveAttachment(attachment.id)} type="button"><X size={14} /></button>
+              <span aria-hidden="true" className="attachment-icon"><AttachmentIcon kind={attachment.kind} /></span>
+              <div className="attachment-copy">
+                <strong>{attachment.name}</strong>
+                <span>{formatBytes(attachment.sizeBytes)} · {attachment.status}</span>
+                {attachment.detail && <span className="attachment-error" title={attachment.detail}>{attachment.detail}</span>}
+              </div>
+              <IconButton icon={<X size={13} />} label={`Remove ${attachment.name}`} onClick={() => onRemoveAttachment(attachment.id)} size="sm" />
             </div>
           ))}
         </div>
       )}
       <div className="composer">
-        <div className="attach-wrap">
-          <button
-            aria-expanded={attachmentMenu}
-            aria-label="Attach a file"
-            className="composer-tool"
-            disabled={accepted.length === 0 || running || busy}
-            onClick={() => {
-              setAttachmentMenu((current) => !current);
-              setPromptControlsOpen(false);
-            }}
-            title={accepted.length ? "Attach supported media or a document" : "This model has no supported attachment path"}
-            type="button"
-          ><Paperclip size={18} /></button>
-          {attachmentMenu && (
-            <div className="popover attachment-menu">
-              <p>Accepted for this model</p>
-              <div className="attachment-capabilities">
-                <span className={isUsable(model, "vision") ? "supported" : ""}><Image size={14} /> Image</span>
-                <span className={isUsable(model, "video") ? "supported" : ""}><Video size={14} /> Video</span>
-                <span className={isUsable(model, "audio") ? "supported" : ""}><Mic size={14} /> Audio</span>
-                <span className={isUsable(model, "extracted_text_input") ? "supported" : ""}><FileText size={14} /> Document</span>
-              </div>
-              <button className="button primary compact" onClick={() => { fileInput.current?.click(); setAttachmentMenu(false); }} type="button">Choose file</button>
-            </div>
-          )}
-          <input
-            accept={accepted.join(",")}
-            className="visually-hidden"
-            onChange={(event) => {
-              const file = event.target.files?.[0];
-              if (file) onAttach(file);
-              event.target.value = "";
-            }}
-            ref={fileInput}
-            type="file"
-          />
-        </div>
         <textarea
           aria-label="Message"
           disabled={!connected || running || busy || !generationSupported}
@@ -152,48 +110,103 @@ export function Composer({ model, connected, busy, running, attachments, setting
           rows={1}
           value={value}
         />
-        {systemPrompt.trim() && <span aria-label="System prompt active" className="composer-tool active" role="img" title="System prompt active: applied to every response in this chat"><ScrollText size={16} /></span>}
-        <div className="composer-settings-wrap">
-          <button
-            aria-expanded={promptControlsOpen}
-            aria-label="Prompt controls"
-            className={`composer-tool ${promptControlsOpen ? "active" : ""}`}
-            disabled={!connected || running || busy || !generationSupported}
-            onClick={() => {
-              setPromptControlsOpen((current) => !current);
-              setAttachmentMenu(false);
-            }}
-            title="Tune reasoning and sampling for the next response"
-            type="button"
-          ><SlidersHorizontal size={18} /></button>
-          {promptControlsOpen && (
-            <div aria-label="Prompt controls panel" className="popover prompt-controls-popover">
-              <div className="prompt-controls-heading"><strong>Next response</strong><small>Applied before you send</small></div>
-              <label className={`prompt-reasoning-toggle ${reasoningSupported ? "" : "unsupported"}`} title={reasoningSupported ? "Ask the model's chat template to enable or disable its thinking mode." : capabilityReason(model, "reasoning_segments")}>
-                <span><BrainCircuit size={15} /><span><strong>Reasoning</strong><small>{reasoningSupported ? "Use the model's thinking mode" : "Not exposed by this model"}</small></span></span>
-                <input aria-label="Reason before answering" checked={reasoningSupported && settings.reasoning !== false} disabled={!reasoningSupported} onChange={(event) => updateSetting("reasoning", event.target.checked)} type="checkbox" />
-              </label>
-              <PromptRange hint="Higher values make token selection more varied; zero uses greedy decoding." label="Temperature" {...SAMPLING_LIMITS.temperature} onChange={(next) => updateSetting("temperature", next)} value={settings.temperature} />
-              <PromptRange hint="Keep only the K highest-scoring tokens. Zero disables this filter." label="Top K" {...SAMPLING_LIMITS.topK} onChange={(next) => updateSetting("topK", next)} value={settings.topK} />
-              <PromptRange hint="Keep the smallest token set whose cumulative probability reaches this value." label="Top P" {...SAMPLING_LIMITS.topP} onChange={(next) => updateSetting("topP", next)} value={settings.topP} />
-              <label className="edit-message" title="Sent as the first message of every response in this chat. Templates without a system role receive it inside the first user message.">
-                <span className="prompt-controls-heading"><strong>System prompt</strong><small>{String(systemPrompt.length)} / {String(SYSTEM_PROMPT_MAX_CHARACTERS)}</small></span>
-                <textarea aria-label="System prompt" maxLength={SYSTEM_PROMPT_MAX_CHARACTERS} onChange={(event) => onSystemPromptChange(event.target.value)} placeholder="Optional instructions applied to every response in this chat" value={systemPrompt} />
-              </label>
-            </div>
-          )}
+        <div className="composer-toolbar">
+          <div className="composer-tools">
+            <IconButton
+              aria-expanded={attachmentMenu}
+              disabled={accepted.length === 0 || running || busy}
+              icon={<Paperclip size={16} />}
+              label="Attach a file"
+              onClick={() => {
+                setAttachmentMenu((current) => !current);
+                setPromptControlsOpen(false);
+              }}
+              ref={attachButton}
+              title={accepted.length ? "Attach supported media or a document" : "This model has no supported attachment path"}
+            />
+            <IconButton
+              aria-expanded={promptControlsOpen}
+              disabled={!connected || running || busy || !generationSupported}
+              icon={<SlidersHorizontal size={16} />}
+              label="Prompt controls"
+              onClick={() => {
+                setPromptControlsOpen((current) => !current);
+                setAttachmentMenu(false);
+              }}
+              ref={controlsButton}
+              title="Tune reasoning, sampling, and the system prompt for the next response"
+            />
+            {systemPrompt.trim() && (
+              <span aria-label="System prompt active" className="system-prompt-indicator" role="img" title="System prompt active: applied to every response in this chat">
+                <Badge icon={<ScrollText aria-hidden="true" size={12} />} tone="accent">System prompt</Badge>
+              </span>
+            )}
+            <span className="composer-summary" title="Sampling settings for the next response">{reasoningSummary} · T {String(settings.temperature)} · K {String(settings.topK)} · P {String(settings.topP)}</span>
+          </div>
+          <div className="composer-end">
+            {contextMeter}
+            {running ? (
+              <button aria-label="Stop generation" className="send-button stop" onClick={onStop} title="Stop and preserve partial output" type="button"><Square fill="currentColor" size={12} /></button>
+            ) : (
+              <button aria-label="Send message" className="send-button" disabled={!canSubmit || busy} onClick={send} title="Send (Enter)" type="button"><ArrowUp size={17} /></button>
+            )}
+          </div>
         </div>
-        {running ? (
-          <button aria-label="Stop generation" className="send-button stop" onClick={onStop} title="Stop and preserve partial output" type="button"><Square fill="currentColor" size={14} /></button>
-        ) : (
-          <button aria-label="Send message" className="send-button" disabled={!canSubmit || busy} onClick={send} type="button"><ArrowUp size={18} /></button>
-        )}
+
+        <Popover anchorRef={attachButton} className="composer-popover attachment-menu" label="Attachment options" onClose={() => setAttachmentMenu(false)} open={attachmentMenu}>
+          <p className="popover-title">Accepted for this model</p>
+          <ul className="attachment-capabilities">
+            <li className={isUsable(model, "vision") ? "supported" : ""}><Image size={14} /> Image</li>
+            <li className={isUsable(model, "video") ? "supported" : ""}><Video size={14} /> Video</li>
+            <li className={isUsable(model, "audio") ? "supported" : ""}><Mic size={14} /> Audio</li>
+            <li className={documentSupported ? "supported" : ""}><FileText size={14} /> Document</li>
+          </ul>
+          <Button block onClick={() => { fileInput.current?.click(); setAttachmentMenu(false); }} size="sm" variant="primary">Choose file</Button>
+        </Popover>
+
+        <Popover anchorRef={controlsButton} className="composer-popover prompt-controls" label="Prompt controls panel" onClose={() => setPromptControlsOpen(false)} open={promptControlsOpen}>
+          <div className="popover-head"><strong>Next response</strong><span>Applied when you send</span></div>
+          <Switch
+            aria-label="Reason before answering"
+            checked={reasoningSupported && settings.reasoning !== false}
+            description={reasoningSupported ? "Use the model’s thinking mode" : "Not exposed by this model"}
+            disabled={!reasoningSupported}
+            label="Reasoning"
+            onChange={(event) => updateSetting("reasoning", event.target.checked)}
+            title={reasoningSupported ? "Ask the model's chat template to enable or disable its thinking mode." : capabilityReason(model, "reasoning_segments")}
+          />
+          <Slider {...SAMPLING_LIMITS.temperature} label="Temperature" onValueChange={(next) => updateSetting("temperature", next)} title="Higher values make token selection more varied; zero uses greedy decoding." value={settings.temperature} />
+          <Slider {...SAMPLING_LIMITS.topK} label="Top K" onValueChange={(next) => updateSetting("topK", next)} title="Keep only the K highest-scoring tokens. Zero disables this filter." value={settings.topK} />
+          <Slider {...SAMPLING_LIMITS.topP} label="Top P" onValueChange={(next) => updateSetting("topP", next)} title="Keep the smallest token set whose cumulative probability reaches this value." value={settings.topP} />
+          <Field
+            addon={<span className="field-count">{String(systemPrompt.length)} / {String(SYSTEM_PROMPT_MAX_CHARACTERS)}</span>}
+            className="system-prompt-field"
+            hint="Applies to every response in this chat. Templates without a system role receive it inside the first user message."
+            label="System prompt"
+          >
+            <Textarea maxLength={SYSTEM_PROMPT_MAX_CHARACTERS} onChange={(event) => onSystemPromptChange(event.target.value)} placeholder="Optional instructions applied to every response in this chat" rows={3} value={systemPrompt} />
+          </Field>
+          {onOpenControls && (
+            <button className="popover-link" onClick={() => { setPromptControlsOpen(false); onOpenControls(); }} type="button">All generation controls…</button>
+          )}
+        </Popover>
+        <input
+          accept={accepted.join(",")}
+          className="visually-hidden"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) onAttach(file);
+            event.target.value = "";
+          }}
+          ref={fileInput}
+          tabIndex={-1}
+          type="file"
+        />
       </div>
       <div className="composer-meta">
-        <span>{model ? `${model.name} · ${model.lifecycle}` : "No model selected"}</span>
+        <span className="composer-model">{model ? `${model.name} · ${model.lifecycle}` : "No model selected"}</span>
         {model && !generationSupported && <span className="warning-copy">{generationCapabilityReason(model)}</span>}
-        <span className="prompt-setting-summary" title="Sampling settings for the next response">{reasoningSupported ? settings.reasoning !== false ? "Reasoning on" : "Reasoning off" : "Reasoning unavailable"} · T {String(settings.temperature)} · K {String(settings.topK)} · P {String(settings.topP)}</span>
-        <span className="keyboard-hint"><kbd>Enter</kbd> send · <kbd>Shift Enter</kbd> newline</span>
+        <span className="keyboard-hint"><kbd>Enter</kbd> send · <kbd>Shift</kbd>+<kbd>Enter</kbd> newline</span>
       </div>
     </div>
   );

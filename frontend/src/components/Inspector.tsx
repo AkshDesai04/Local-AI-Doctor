@@ -3,7 +3,6 @@ import {
   Binary,
   Box,
   Braces,
-  ChevronDown,
   Clock3,
   Cpu,
   FileJson,
@@ -12,9 +11,9 @@ import {
   GitBranch,
   Info,
   Layers3,
+  ListOrdered,
   Network,
   Sigma,
-  Sparkles,
   X,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -25,6 +24,7 @@ import { capabilityOf, supportsGeneration } from "../domain/capabilities";
 import { displayTokenText, downloadBlob, formatBytes, formatDuration, formatNumber, formatPercent, shortFingerprint, tokenTextHint } from "../utils/format";
 import { AttentionAttributionView } from "./AttentionAttribution";
 import { type ChartMetric, TraceChart } from "./TraceChart";
+import { Badge, type BadgeTone, Button, Callout, Card, EmptyState, IconButton, Select, Stat, Tabs } from "./ui";
 import { VirtualTokenTable } from "./VirtualTokenTable";
 
 export type InspectorTab = "overview" | "tokens" | "probability" | "timing" | "experts" | "context" | "embeddings" | "hardware" | "configuration" | "events";
@@ -65,12 +65,24 @@ interface InspectorProps {
   onClose: () => void;
 }
 
-function DataCard({ label, value, detail }: { label: string; value: React.ReactNode; detail?: string }): React.ReactNode {
-  return <div className="data-card"><span>{label}</span><strong>{value}</strong>{detail && <small>{detail}</small>}</div>;
+const runTones: Record<RunDetails["status"], BadgeTone> = {
+  queued: "neutral",
+  loading: "accent",
+  running: "accent",
+  complete: "info",
+  cancelled: "warning",
+  failed: "danger",
+};
+
+function tabDisabled(tab: TabDefinition, model: ModelSummary | null): { disabled: boolean; reason?: string } {
+  if (tab.id === "timing") return { disabled: !supportsGeneration(model), reason: "Timing traces need a text-generation model." };
+  if (!tab.capability) return { disabled: false };
+  const capability = capabilityOf(model, tab.capability);
+  return { disabled: capability.state !== "full" && capability.state !== "partial", reason: capability.reason };
 }
 
-function EmptyInspector({ icon: Icon = Info, title, body }: { icon?: LucideIcon; title: string; body: string }): React.ReactNode {
-  return <div className="inspector-empty"><div><Icon size={19} /></div><strong>{title}</strong><p>{body}</p></div>;
+function StatGrid({ children }: { children: React.ReactNode }): React.ReactNode {
+  return <div className="stat-grid">{children}</div>;
 }
 
 interface SelectedAlternative {
@@ -91,8 +103,8 @@ function Alternatives({ title, distribution, alternatives, currentTokenId, nerdM
     <section className="alternatives-section">
       <h4 title={distribution === "raw" ? "Probabilities directly from the model before sampling filters are applied." : "Probabilities after temperature, top-k, top-p, and other active sampling filters."}>{title}</h4>
       {!alternatives?.length ? <p className="muted">Not captured at this instrumentation level.</p> : (
-        <div className="alternatives-table">
-          <div className="alternatives-head"><span title="Probability rank within this distribution">Rank</span><span title="Human-readable token text; hover a row for the exact tokenizer piece">Piece</span><span title="Probability assigned to this token">Probability</span><span title="Natural logarithm of the token probability">Log p</span><span title="Whether this token survived the active sampling filters">Filter</span></div>
+        <div className="data-table alternatives-table">
+          <div className="data-table-head alternatives-grid"><span title="Probability rank within this distribution">Rank</span><span title="Human-readable token text; hover a row for the exact tokenizer piece">Piece</span><span title="Probability assigned to this token">Probability</span><span title="Natural logarithm of the token probability">Log p</span><span title="Whether this token survived the active sampling filters">Filter</span></div>
           {alternatives.map((item) => {
             const isCurrent = item.tokenId === currentTokenId;
             const isSelected = selected?.distribution === distribution
@@ -103,7 +115,7 @@ function Alternatives({ title, distribution, alternatives, currentTokenId, nerdM
             <button
               aria-label={`${isCurrent ? "Current" : "Select"} token ${tokenLabel} from the ${distribution} distribution`}
               aria-pressed={isSelected}
-              className={`alternatives-row ${nerdMode && !isCurrent ? "selectable" : ""} ${isSelected ? "selected" : ""}`}
+              className={`data-table-row alternatives-grid ${nerdMode && !isCurrent ? "selectable" : ""} ${isSelected ? "selected" : ""} ${isCurrent ? "current" : ""}`}
               disabled={!nerdMode || isCurrent}
               key={`${String(item.rank)}-${String(item.tokenId)}`}
               onClick={() => onSelect({ distribution, alternative: item })}
@@ -135,18 +147,22 @@ function TokenDetail({ token, contextTokens, nerdMode, branching, canBranch, bra
     setSelectedAlternative(null);
   }, [nerdMode, token?.index]);
 
-  if (!token) return <EmptyInspector body="Select a token in the response, graph, or table to lock its exact details here." title="No token selected" />;
+  if (!token) return <EmptyState description="Select a token in the response, graph, or table to lock its exact details here." title="No token selected" />;
   const branch = async (): Promise<void> => {
     if (!selectedAlternative || branching || !canBranch) return;
     await onBranchAlternative(token.index, selectedAlternative.distribution, selectedAlternative.alternative);
   };
   const selectedTokenLabel = displayTokenText(token.displayText || token.piece) || "∅";
   return (
-    <div className="token-detail">
-      <div className="token-detail-hero" title={tokenTextHint(token.piece, token.displayText)}><span className={`segment-badge ${token.reasoningSegment}`}>{token.reasoningSegment}</span><code>{selectedTokenLabel}</code><span>token #{String(token.index)}</span></div>
+    <div className="inspector-stack">
+      <div className="token-detail-hero" title={tokenTextHint(token.piece, token.displayText)}>
+        <Badge className="segment-badge" tone={token.reasoningSegment === "reasoning" ? "info" : "neutral"}>{token.reasoningSegment}</Badge>
+        <code>{selectedTokenLabel}</code>
+        <span>token #{String(token.index)}</span>
+      </div>
       <AttentionAttributionView attribution={token.attentionAttribution} contextTokens={contextTokens} onSelectGeneratedToken={onSelectToken} targetTokenIndex={token.index} />
-      <dl className="definition-grid">
-        <div><dt>Token ID</dt><dd>{String(token.tokenId)}</dd></div>
+      <dl className="kv-grid">
+        <div><dt>Token ID</dt><dd className="mono">{String(token.tokenId)}</dd></div>
         <div><dt>Bytes</dt><dd className="mono">{token.bytes ?? "Not captured"}</dd></div>
         <div><dt>Character span</dt><dd>{token.characterSpan ? `${String(token.characterSpan[0])}–${String(token.characterSpan[1])}` : "Not captured"}</dd></div>
         <div><dt>Decoded display</dt><dd className="mono">{displayTokenText(token.displayText) || "∅"}</dd></div>
@@ -170,100 +186,101 @@ function TokenDetail({ token, contextTokens, nerdMode, branching, canBranch, bra
       {nerdMode && selectedAlternative && (
         <div className="branch-token-action">
           <span>Continue from token <code title={tokenTextHint(selectedAlternative.alternative.piece)}>{displayTokenText(selectedAlternative.alternative.piece) || "∅"}</code> in a new chat.</span>
-          <button disabled={branching || !canBranch} onClick={() => void branch()} title={!canBranch ? branchUnavailableReason : "Create a new chat from this point and force the selected alternative before continuing generation."} type="button"><GitBranch size={14} />{branching ? "Creating branch…" : canBranch ? "Branch out with selected token" : branchUnavailableReason}</button>
+          <Button block disabled={!canBranch} icon={<GitBranch size={14} />} loading={branching} onClick={() => void branch()} title={!canBranch ? branchUnavailableReason : "Create a new chat from this point and force the selected alternative before continuing generation."} variant="primary">{branching ? "Creating branch…" : canBranch ? "Branch out with selected token" : branchUnavailableReason}</Button>
         </div>
       )}
-      <div className="metric-note"><Info size={14} /><span>Alternatives are tokens with high probability under a distribution—not model thoughts or hidden reasoning.</span></div>
+      <Callout>Alternatives are tokens with high probability under a distribution—not model thoughts or hidden reasoning.</Callout>
     </div>
   );
 }
 
 function OverviewPanel({ run, model }: { run: RunDetails | null; model: ModelSummary | null }): React.ReactNode {
-  if (!run) return <EmptyInspector body="Run a prompt or open response details to inspect telemetry. No placeholder measurements are shown." title="No run selected" />;
+  if (!run) return <EmptyState description="Run a prompt or open response details to inspect telemetry. No placeholder measurements are shown." icon={Gauge} title="No run selected" />;
   const timing = run.metrics?.timing;
   return (
     <div className="inspector-stack">
-      <div className="run-status-row"><span className={`run-state ${run.status}`}><i />{run.status}</span><span>{run.metrics?.finishReason ?? "No finish reason yet"}</span></div>
-      {run.warnings?.map((warning, index) => <div className="inline-warning" key={index}><Info size={14} /><span>{warning}</span></div>)}
-      <div className="data-grid">
-        <DataCard detail="request → first server token" label="Server TTFT" value={formatDuration(timing?.serverTtftMs)} />
-        <DataCard detail="steady-state decode" label="Decode rate" value={timing?.decodeTokensPerSecond === undefined ? "—" : `${formatNumber(timing.decodeTokensPerSecond, 2)} tok/s`} />
-        <DataCard detail="conditional generated response" label="Perplexity" value={formatNumber(run.metrics?.responsePerplexity, 4)} />
-        <DataCard detail="prompt + completion" label="Total latency" value={formatDuration(timing?.totalMs)} />
-        <DataCard label="Prompt tokens" value={formatNumber(run.metrics?.promptTokens, 0)} />
-        <DataCard label="Generated tokens" value={formatNumber(run.metrics?.generatedTokens ?? run.tokens.length, 0)} />
-      </div>
-      <section className="inspector-section">
-        <div className="section-title"><Fingerprint size={15} /><h3>Reproducibility</h3></div>
+      <div className="run-status-row"><Badge tone={runTones[run.status]}>{run.status}</Badge><span>{run.metrics?.finishReason ? `finish: ${run.metrics.finishReason}` : "No finish reason yet"}</span></div>
+      {run.warnings?.map((warning, index) => <Callout key={index} tone="warning">{warning}</Callout>)}
+      <StatGrid>
+        <Stat caption="request → first server token" label="Server TTFT" value={formatDuration(timing?.serverTtftMs)} />
+        <Stat caption="steady-state decode" label="Decode rate" value={timing?.decodeTokensPerSecond === undefined ? "—" : `${formatNumber(timing.decodeTokensPerSecond, 2)} tok/s`} />
+        <Stat caption="conditional generated response" label="Perplexity" value={formatNumber(run.metrics?.responsePerplexity, 4)} />
+        <Stat caption="prompt + completion" label="Total latency" value={formatDuration(timing?.totalMs)} />
+        <Stat label="Prompt tokens" value={formatNumber(run.metrics?.promptTokens, 0)} />
+        <Stat label="Generated tokens" value={formatNumber(run.metrics?.generatedTokens ?? run.tokens.length, 0)} />
+      </StatGrid>
+      <Card icon={Fingerprint} title="Reproducibility">
         {!run.reproducibility ? <p className="muted">The backend has not returned a reproducibility snapshot.</p> : (
-          <dl className="definition-grid compact-definitions">
+          <dl className="kv-grid">
             <div><dt>Requested seed</dt><dd>{run.reproducibility.requestedSeed === null || run.reproducibility.requestedSeed === undefined || run.reproducibility.requestedSeed === "" ? "Generated" : String(run.reproducibility.requestedSeed)}</dd></div>
             <div><dt>Effective seed</dt><dd className="mono">{run.reproducibility.effectiveSeed}</dd></div>
             <div><dt>RNG</dt><dd>{run.reproducibility.rngAlgorithm ?? "Not reported"}</dd></div>
             <div><dt>Generator</dt><dd>{run.reproducibility.generatorDevice ?? "Not reported"}</dd></div>
-            <div><dt>Model fingerprint</dt><dd>{shortFingerprint(run.reproducibility.modelFingerprint ?? model?.fingerprint)}</dd></div>
+            <div><dt>Model fingerprint</dt><dd className="mono">{shortFingerprint(run.reproducibility.modelFingerprint ?? model?.fingerprint)}</dd></div>
             <div><dt>Backend</dt><dd>{run.reproducibility.backend ?? "Not reported"}</dd></div>
-            <div><dt>Device / dtype</dt><dd title={run.reproducibility.deviceReason}><span>{run.reproducibility.device ?? "—"} / {run.reproducibility.dtype ?? "—"}</span>{run.reproducibility.deviceReason && <small className="definition-detail">{run.reproducibility.deviceReason}</small>}</dd></div>
+            <div><dt>Device / dtype</dt><dd title={run.reproducibility.deviceReason}><span>{run.reproducibility.device ?? "—"} / {run.reproducibility.dtype ?? "—"}</span>{run.reproducibility.deviceReason && <small className="kv-detail">{run.reproducibility.deviceReason}</small>}</dd></div>
             <div><dt>Deterministic kernels</dt><dd>{run.reproducibility.deterministicKernels === undefined ? "Not reported" : run.reproducibility.deterministicKernels ? "Enabled" : "Disabled"}</dd></div>
           </dl>
         )}
         <p className="footnote">A seed cannot be recovered from output. Exact replay also depends on unchanged files, tokenizer, device, dtype, kernels, software, and batching.</p>
-      </section>
-      {run.metrics?.telemetryOverhead && <div className="metric-note"><Activity size={14} /><span>Instrumentation overhead: {run.metrics.telemetryOverhead}</span></div>}
+      </Card>
+      {run.metrics?.telemetryOverhead && <Callout icon={Activity}>Instrumentation overhead: {run.metrics.telemetryOverhead}</Callout>}
     </div>
   );
 }
 
 const probabilityMetrics: ChartMetric[] = [
-  { key: "raw-p", label: "Raw model probability", color: "#60a5fa", value: (token) => token.rawProbability },
-  { key: "sample-p", label: "Sampler probability", color: "#b49cff", value: (token) => token.samplingProbability },
+  { key: "raw-p", label: "Raw model probability", color: "var(--viz-1)", value: (token) => token.rawProbability },
+  { key: "sample-p", label: "Sampler probability", color: "var(--viz-2)", value: (token) => token.samplingProbability },
 ];
 const logProbabilityMetrics: ChartMetric[] = [
-  { key: "raw-log-p", label: "Raw model log probability", color: "#60a5fa", value: (token) => token.rawLogProbability },
-  { key: "sample-log-p", label: "Sampler log probability", color: "#b49cff", value: (token) => token.samplingLogProbability },
+  { key: "raw-log-p", label: "Raw model log probability", color: "var(--viz-1)", value: (token) => token.rawLogProbability },
+  { key: "sample-log-p", label: "Sampler log probability", color: "var(--viz-2)", value: (token) => token.samplingLogProbability },
 ];
 const uncertaintyMetrics: ChartMetric[] = [
-  { key: "entropy", label: "Entropy", color: "#5bb8ef", value: (token) => token.entropy },
-  { key: "surprise", label: "Surprise −ln(p)", color: "#f3a769", value: (token) => token.surprise },
+  { key: "entropy", label: "Entropy", color: "var(--viz-3)", value: (token) => token.entropy },
+  { key: "surprise", label: "Surprise −ln(p)", color: "var(--viz-5)", value: (token) => token.surprise },
 ];
 const rankMetrics: ChartMetric[] = [
-  { key: "rank", label: "Exact full-vocabulary rank", color: "#f3a769", value: (token) => token.rawRank },
+  { key: "rank", label: "Exact full-vocabulary rank", color: "var(--viz-4)", value: (token) => token.rawRank },
 ];
 const perplexityMetrics: ChartMetric[] = [
-  { key: "perplexity", label: "Running response perplexity", color: "#b49cff", value: (token) => token.runningPerplexity },
+  { key: "perplexity", label: "Running response perplexity", color: "var(--viz-6)", value: (token) => token.runningPerplexity },
 ];
 const timingMetrics: ChartMetric[] = [
-  { key: "decode", label: "Decode forward", unit: "ms", color: "#60a5fa", value: (token) => token.timing?.decodeMs },
-  { key: "sampling", label: "Sampling", unit: "ms", color: "#b49cff", value: (token) => token.timing?.samplingMs },
+  { key: "decode", label: "Decode forward", unit: "ms", color: "var(--viz-1)", value: (token) => token.timing?.decodeMs },
+  { key: "sampling", label: "Sampling", unit: "ms", color: "var(--viz-2)", value: (token) => token.timing?.samplingMs },
 ];
 const arrivalMetrics: ChartMetric[] = [
-  { key: "server-arrival", label: "Server inter-token", unit: "ms", color: "#f3a769", value: (token) => token.timing?.interTokenMs },
-  { key: "client-arrival", label: "Client inter-arrival", unit: "ms", color: "#68bce8", value: (token) => token.timing?.clientInterArrivalMs },
+  { key: "server-arrival", label: "Server inter-token", unit: "ms", color: "var(--viz-3)", value: (token) => token.timing?.interTokenMs },
+  { key: "client-arrival", label: "Client inter-arrival", unit: "ms", color: "var(--viz-5)", value: (token) => token.timing?.clientInterArrivalMs },
 ];
 const cumulativeTimingMetrics: ChartMetric[] = [
-  { key: "cumulative", label: "Cumulative time", unit: "ms", color: "#60a5fa", value: (token) => token.timing?.cumulativeMs },
+  { key: "cumulative", label: "Cumulative time", unit: "ms", color: "var(--viz-6)", value: (token) => token.timing?.cumulativeMs },
 ];
 const throughputMetrics: ChartMetric[] = [
-  { key: "instant", label: "Instantaneous", unit: "tok/s", color: "#5bb8ef", value: (token) => token.timing?.instantaneousTps },
-  { key: "rolling", label: "Rolling", unit: "tok/s", color: "#b49cff", value: (token) => token.timing?.rollingTps },
+  { key: "instant", label: "Instantaneous", unit: "tok/s", color: "var(--viz-1)", value: (token) => token.timing?.instantaneousTps },
+  { key: "rolling", label: "Rolling", unit: "tok/s", color: "var(--viz-2)", value: (token) => token.timing?.rollingTps },
 ];
 
 const expertSelectionMetrics: ChartMetric[] = [
-  { key: "expert-id", label: "First selected expert ID", color: "#b49cff", value: (token) => token.expertRoutes?.[0]?.selectedExpertIds[0] },
-  { key: "expert-weight", label: "First expert weight", color: "#60a5fa", value: (token) => token.expertRoutes?.[0]?.gateWeights[0] },
+  { key: "expert-id", label: "First selected expert ID", color: "var(--viz-3)", value: (token) => token.expertRoutes?.[0]?.selectedExpertIds[0] },
+  { key: "expert-weight", label: "First expert weight", color: "var(--viz-1)", value: (token) => token.expertRoutes?.[0]?.gateWeights[0] },
 ];
 
 function ExpertsPanel({ run, selectedToken, nerdMode, onSelectToken }: { run: RunDetails | null; selectedToken: number | null; nerdMode: boolean; onSelectToken: (index: number) => void }): React.ReactNode {
   const routed = run?.tokens.filter((token) => token.expertRoutes?.length) ?? [];
-  if (!routed.length) return <EmptyInspector body="The selected adapter supports routing, but this run did not expose per-token routes at its instrumentation level." icon={Network} title="No expert route events" />;
+  if (!routed.length) return <EmptyState description="The selected adapter supports routing, but this run did not expose per-token routes at its instrumentation level." icon={Network} title="No expert route events" />;
   return (
     <div className="inspector-stack">
       <TraceChart metrics={expertSelectionMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Expert selection and weight" tokens={run?.tokens ?? []} />
-      <section className="inspector-section">
-        <div className="section-title"><Network size={15} /><h3>Selected vs. executed experts</h3></div>
-        <div className="expert-route-table"><div><strong>Token</strong><strong>Layer</strong><strong>Selected</strong><strong>Executed</strong><strong>Weights</strong></div>{routed.flatMap((token) => token.expertRoutes?.map((route) => <button key={`${String(token.index)}-${String(route.layer)}`} onClick={() => onSelectToken(token.index)} type="button"><span>#{String(token.index)}</span><span>{String(route.layer)}</span><span>{route.selectedExpertIds.join(", ")}</span><span>{route.executedExpertIds.join(", ")}</span><span>{route.gateWeights.map((weight) => formatNumber(weight, 3)).join(", ")}</span></button>) ?? [])}</div>
-      </section>
-      <div className="metric-note"><Info size={14} /><span>Selected and actually executed experts are intentionally distinct. Dense gated MLPs are never presented as MoE routing.</span></div>
+      <Card flush icon={Network} title="Selected vs. executed experts">
+        <div className="data-table expert-route-table">
+          <div className="data-table-head expert-grid"><span>Token</span><span>Layer</span><span>Selected</span><span>Executed</span><span>Weights</span></div>
+          {routed.flatMap((token) => token.expertRoutes?.map((route) => <button className="data-table-row expert-grid selectable" key={`${String(token.index)}-${String(route.layer)}`} onClick={() => onSelectToken(token.index)} type="button"><span>#{String(token.index)}</span><span>{String(route.layer)}</span><span>{route.selectedExpertIds.join(", ")}</span><span>{route.executedExpertIds.join(", ")}</span><span>{route.gateWeights.map((weight) => formatNumber(weight, 3)).join(", ")}</span></button>) ?? [])}
+        </div>
+      </Card>
+      <Callout>Selected and actually executed experts are intentionally distinct. Dense gated MLPs are never presented as MoE routing.</Callout>
     </div>
   );
 }
@@ -280,18 +297,27 @@ function ContextPanel({ run, model }: { run: RunDetails | null; model: ModelSumm
   ];
   const used = parts.reduce((sum, part) => sum + part.value, 0);
   const remaining = context?.remainingTokens ?? (limit === null ? undefined : Math.max(0, limit - used));
-  if (!run && !model) return <EmptyInspector body="Select a model to see its discovered context metadata." title="No context metadata" />;
+  if (!run && !model) return <EmptyState description="Select a model to see its discovered context metadata." icon={Layers3} title="No context metadata" />;
   return (
     <div className="inspector-stack">
-      <div className="context-hero"><div><span className="eyebrow">Effective model limit</span><strong>{limit === null ? "Unknown" : formatNumber(limit, 0)}</strong></div><div><span className="eyebrow">Used + reserved</span><strong>{context ? formatNumber(used, 0) : "No run"}</strong></div><div><span className="eyebrow">Remaining</span><strong>{remaining === undefined ? "—" : formatNumber(remaining, 0)}</strong></div></div>
-      {context && limit !== null && <div className="context-bar" aria-label={`Context used ${formatPercent(used / limit)}`}>{parts.map((part) => <i className={part.className} key={part.label} style={{ width: `${String((part.value / limit) * 100)}%` }} />)}</div>}
-      <div className="context-legend">{parts.map((part) => <div key={part.label}><i className={part.className} /><span>{part.label}</span><strong>{context ? formatNumber(part.value, 0) : "—"}</strong></div>)}</div>
-      <div className="metric-note"><Info size={14} /><span>Text tokens and expanded multimodal positions are kept separate. Remaining capacity includes the reserved output budget.</span></div>
-      <section className="inspector-section">
-        <div className="section-title"><Layers3 size={15} /><h3>Discovered limits</h3></div>
-        {!model?.contextLimits?.length ? <p className="muted">The adapter did not expose context-limit candidates.</p> : model.contextLimits.map((candidate) => <div className={`context-candidate ${candidate.selected ? "selected" : ""}`} key={candidate.source}><span>{candidate.source}</span><strong>{candidate.tokens === null ? "Unknown" : formatNumber(candidate.tokens, 0)}</strong>{candidate.note && <small>{candidate.note}</small>}</div>)}
-      </section>
-      <dl className="definition-grid compact-definitions"><div><dt>Truncation behavior</dt><dd>{context?.behavior?.replaceAll("_", " ") ?? "Not observed"}</dd></div><div><dt>Selection</dt><dd>{limit === null ? "Conflicting or absent metadata" : "Conservative effective limit"}</dd></div></dl>
+      <StatGrid>
+        <Stat label="Effective limit" value={limit === null ? "Unknown" : formatNumber(limit, 0)} />
+        <Stat label="Used + reserved" value={context ? formatNumber(used, 0) : "No run"} />
+        <Stat label="Remaining" value={remaining === undefined ? "—" : formatNumber(remaining, 0)} />
+      </StatGrid>
+      <Card title="Composition">
+        {context && limit !== null && <div className="context-bar" aria-label={`Context used ${formatPercent(used / limit)}`} role="img">{parts.map((part) => <i className={part.className} key={part.label} style={{ width: `${String((part.value / limit) * 100)}%` }} />)}</div>}
+        <ul className="context-legend">{parts.map((part) => <li key={part.label}><i aria-hidden="true" className={part.className} /><span>{part.label}</span><strong>{context ? formatNumber(part.value, 0) : "—"}</strong></li>)}</ul>
+      </Card>
+      <Callout>Text tokens and expanded multimodal positions are kept separate. Remaining capacity includes the reserved output budget.</Callout>
+      <Card flush icon={Layers3} title="Discovered limits">
+        {!model?.contextLimits?.length ? <p className="muted card-inset">The adapter did not expose context-limit candidates.</p> : (
+          <ul className="candidate-list">
+            {model.contextLimits.map((candidate) => <li className={candidate.selected ? "selected" : ""} key={candidate.source}><span className="mono">{candidate.source}</span><strong>{candidate.tokens === null ? "Unknown" : formatNumber(candidate.tokens, 0)}</strong>{candidate.note && <small>{candidate.note}</small>}</li>)}
+          </ul>
+        )}
+      </Card>
+      <dl className="kv-grid"><div><dt>Truncation behavior</dt><dd>{context?.behavior?.replaceAll("_", " ") ?? "Not observed"}</dd></div><div><dt>Selection</dt><dd>{limit === null ? "Conflicting or absent metadata" : "Selected effective limit"}</dd></div></dl>
     </div>
   );
 }
@@ -299,34 +325,34 @@ function ContextPanel({ run, model }: { run: RunDetails | null; model: ModelSumm
 function HardwarePanel({ run, health }: { run: RunDetails | null; health: HealthStatus | null }): React.ReactNode {
   return (
     <div className="inspector-stack">
-      <div className="data-grid">
-        <DataCard detail="selected by hardware discovery" label="Backend" value={run?.reproducibility?.backend ?? health?.selectedBackend ?? "Not reported"} />
-        <DataCard label="Device" value={run?.reproducibility?.device ?? "Not reported"} />
-        <DataCard label="Peak RAM" value={formatBytes(run?.metrics?.peakRamBytes)} />
-        <DataCard label="Peak VRAM" value={formatBytes(run?.metrics?.peakVramBytes)} />
-        <DataCard label="KV cache" value={formatBytes(run?.metrics?.kvCacheBytes)} />
-        <DataCard label="Attention" value={run?.reproducibility?.attentionImplementation ?? "Not reported"} />
-      </div>
-      <div className="metric-note"><Info size={14} /><span>Memory peaks are exact allocator measurements where available. Utilization samples are not exact per-token measurements.</span></div>
-      {!run && <EmptyInspector body="Hardware discovery is available above. Per-run memory and cache measurements appear after selecting a run." title="No run hardware snapshot" />}
+      <StatGrid>
+        <Stat caption="selected by hardware discovery" label="Backend" value={run?.reproducibility?.backend ?? health?.selectedBackend ?? "Not reported"} />
+        <Stat label="Device" value={run?.reproducibility?.device ?? "Not reported"} />
+        <Stat label="Peak RAM" value={formatBytes(run?.metrics?.peakRamBytes)} />
+        <Stat label="Peak VRAM" value={formatBytes(run?.metrics?.peakVramBytes)} />
+        <Stat label="KV cache" value={formatBytes(run?.metrics?.kvCacheBytes)} />
+        <Stat label="Attention" value={run?.reproducibility?.attentionImplementation ?? "Not reported"} />
+      </StatGrid>
+      <Callout>Memory peaks are exact allocator measurements where available. Utilization samples are not exact per-token measurements.</Callout>
+      {!run && <EmptyState description="Hardware discovery is available above. Per-run memory and cache measurements appear after selecting a run." icon={Cpu} size="compact" title="No run hardware snapshot" />}
     </div>
   );
 }
 
 export function Inspector({ open, model, run, health, configuration, activeTab, selectedToken, nerdMode, branching, onBranchAlternative, onTabChange, onSelectToken, onClose }: InspectorProps): React.ReactNode {
   const selected = run?.tokens.find((token) => token.index === selectedToken);
-  const [mobileTabsOpen, setMobileTabsOpen] = useState(false);
   const [exporting, setExporting] = useState<"json" | "jsonl" | "csv" | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
   const activeDefinition = tabs.find((tab) => tab.id === activeTab) ?? tabs[0];
-  const ActiveIcon = activeDefinition?.icon;
   const activeCapability = activeDefinition?.capability ? capabilityOf(model, activeDefinition.capability) : null;
-  const activeCapabilityDisabled = activeDefinition?.id === "timing"
-    ? !supportsGeneration(model)
-    : activeCapability !== null && activeCapability.state !== "full" && activeCapability.state !== "partial";
+  const activeCapabilityDisabled = activeDefinition ? tabDisabled(activeDefinition, model).disabled : false;
   // Never render (or fetch for) a tab the selected model cannot support, even for the
   // single render before the parent state falls back to the overview.
   const visibleTab: InspectorTab = activeCapabilityDisabled ? "overview" : activeTab;
+  const tabItems = tabs.map((tab) => {
+    const state = tabDisabled(tab, model);
+    return { id: tab.id, label: tab.label, icon: tab.icon, disabled: state.disabled, disabledReason: state.reason ?? `${tab.label} is not available for this model.` };
+  });
 
   useEffect(() => {
     if (activeCapabilityDisabled) onTabChange("overview");
@@ -348,6 +374,7 @@ export function Inspector({ open, model, run, health, configuration, activeTab, 
   }, [run]);
 
   const panel = useMemo((): React.ReactNode => {
+    const chart = (title: string, metrics: ChartMetric[]): React.ReactNode => <TraceChart metrics={metrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title={title} tokens={run?.tokens ?? []} />;
     switch (visibleTab) {
       case "overview": return <OverviewPanel model={model} run={run} />;
       case "tokens": {
@@ -374,52 +401,71 @@ export function Inspector({ open, model, run, health, configuration, activeTab, 
           ? [...promptContextTokens, ...generatedContextTokens]
           : undefined;
         return nerdMode
-          ? <div className="inspector-stack"><TokenDetail branchUnavailableReason={branchUnavailableReason} branching={branching} canBranch={runComplete && tokenPersisted} contextTokens={attentionContextTokens} nerdMode onBranchAlternative={onBranchAlternative} onSelectToken={onSelectToken} token={selected} /><section className="inspector-section"><div className="section-title"><Binary size={15} /><h3>All generated tokens</h3></div><VirtualTokenTable onSelectToken={onSelectToken} selectedToken={selectedToken} tokens={run?.tokens ?? []} /></section></div>
-          : <EmptyInspector body="Enable Nerd Mode to inspect raw token boundaries, protocol markers, and alternative distributions." icon={Binary} title="Token details are hidden" />;
+          ? <div className="inspector-stack"><TokenDetail branchUnavailableReason={branchUnavailableReason} branching={branching} canBranch={runComplete && tokenPersisted} contextTokens={attentionContextTokens} nerdMode onBranchAlternative={onBranchAlternative} onSelectToken={onSelectToken} token={selected} /><Card flush icon={ListOrdered} title="All generated tokens"><VirtualTokenTable onSelectToken={onSelectToken} selectedToken={selectedToken} tokens={run?.tokens ?? []} /></Card></div>
+          : <EmptyState description="Enable Nerd Mode to inspect raw token boundaries, protocol markers, and alternative distributions." icon={Binary} title="Token details are hidden" />;
       }
-      case "probability": return <div className="inspector-stack"><TraceChart metrics={probabilityMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Chosen-token probability" tokens={run?.tokens ?? []} /><TraceChart metrics={logProbabilityMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Chosen-token log probability" tokens={run?.tokens ?? []} /><TraceChart metrics={uncertaintyMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Uncertainty" tokens={run?.tokens ?? []} /><TraceChart metrics={rankMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Exact model rank" tokens={run?.tokens ?? []} /><TraceChart metrics={perplexityMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Running perplexity" tokens={run?.tokens ?? []} /></div>;
-      case "timing": return <div className="inspector-stack">{run?.tokens[0] && <div className="metric-note"><Info size={14} /><span>The first token includes prefill and is not treated as steady-state decode.</span></div>}<TraceChart metrics={timingMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Token compute" tokens={run?.tokens ?? []} /><TraceChart metrics={arrivalMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Inter-token arrival" tokens={run?.tokens ?? []} /><TraceChart metrics={throughputMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Decode throughput" tokens={run?.tokens ?? []} /><TraceChart metrics={cumulativeTimingMetrics} onSelectToken={onSelectToken} revealTokenText={nerdMode} selectedToken={selectedToken} title="Cumulative generation time" tokens={run?.tokens ?? []} /><div className="data-grid"><DataCard label="Queue" value={formatDuration(run?.metrics?.timing?.queueMs)} /><DataCard label="Tokenization" value={formatDuration(run?.metrics?.timing?.tokenizationMs)} /><DataCard label="Prefill" value={formatDuration(run?.metrics?.timing?.prefillMs)} /><DataCard label="Client TTFT" value={formatDuration(run?.metrics?.timing?.clientTtftMs)} /></div></div>;
+      case "probability": return <div className="inspector-stack">{chart("Chosen-token probability", probabilityMetrics)}{chart("Chosen-token log probability", logProbabilityMetrics)}{chart("Uncertainty", uncertaintyMetrics)}{chart("Exact model rank", rankMetrics)}{chart("Running perplexity", perplexityMetrics)}</div>;
+      case "timing": return (
+        <div className="inspector-stack">
+          {run?.tokens[0] && <Callout>The first token includes prefill and is not treated as steady-state decode.</Callout>}
+          {chart("Token compute", timingMetrics)}
+          {chart("Inter-token arrival", arrivalMetrics)}
+          {chart("Decode throughput", throughputMetrics)}
+          {chart("Cumulative generation time", cumulativeTimingMetrics)}
+          <StatGrid><Stat label="Queue" value={formatDuration(run?.metrics?.timing?.queueMs)} /><Stat label="Tokenization" value={formatDuration(run?.metrics?.timing?.tokenizationMs)} /><Stat label="Prefill" value={formatDuration(run?.metrics?.timing?.prefillMs)} /><Stat label="Client TTFT" value={formatDuration(run?.metrics?.timing?.clientTtftMs)} /></StatGrid>
+        </div>
+      );
       case "experts": return <ExpertsPanel nerdMode={nerdMode} onSelectToken={onSelectToken} run={run} selectedToken={selectedToken} />;
       case "context": return <ContextPanel model={model} run={run} />;
-      case "embeddings": return <EmptyInspector body="Create or select an embedding run in the Embeddings workspace to inspect vectors, similarity, and projections." icon={Box} title="No embedding run selected" />;
+      case "embeddings": return <EmptyState description="Create or select an embedding run in the Embeddings workspace to inspect vectors, similarity, and projections." icon={Box} title="No embedding run selected" />;
       case "hardware": return <HardwarePanel health={health} run={run} />;
-      case "configuration": return <div className="inspector-stack"><section className="json-section"><div className="section-title"><Braces size={15} /><h3>{run?.effectiveSettings ? "Effective run settings" : "Effective application configuration"}</h3></div>{run?.effectiveSettings || configuration?.effective ? <pre>{JSON.stringify(run?.effectiveSettings ?? configuration?.effective, null, 2)}</pre> : <p className="muted">No redacted effective configuration has been returned.</p>}</section><section className="json-section"><div className="section-title"><Activity size={15} /><h3>{run ? "Sampling operation order" : "Configuration precedence"}</h3></div>{(run?.samplingPipeline ?? configuration?.precedence)?.length ? <ol>{(run?.samplingPipeline ?? configuration?.precedence ?? []).map((step) => <li key={step}>{step}</li>)}</ol> : <p className="muted">The configuration order was not reported.</p>}</section></div>;
+      case "configuration": return (
+        <div className="inspector-stack">
+          <Card icon={Braces} title={run?.effectiveSettings ? "Effective run settings" : "Effective application configuration"}>
+            {run?.effectiveSettings || configuration?.effective ? <pre className="code-block">{JSON.stringify(run?.effectiveSettings ?? configuration?.effective, null, 2)}</pre> : <p className="muted">No redacted effective configuration has been returned.</p>}
+          </Card>
+          <Card icon={Activity} title={run ? "Sampling operation order" : "Configuration precedence"}>
+            {(run?.samplingPipeline ?? configuration?.precedence)?.length ? <ol className="ordered-list">{(run?.samplingPipeline ?? configuration?.precedence ?? []).map((step) => <li key={step}>{step}</li>)}</ol> : <p className="muted">The configuration order was not reported.</p>}
+          </Card>
+        </div>
+      );
       case "events": return nerdMode
-        ? <div className="inspector-stack"><div className="raw-events-heading"><span>{String(run?.rawEvents?.length ?? 0)} live events</span>{run && <div className="server-export-actions"><button disabled={exporting !== null} onClick={() => void exportRun("json")} type="button">{exporting === "json" ? "Exporting…" : "JSON"}</button><button disabled={exporting !== null} onClick={() => void exportRun("jsonl")} type="button">{exporting === "jsonl" ? "Exporting…" : "JSONL"}</button><button disabled={exporting !== null} onClick={() => void exportRun("csv")} type="button">{exporting === "csv" ? "Exporting…" : "Token CSV"}</button></div>}</div>{exportError && <p className="inline-error" role="alert">{exportError}</p>}{run?.rawEvents?.length ? <pre className="event-log">{run.rawEvents.map((event) => JSON.stringify(event)).join("\n")}</pre> : <EmptyInspector body="Raw protocol events appear here as they arrive. Use the server export above for the complete persisted trace." title="No live events captured" />}</div>
-        : <EmptyInspector body="Enable Nerd Mode to inspect raw protocol events and export token-level traces." icon={FileJson} title="Raw events are hidden" />;
+        ? (
+          <div className="inspector-stack">
+            <div className="raw-events-heading">
+              <span>{String(run?.rawEvents?.length ?? 0)} live events</span>
+              {run && (
+                <div className="raw-events-actions">
+                  <Button disabled={exporting !== null} loading={exporting === "json"} onClick={() => void exportRun("json")} size="sm">JSON</Button>
+                  <Button disabled={exporting !== null} loading={exporting === "jsonl"} onClick={() => void exportRun("jsonl")} size="sm">JSONL</Button>
+                  <Button disabled={exporting !== null} loading={exporting === "csv"} onClick={() => void exportRun("csv")} size="sm">Token CSV</Button>
+                </div>
+              )}
+            </div>
+            {exportError && <Callout tone="danger">{exportError}</Callout>}
+            {run?.rawEvents?.length ? <pre className="code-block event-log">{run.rawEvents.map((event) => JSON.stringify(event)).join("\n")}</pre> : <EmptyState description="Raw protocol events appear here as they arrive. Use the server export above for the complete persisted trace." icon={FileJson} title="No live events captured" />}
+          </div>
+        )
+        : <EmptyState description="Enable Nerd Mode to inspect raw protocol events and export token-level traces." icon={FileJson} title="Raw events are hidden" />;
     }
   }, [visibleTab, branching, configuration, exportError, exportRun, exporting, health, model, nerdMode, onBranchAlternative, onSelectToken, run, selected, selectedToken]);
 
   return (
     <aside className={`inspector ${open ? "open" : ""}`} aria-label="Run inspector">
-      <div className="inspector-header">
-        <div><span className="eyebrow">Observability</span><h2>Run inspector</h2></div>
-        <div className="inspector-header-actions"><span className={`run-mini-status ${run?.status ?? "idle"}`}>{run?.status ?? "no run"}</span><button aria-label="Close inspector" className="icon-button" onClick={onClose} type="button"><X size={18} /></button></div>
+      <header className="inspector-header">
+        <div className="inspector-title"><h2>Run inspector</h2>{run ? <Badge tone={runTones[run.status]}>{run.status}</Badge> : <Badge>no run</Badge>}</div>
+        <IconButton icon={<X size={16} />} label="Close inspector" onClick={onClose} />
+      </header>
+      <div className="inspector-nav">
+        <Tabs className="inspector-tabs" idPrefix="inspector" items={tabItems} label="Inspector sections" onChange={onTabChange} value={visibleTab} />
+        <div className="inspector-mobile-select">
+          <Select aria-label="Inspector section" onChange={(event) => onTabChange(event.target.value as InspectorTab)} value={visibleTab}>
+            {tabItems.map((tab) => <option disabled={tab.disabled} key={tab.id} value={tab.id}>{tab.disabled ? `${tab.label} (unavailable)` : tab.label}</option>)}
+          </Select>
+        </div>
       </div>
-      <button className="mobile-tab-select" onClick={() => setMobileTabsOpen((value) => !value)} type="button"><span>{ActiveIcon && <ActiveIcon size={15} />} {activeDefinition?.label}</span><ChevronDown size={15} /></button>
-      <div className={`inspector-tabs ${mobileTabsOpen ? "mobile-open" : ""}`} role="tablist">
-        {tabs.map((tab) => {
-          const capability = tab.capability ? capabilityOf(model, tab.capability) : null;
-          const disabled = tab.id === "timing"
-            ? !supportsGeneration(model)
-            : capability !== null && capability.state !== "full" && capability.state !== "partial";
-          const Icon = tab.icon;
-          return (
-            <button
-              aria-disabled={disabled}
-              aria-selected={visibleTab === tab.id}
-              className={`${visibleTab === tab.id ? "selected" : ""} ${disabled ? "disabled" : ""}`}
-              key={tab.id}
-              onClick={() => { if (!disabled) { onTabChange(tab.id); setMobileTabsOpen(false); } }}
-              role="tab"
-              title={disabled ? capability?.reason ?? `${tab.label} is not available for this model.` : tab.label}
-              type="button"
-            ><Icon size={15} /><span>{tab.label}</span>{disabled && <i />}</button>
-          );
-        })}
-      </div>
-      <div className="inspector-content" role="tabpanel">{panel}</div>
-      {activeCapability && activeCapability.state === "partial" && <div className="capability-footer"><Sparkles size={13} /><span>Partial support: {activeCapability.reason ?? "Some fields may be unavailable."}</span></div>}
+      <div aria-labelledby={`inspector-tab-${visibleTab}`} className="inspector-content" id="inspector-panel" role="tabpanel">{panel}</div>
+      {activeCapability && activeCapability.state === "partial" && <div className="capability-footer"><Info aria-hidden="true" size={13} /><span>Partial support: {activeCapability.reason ?? "Some fields may be unavailable."}</span></div>}
     </aside>
   );
 }

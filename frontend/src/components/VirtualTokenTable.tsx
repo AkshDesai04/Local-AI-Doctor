@@ -8,7 +8,7 @@ interface VirtualTokenTableProps {
   onSelectToken: (index: number) => void;
 }
 
-const rowHeight = 38;
+const rowHeight = 32;
 const viewportHeight = 360;
 const overscan = 6;
 
@@ -31,10 +31,10 @@ export function VirtualTokenTable({ tokens, selectedToken, onSelectToken }: Virt
     }
   }, [selectedToken, tokens]);
 
-  if (!tokens.length) return <div className="inspector-empty compact">Token events were not captured for this run.</div>;
+  if (!tokens.length) return <p className="muted card-inset">Token events were not captured for this run.</p>;
   return (
     <div className="token-table-shell">
-      <div className="token-table-header" role="row">
+      <div className="data-table-head token-table-grid" role="row">
         <span title="Generation order">#</span><span title="Human-readable token text">Piece</span><span title="Tokenizer vocabulary ID">ID</span><span title="Probability before sampling filters">Model p</span><span title="Probability after sampling filters">Sampler p</span><span title="Raw model probability rank">Rank</span><span title="Time spent decoding this token">Latency</span>
       </div>
       <div
@@ -50,7 +50,7 @@ export function VirtualTokenTable({ tokens, selectedToken, onSelectToken }: Virt
           {visible.map((token, localIndex) => (
             <button
               aria-selected={selectedToken === token.index}
-              className={`token-table-row ${selectedToken === token.index ? "selected" : ""}`}
+              className={`data-table-row token-table-grid token-table-row selectable ${selectedToken === token.index ? "selected" : ""}`}
               key={token.index}
               onClick={() => onSelectToken(token.index)}
               role="row"

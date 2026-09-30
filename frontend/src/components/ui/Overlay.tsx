@@ -70,14 +70,15 @@ interface MenuItemProps {
   danger?: boolean;
   disabled?: boolean;
   title?: string;
+  className?: string;
   children: ReactNode;
 }
 
-export function MenuItem({ onSelect, icon, danger = false, disabled = false, title, children }: MenuItemProps): React.ReactNode {
+export function MenuItem({ onSelect, icon, danger = false, disabled = false, title, className, children }: MenuItemProps): React.ReactNode {
   const close = useContext(MenuCloseContext);
   return (
     <button
-      className={`menu-item ${danger ? "danger" : ""}`}
+      className={`menu-item ${danger ? "danger" : ""} ${className ?? ""}`}
       disabled={disabled}
       onClick={() => { close(); onSelect(); }}
       role="menuitem"

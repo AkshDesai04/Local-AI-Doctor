@@ -13,6 +13,7 @@ import {
   LoaderCircle,
   GitBranch,
   RefreshCcw,
+  ScrollText,
   Sparkles,
   User,
   Video,
@@ -25,6 +26,7 @@ import { isUsable, supportsGeneration } from "../domain/capabilities";
 import { displayTokenText, formatDuration, formatNumber, formatPercent, tokenTextHint } from "../utils/format";
 import { cleanAssistantOutput, isTerminationToken, splitAssistantOutput } from "../utils/markdown";
 import { MarkdownMessage } from "./MarkdownMessage";
+import { Badge, Button, Callout, EmptyState, IconButton, Select, Textarea } from "./ui";
 
 export type NerdMetric = "rawProbability" | "samplingProbability" | "surprise" | "latency" | "reasoning";
 
@@ -322,7 +324,7 @@ function NerdResponse({
   };
   return (
     <div className={`nerd-response ${attentionActive ? "attention-active" : ""}`} aria-label={`Tokenized response colored by ${attentionActive ? "context attention" : metric}`}>
-      {attentionActive && <div className="attention-mode-banner" role="status"><Activity size={14} /><span>Attention view for token #{String(selectedToken)}. Earlier generated tokens are shaded by mean attention weight; the exact prompt and history context map is in the inspector.</span></div>}
+      {attentionActive && <Callout className="attention-mode-banner" icon={Activity} role="status">Attention view for token #{String(selectedToken)}. Earlier generated tokens are shaded by mean attention weight; the exact prompt and history context map is in the inspector.</Callout>}
       {groups.map((group, groupIndex) => group.reasoning ? (
         <details className="reasoning-disclosure nerd-reasoning-disclosure" key={`reasoning-${String(groupIndex)}`}>
           <summary className="reasoning-summary">Thinking… <small>{String(new Set(group.parts.map((part) => part.token.index)).size)} tokens</small></summary>
@@ -522,12 +524,27 @@ function MessageRow({
   };
   return (
     <article className={`message-row ${message.role} ${message.status}`}>
-      <div className="message-avatar">{message.role === "assistant" ? <Sparkles size={17} /> : message.role === "user" ? <User size={16} /> : <Bot size={16} />}</div>
+      <div aria-hidden="true" className="message-avatar">{message.role === "assistant" ? <Sparkles size={15} /> : message.role === "user" ? <User size={15} /> : <Bot size={15} />}</div>
       <div className="message-body">
-        <div className="message-label"><strong>{message.role === "assistant" ? "Local model" : message.role === "user" ? "You" : "System"}</strong>{message.status !== "complete" && <span className={`message-status ${message.status}`}>{message.status === "streaming" && <LoaderCircle className="spin" size={12} />}{message.status}</span>}{branchControl && <label className="branch-selector"><GitBranch aria-hidden="true" size={12} /><span className="visually-hidden">{branchControl.accessibleLabel}</span><select aria-label={branchControl.accessibleLabel} onChange={(event) => branchControl.onSelect(event.target.value)} value={message.id}>{branchControl.options.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>}</div>
+        <div className="message-label">
+          <strong>{message.role === "assistant" ? "Local model" : message.role === "user" ? "You" : "System"}</strong>
+          {message.status !== "complete" && <Badge className="message-status" icon={message.status === "streaming" ? <LoaderCircle className="spin" size={11} /> : undefined} tone={message.status === "failed" ? "danger" : message.status === "cancelled" ? "warning" : "accent"}>{message.status}</Badge>}
+          {branchControl && (
+            <span className="branch-selector" title={branchControl.accessibleLabel}>
+              <GitBranch aria-hidden="true" size={13} />
+              <Select aria-label={branchControl.accessibleLabel} controlSize="sm" onChange={(event) => branchControl.onSelect(event.target.value)} value={message.id} variant="ghost">{branchControl.options.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</Select>
+            </span>
+          )}
+        </div>
         <AttachmentPreview message={message} />
         {editing ? (
-          <div className="edit-message"><textarea autoFocus onChange={(event) => setDraft(event.target.value)} value={draft} /><div><button className="button secondary compact" onClick={() => { setEditing(false); setDraft(message.content); }} type="button"><X size={13} /> Cancel</button><button className="button primary compact" onClick={() => { if (draft.trim()) onBranch(draft.trim()); setEditing(false); }} type="button"><GitBranch size={13} /> Send as branch</button></div></div>
+          <div className="edit-message">
+            <Textarea aria-label="Edit message" autoFocus onChange={(event) => setDraft(event.target.value)} rows={4} value={draft} />
+            <div className="edit-message-actions">
+              <Button icon={<X size={13} />} onClick={() => { setEditing(false); setDraft(message.content); }} size="sm" variant="ghost">Cancel</Button>
+              <Button icon={<GitBranch size={13} />} onClick={() => { if (draft.trim()) onBranch(draft.trim()); setEditing(false); }} size="sm" variant="primary">Send as branch</Button>
+            </div>
+          </div>
         ) : tokenized ? (
           <NerdResponse metric={nerdMetric} onOpenInspector={onOpenInspector} onSelectToken={onSelectToken} reasoningPrimed={reasoningPrimed} selectedToken={selectedToken} tokens={run?.tokens ?? []} />
         ) : rawNerdFallback ? (
@@ -536,19 +553,19 @@ function MessageRow({
           <div className="message-content"><MarkdownMessage assistant={message.role === "assistant"} content={message.content} reasoningPrimed={reasoningPrimed} />{message.status === "streaming" && <span className="stream-caret" />}</div>
         )}
         {endedWithoutAnswer && (
-          <div className="assistant-output-warning" role="status">
+          <Callout className="assistant-output-warning" role="status" tone="warning">
             {runMatchesMessage && run?.metrics?.finishReason === "length"
               ? "No final answer: this response reached its token limit. Increase Max tokens and regenerate."
               : "No final answer was produced. Regenerate the response to try again."}
-          </div>
+          </Callout>
         )}
-        {message.error && <div className="message-error">{message.error}</div>}
+        {message.error && <Callout className="message-error" role="note" tone="danger">{message.error}</Callout>}
         <div className="message-actions">
-          <button aria-label="Copy message" onClick={copy} title="Copy" type="button">{copied ? <Check size={14} /> : <Copy size={14} />}</button>
-          {message.role === "user" && <button aria-label="Edit and retry" onClick={() => setEditing(true)} title="Edit and retry" type="button"><Edit3 size={14} /></button>}
-          {message.role === "assistant" && <button aria-label="Regenerate response" disabled={message.status !== "complete" || !message.runId} onClick={onRetry} title={message.status !== "complete" ? "Only completed runs can be replayed" : message.runId ? "Replay this run" : "No persisted run is attached"} type="button"><RefreshCcw size={14} /></button>}
-          <button aria-label="Branch from message" onClick={() => setEditing(true)} title="Branch" type="button"><GitBranch size={14} /></button>
-          {message.runId && <button aria-label="Open response details" onClick={() => { onInspectRun(message.runId ?? ""); onOpenInspector(); }} title="Response details" type="button"><Activity size={14} /> Details</button>}
+          <IconButton icon={copied ? <Check size={14} /> : <Copy size={14} />} label="Copy message" onClick={copy} size="sm" title={copied ? "Copied" : "Copy"} />
+          {message.role === "user" && <IconButton icon={<Edit3 size={14} />} label="Edit and retry" onClick={() => setEditing(true)} size="sm" />}
+          {message.role === "assistant" && <IconButton disabled={message.status !== "complete" || !message.runId} icon={<RefreshCcw size={14} />} label="Regenerate response" onClick={onRetry} size="sm" title={message.status !== "complete" ? "Only completed runs can be replayed" : message.runId ? "Replay this run" : "No persisted run is attached"} />}
+          <IconButton icon={<GitBranch size={14} />} label="Branch from message" onClick={() => setEditing(true)} size="sm" title="Branch" />
+          {message.runId && <Button aria-label="Open response details" icon={<Activity size={14} />} onClick={() => { onInspectRun(message.runId ?? ""); onOpenInspector(); }} size="sm" title="Response details" variant="ghost">Details</Button>}
         </div>
       </div>
     </article>
@@ -556,11 +573,25 @@ function MessageRow({
 }
 
 function EmptyChat({ connected, booting, model, onNavigate }: { connected: boolean; booting: boolean; model: ModelSummary | null; onNavigate: (view: "embeddings" | "models") => void }): React.ReactNode {
-  if (booting) return <div className="chat-empty"><LoaderCircle className="spin" size={24} /><h1>Connecting to your local workbench</h1><p>Reading model capabilities and saved conversations…</p></div>;
-  if (!connected) return <div className="chat-empty offline-empty"><div className="empty-orbit"><Database size={23} /></div><span className="eyebrow">Local only</span><h1>The backend is offline</h1><p>Start the local service to discover models and restore persisted chats. This interface will not fall back to a remote inference provider.</p><code>python -m local_ai_doctor</code></div>;
-  if (!model) return <div className="chat-empty"><div className="empty-orbit"><Database size={23} /></div><span className="eyebrow">Model registry is empty</span><h1>Add a local model to begin</h1><p>Configure a read-only model root, then rescan it. Unsupported folders remain visible with actionable diagnostics.</p><button className="button primary" onClick={() => onNavigate("models")} type="button">Open model registry</button></div>;
-  if (!supportsGeneration(model) && isUsable(model, "embeddings")) return <div className="chat-empty"><div className="empty-orbit"><Boxes size={23} /></div><span className="eyebrow">Embedding model selected</span><h1>This model maps meaning, not words</h1><p>Use the embeddings workspace for vectors, similarity, nearest neighbors, and projections.</p><button className="button primary" onClick={() => onNavigate("embeddings")} type="button">Open embeddings</button></div>;
-  return <div className="chat-empty welcome-empty"><div className="empty-orbit"><Sparkles size={23} /></div><span className="eyebrow">Local · private · observable</span><h1>What should we inspect?</h1><p>Every run can preserve exact token probabilities, timing, context use, and reproducibility details—when the model and selected instrumentation expose them.</p><div className="prompt-suggestions"><span>Try a short prompt to establish a baseline</span><span>Set a seed, then compare two sampling runs</span><span>Enable Nerd Mode to inspect token boundaries</span></div></div>;
+  if (booting) return <EmptyState className="chat-empty booting" description="Reading model capabilities and saved conversations…" headingLevel={1} icon={LoaderCircle} size="page" title="Connecting to your local workbench" />;
+  if (!connected) {
+    return (
+      <EmptyState className="chat-empty" description="Start the local service to discover models and restore persisted chats. This interface will not fall back to a remote inference provider." eyebrow="Local only" headingLevel={1} icon={Database} size="page" title="The backend is offline">
+        <code className="empty-command">python -m local_ai_doctor</code>
+      </EmptyState>
+    );
+  }
+  if (!model) return <EmptyState actions={<Button onClick={() => onNavigate("models")} variant="primary">Open model registry</Button>} className="chat-empty" description="Configure a read-only model root, then rescan it. Unsupported folders remain visible with actionable diagnostics." eyebrow="Model registry is empty" headingLevel={1} icon={Database} size="page" title="Add a local model to begin" />;
+  if (!supportsGeneration(model) && isUsable(model, "embeddings")) return <EmptyState actions={<Button onClick={() => onNavigate("embeddings")} variant="primary">Open embeddings</Button>} className="chat-empty" description="Use the embeddings workspace for vectors, similarity, nearest neighbors, and projections." eyebrow="Embedding model selected" headingLevel={1} icon={Boxes} size="page" title="This model maps meaning, not words" />;
+  return (
+    <EmptyState className="chat-empty" description="Every run can preserve exact token probabilities, timing, context use, and reproducibility details—when the model and selected instrumentation expose them." eyebrow="Local · private · observable" headingLevel={1} icon={Sparkles} size="page" title="What should we inspect?">
+      <ul className="prompt-suggestions">
+        <li>Try a short prompt to establish a baseline</li>
+        <li>Set a seed, then compare two sampling runs</li>
+        <li>Enable Nerd Mode to inspect token boundaries</li>
+      </ul>
+    </EmptyState>
+  );
 }
 
 export function ChatView({
@@ -649,17 +680,26 @@ export function ChatView({
     <div className="chat-view">
       {nerdMode && (
         <div className="nerd-toolbar">
-          <div><Bug size={14} /><strong>Nerd Mode</strong><span>Token boundaries are visible. Color is reinforced by index and segment markers.</span></div>
-          <label>Color by <select onChange={(event) => onNerdMetricChange(event.target.value as NerdMetric)} value={nerdMetric}><option value="rawProbability">Raw probability</option><option value="samplingProbability">Sampler probability</option><option value="surprise">Surprise</option><option value="latency">Decode latency</option><option value="reasoning">Reasoning segment</option></select></label>
+          <div className="nerd-toolbar-copy"><Bug aria-hidden="true" size={14} /><strong>Nerd Mode</strong><span>Token boundaries are visible. Color is reinforced by index and segment markers.</span></div>
+          <label className="nerd-toolbar-metric">
+            <span>Color by</span>
+            <Select controlSize="sm" onChange={(event) => onNerdMetricChange(event.target.value as NerdMetric)} value={nerdMetric}>
+              <option value="rawProbability">Raw probability</option>
+              <option value="samplingProbability">Sampler probability</option>
+              <option value="surprise">Surprise</option>
+              <option value="latency">Decode latency</option>
+              <option value="reasoning">Reasoning segment</option>
+            </Select>
+          </label>
         </div>
       )}
       <div className="messages-scroll">
-        {messagesLoading ? <div className="messages-loading"><LoaderCircle className="spin" size={20} /> Loading conversation…</div> : messages.length === 0 ? <EmptyChat booting={booting} connected={connected} model={model} onNavigate={onNavigate} /> : (
+        {messagesLoading ? <div className="messages-loading"><LoaderCircle className="spin" size={18} /> Loading conversation…</div> : messages.length === 0 ? <EmptyChat booting={booting} connected={connected} model={model} onNavigate={onNavigate} /> : (
           <div className="messages-list">
             {systemPrompt.trim() && (
-              <details className="reasoning-disclosure system-prompt-card">
-                <summary className="reasoning-summary">System prompt<small>applies to every response in this chat</small></summary>
-                <div className="reasoning-content"><pre className="nerd-raw-fallback">{systemPrompt}</pre></div>
+              <details className="card system-prompt-card">
+                <summary className="system-prompt-summary"><ScrollText aria-hidden="true" size={14} />System prompt<small>applies to every response in this chat</small></summary>
+                <p className="system-prompt-text">{systemPrompt}</p>
               </details>
             )}
             {lineage.map(({ message, parentKey, siblings }, index) => (
@@ -692,7 +732,11 @@ export function ChatView({
             ))}
             {runSummary && (
               <button className="run-summary-strip" onClick={onOpenInspector} title="Open the live run inspector for timing, probability, hardware, and token telemetry" type="button">
-                <span><Eye size={14} /> Inspect run</span><span>{String(runSummary.tokens)} tokens</span><span>{runSummary.tps === undefined ? "TPS —" : `${formatNumber(runSummary.tps, 2)} tok/s`}</span><span>{runSummary.perplexity === undefined ? "PPL —" : `PPL ${formatNumber(runSummary.perplexity, 3)}`}</span><span className={`stream-indicator ${displayedRunIsActive && streamConnected ? "connected" : ""}`}>{displayedRunIsActive ? `${run?.status ?? "running"} · ${streamConnected ? "live" : "reconnecting"}` : run?.status}</span>
+                <span className="run-summary-label"><Eye aria-hidden="true" size={14} /> Inspect run</span>
+                <span className="run-summary-stat">{String(runSummary.tokens)} tokens</span>
+                <span className="run-summary-stat">{runSummary.tps === undefined ? "TPS —" : `${formatNumber(runSummary.tps, 2)} tok/s`}</span>
+                <span className="run-summary-stat">{runSummary.perplexity === undefined ? "PPL —" : `PPL ${formatNumber(runSummary.perplexity, 3)}`}</span>
+                <span className={`stream-indicator ${run?.status ?? ""} ${displayedRunIsActive && streamConnected ? "connected" : ""}`}>{displayedRunIsActive ? `${run?.status ?? "running"} · ${streamConnected ? "live" : "reconnecting"}` : run?.status}</span>
               </button>
             )}
             <div ref={bottom} />

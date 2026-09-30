@@ -167,8 +167,9 @@ describe("alternative-token branching", () => {
     const prior = screen.getByRole("button", { name: /prior, mean attention 30%/i });
     await user.click(prior);
     expect(onSelectToken).toHaveBeenCalledWith(0);
-    expect(screen.getByRole("note")).toHaveTextContent("not causal contribution scores");
-    expect(screen.getByRole("note")).toHaveTextContent("do not prove grounding or hallucination");
+    const caveat = screen.getByRole("note", { name: "Attention caveat" });
+    expect(caveat).toHaveTextContent("not causal contribution scores");
+    expect(caveat).toHaveTextContent("do not prove grounding or hallucination");
   });
 
   it("falls back to the overview instead of rendering a capability-disabled tab", () => {

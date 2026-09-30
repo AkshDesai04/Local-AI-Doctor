@@ -80,12 +80,12 @@ describe("prompt controls", () => {
 
     await user.click(screen.getByRole("button", { name: "Prompt controls" }));
 
-    expect(screen.getByRole("checkbox", { name: "Reason before answering" })).toBeChecked();
+    expect(screen.getByRole("switch", { name: "Reason before answering" })).toBeChecked();
     expect(screen.getByRole("slider", { name: "Temperature" })).toHaveValue("0.7");
     expect(screen.getByRole("slider", { name: "Top K" })).toHaveValue("50");
     expect(screen.getByRole("slider", { name: "Top P" })).toHaveValue("0.95");
 
-    await user.click(screen.getByRole("checkbox", { name: "Reason before answering" }));
+    await user.click(screen.getByRole("switch", { name: "Reason before answering" }));
     fireEvent.change(screen.getByRole("slider", { name: "Temperature" }), { target: { value: "1.25" } });
 
     const reasoningUpdate = onSettingsChange.mock.calls[0]?.[0] as (current: GenerationSettings) => GenerationSettings;
@@ -172,7 +172,7 @@ describe("prompt controls", () => {
     );
 
     await user.click(screen.getByRole("button", { name: "Prompt controls" }));
-    expect(screen.getByRole("checkbox", { name: "Reason before answering" })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "Reason before answering" })).toBeDisabled();
     expect(screen.getByTitle("Sampling settings for the next response")).toHaveTextContent("Reasoning unavailable");
   });
 

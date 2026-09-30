@@ -9,6 +9,7 @@ import { Inspector, type InspectorTab } from "./components/Inspector";
 import { ModelRegistry } from "./components/ModelRegistry";
 import { Sidebar, type WorkspaceView } from "./components/Sidebar";
 import { WorkbenchHeader } from "./components/WorkbenchHeader";
+import { IconButton } from "./components/ui";
 import { AUTH_CHANGED_EVENT, AUTH_REQUIRED_EVENT } from "./api/auth";
 import { isUsable } from "./domain/capabilities";
 import { useWorkbench } from "./hooks/useWorkbench";
@@ -96,9 +97,12 @@ export default function App(): React.ReactNode {
       <section className={`workbench-frame ${inspectorOpen ? "inspector-visible" : ""}`}>
         <WorkbenchHeader
           connected={workbench.connected}
+          controlsOpen={controlsOpen}
           inspectorOpen={inspectorOpen}
+          loadOptions={workbench.settings}
           models={workbench.models}
           nerdMode={nerdMode}
+          onOpenRegistry={() => setView("models")}
           onOpenSidebar={() => setSidebarOpen(true)}
           onRefresh={() => void workbench.refreshModels()}
           onSelectModel={workbench.setSelectedModelId}
@@ -138,8 +142,16 @@ export default function App(): React.ReactNode {
                   attachments={workbench.attachments}
                   busy={workbench.branching}
                   connected={workbench.connected}
+                  contextMeter={(
+                    <ContextMeter
+                      context={workbench.selectedRun?.metrics?.context}
+                      fallbackLimit={workbench.selectedModel?.effectiveContextLimit ?? null}
+                      onOpen={() => { setInspectorTab("context"); setInspectorOpen(true); }}
+                    />
+                  )}
                   model={workbench.selectedModel}
                   onAttach={(file) => void workbench.addAttachment(file)}
+                  onOpenControls={() => setControlsOpen(true)}
                   onRemoveAttachment={workbench.removeAttachment}
                   onSettingsChange={workbench.setSettings}
                   onStop={() => void workbench.stop()}
@@ -170,13 +182,6 @@ export default function App(): React.ReactNode {
                 onToggleLoaded={(model) => void workbench.toggleModelLoaded(model)}
               />
             )}
-            {view === "chat" && (
-              <ContextMeter
-                context={workbench.selectedRun?.metrics?.context}
-                fallbackLimit={workbench.selectedModel?.effectiveContextLimit ?? null}
-                onOpen={() => { setInspectorTab("context"); setInspectorOpen(true); }}
-              />
-            )}
           </div>
           <Inspector
             activeTab={inspectorTab}
@@ -205,10 +210,10 @@ export default function App(): React.ReactNode {
         />
       </section>
       {workbench.error && (
-        <div className="toast error" role="alert"><AlertTriangle size={17} /><span>{workbench.error}</span><button aria-label="Dismiss error" onClick={() => workbench.setError(null)} type="button"><X size={15} /></button></div>
+        <div className="toast error" role="alert"><AlertTriangle size={16} /><span>{workbench.error}</span><IconButton icon={<X size={14} />} label="Dismiss error" onClick={() => workbench.setError(null)} size="sm" /></div>
       )}
       {workbench.notice && !workbench.error && (
-        <div className="toast notice" role="status"><CheckCircle2 size={17} /><span>{workbench.notice}</span></div>
+        <div className="toast notice" role="status"><CheckCircle2 size={16} /><span>{workbench.notice}</span></div>
       )}
     </div>
   );

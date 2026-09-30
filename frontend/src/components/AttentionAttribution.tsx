@@ -1,6 +1,7 @@
-import { Eye, Info } from "lucide-react";
+import { Eye } from "lucide-react";
 import type { AttentionAttribution, AttentionContextToken, AttentionSourceToken } from "../api/types";
 import { displayTokenText, formatNumber, formatPercent, tokenTextHint } from "../utils/format";
+import { Callout } from "./ui";
 
 interface AttentionAttributionViewProps {
   attribution: AttentionAttribution | undefined;
@@ -99,7 +100,7 @@ export function AttentionAttributionView({ attribution, contextTokens, targetTok
   if (!attribution) {
     return (
       <section className="attention-attribution empty" aria-label="Context attention">
-        <div className="attention-attribution-title"><Eye size={15} /><div><strong>Context attention</strong><span>Not captured for this token</span></div></div>
+        <div className="attention-attribution-title"><Eye aria-hidden="true" size={15} /><div><strong>Context attention</strong><span>Not captured for this token</span></div></div>
         <p>Generate with Full or Expert instrumentation to capture an attention map.</p>
       </section>
     );
@@ -155,7 +156,7 @@ export function AttentionAttributionView({ attribution, contextTokens, targetTok
         <div><dt>Aggregation</dt><dd>{humanize(attribution.aggregation)}</dd></div>
         <div><dt>Omitted mass</dt><dd>{formatPercent(attribution.omittedWeight, 3)}</dd></div>
       </dl>
-      <div className="attention-caveat" role="note"><Info size={15} /><span>These are exact post-softmax self-attention weights averaged across the captured layers and heads. The row belongs to the prediction step, not to one vocabulary choice: the same prefix has the same map whichever candidate is sampled. The weights are <strong>not causal contribution scores</strong> and do not prove grounding or hallucination; residual paths, value vectors, MLPs, and later layers also shape the selected token.</span></div>
+      <Callout aria-label="Attention caveat" className="attention-caveat">These are exact post-softmax self-attention weights averaged across the captured layers and heads. The row belongs to the prediction step, not to one vocabulary choice: the same prefix has the same map whichever candidate is sampled. The weights are <strong>not causal contribution scores</strong> and do not prove grounding or hallucination; residual paths, value vectors, MLPs, and later layers also shape the selected token.</Callout>
     </section>
   );
 }

@@ -7,6 +7,7 @@ import "./styles/tokens.css";
 import "./styles/base.css";
 import "./styles.css";
 import "./styles/components.css";
+import "./styles/views.css";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Application root was not found.");
