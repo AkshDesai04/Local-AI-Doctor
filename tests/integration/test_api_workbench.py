@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from collections import OrderedDict
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
@@ -141,7 +142,9 @@ def test_model_root_settings_require_an_unloaded_worker(
 ) -> None:
     services = api_client.app.state.services
     before = api_user_config_path.read_bytes()
-    monkeypatch.setattr(services.worker, "_loaded", {"model_id": "still-in-vram"})
+    monkeypatch.setattr(
+        services.worker, "_resident", OrderedDict(k={"model_key": "k", "model_id": "still-in-vram"})
+    )
 
     response = api_client.put(
         "/api/v1/configuration/model-roots",
@@ -728,7 +731,11 @@ def test_resource_and_conflict_errors_use_the_error_envelope(
     )
     error_of(too_many, 413, "limit_exceeded")
 
-    monkeypatch.setattr(services.worker, "_loaded", {"model_id": "some-other-model"})
+    monkeypatch.setattr(
+        services.worker,
+        "_resident",
+        OrderedDict(k={"model_key": "k", "model_id": "some-other-model"}),
+    )
     other = api_client.post(f"/api/v1/models/{model_id}/unload", headers=API_HEADERS)
     error_of(other, 409, "model_not_loaded")
 

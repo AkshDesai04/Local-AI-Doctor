@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, Mapping
 from pathlib import Path
 from types import SimpleNamespace
@@ -206,26 +207,63 @@ def test_run_manager_close_cancels_waiters_before_active_run_releases() -> None:
 def test_supervisor_run_scoped_cancel_does_not_interrupt_a_different_run() -> None:
     supervisor = ModelWorkerSupervisor.__new__(ModelWorkerSupervisor)
     supervisor._cancel_event = SimpleNamespace(set=lambda: setattr(supervisor, "event_set", True))
+    sent: list[dict[str, Any]] = []
+    supervisor._commands = SimpleNamespace(put_nowait=sent.append)
     supervisor._cancelled_run_ids = set()
-    supervisor._active_run_id = "active"
+    supervisor._active_run_ids = {"active", "other"}
     supervisor.event_set = False
 
     supervisor.cancel("waiting")
-    assert supervisor.event_set is False
+    assert sent == []
     assert supervisor._cancelled_run_ids == {"waiting"}
 
     supervisor.cancel("active")
-    assert supervisor.event_set is True
+    assert sent == [{"op": "cancel", "run_id": "active"}]
+    assert supervisor.event_set is False
     assert supervisor._cancelled_run_ids == {"waiting", "active"}
 
+    supervisor.cancel()
+    assert supervisor.event_set is True
 
-def test_supervisor_load_cache_is_bound_to_model_identity_and_runtime(
+
+def test_supervisor_cancel_falls_back_to_the_shared_event_when_the_queue_is_full() -> None:
+    import queue
+
+    supervisor = ModelWorkerSupervisor.__new__(ModelWorkerSupervisor)
+    supervisor._cancel_event = SimpleNamespace(set=lambda: setattr(supervisor, "event_set", True))
+
+    def full(_command: object) -> None:
+        raise queue.Full
+
+    supervisor._commands = SimpleNamespace(put_nowait=full)
+    supervisor._cancelled_run_ids = set()
+    supervisor._active_run_ids = {"active"}
+    supervisor.event_set = False
+
+    supervisor.cancel("active")
+
+    assert supervisor.event_set is True
+
+
+def _descriptor(model_id: str = "stable-model-id") -> Any:
+    return SimpleNamespace(
+        id=model_id,
+        display_name=f"Model {model_id}",
+        path=Path("model"),
+        task=SimpleNamespace(value="text_generation"),
+        model_type="test",
+        effective_context_limit=1024,
+        fingerprint=SimpleNamespace(value="a" * 64),
+        trust_decision=TrustDecision.BUILTIN_ONLY,
+    )
+
+
+def test_supervisor_tracks_residents_by_key_most_recently_used_last(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
         supervisor = ModelWorkerSupervisor.__new__(ModelWorkerSupervisor)
-        supervisor._loaded = None
-        supervisor._loaded_request = None
+        supervisor._resident = OrderedDict()
         supervisor._process = SimpleNamespace(is_alive=lambda: True)
         requests: list[dict[str, Any]] = []
 
@@ -235,57 +273,78 @@ def test_supervisor_load_cache_is_bound_to_model_identity_and_runtime(
             assert timeout_seconds == 30.0
             request = dict(command)
             requests.append(request)
-            model = request["model"]
-            runtime = request["runtime"]
+            if request["op"] == "unload":
+                return {"unloaded_model_keys": [request["model_key"]]}
             return {
-                "model_id": model["id"],
-                "task": model["task"],
-                "device": runtime["device"],
-                "dtype": runtime["dtype"],
+                "model_id": request["model"]["id"],
+                "task": request["model"]["task"],
+                "device": request["runtime"]["device"],
+                "dtype": request["runtime"]["dtype"],
+                "model_key": request["model_key"],
             }
 
         monkeypatch.setattr(supervisor, "_request", fake_request)
-        first_descriptor = SimpleNamespace(
-            id="stable-model-id",
-            display_name="Model",
-            path=Path("model"),
-            task=SimpleNamespace(value="text_generation"),
-            model_type="test",
-            effective_context_limit=1024,
-            fingerprint=SimpleNamespace(value="a" * 64),
-            trust_decision=TrustDecision.BUILTIN_ONLY,
-        )
-        runtime = {
-            "device": "cuda:0",
-            "dtype": "bfloat16",
-            "cpu_threads": 4,
-            "attention_backend": "sdpa",
-        }
+        runtime = {"device": "cuda:0", "dtype": "bfloat16"}
 
-        await supervisor.load_model(first_descriptor, runtime, timeout_seconds=30.0)
-        await supervisor.load_model(first_descriptor, dict(runtime), timeout_seconds=30.0)
-        assert len(requests) == 1
+        await supervisor.load_model(_descriptor("a"), runtime, model_key="ka", timeout_seconds=30.0)
+        await supervisor.load_model(_descriptor("b"), runtime, model_key="kb", timeout_seconds=30.0)
+        assert [entry["model_key"] for entry in supervisor.resident] == ["ka", "kb"]
+        assert requests[0]["model_key"] == "ka"
+        assert supervisor.loaded is not None and supervisor.loaded["model_id"] == "b"
 
+        supervisor.touch("ka")
+        assert [entry["model_key"] for entry in supervisor.resident] == ["kb", "ka"]
+        assert supervisor.loaded is not None and supervisor.loaded["model_id"] == "a"
+
+        # Reloading a key replaces only that entry.
         await supervisor.load_model(
-            first_descriptor,
-            {**runtime, "dtype": "float32"},
-            timeout_seconds=30.0,
+            _descriptor("b"), {**runtime, "dtype": "float32"}, model_key="kb", timeout_seconds=30.0
         )
-        assert len(requests) == 2
+        assert [entry["model_key"] for entry in supervisor.resident] == ["ka", "kb"]
+        assert supervisor.resident[-1]["dtype"] == "float32"
 
-        changed_checkpoint = SimpleNamespace(
-            **{
-                **vars(first_descriptor),
-                "fingerprint": SimpleNamespace(value="b" * 64),
-            }
-        )
-        await supervisor.load_model(
-            changed_checkpoint,
-            {**runtime, "dtype": "float32"},
-            timeout_seconds=30.0,
-        )
-        assert len(requests) == 3
-        assert requests[-1]["model"]["fingerprint"] == "b" * 64
+        await supervisor.unload(model_key="ka", timeout_seconds=30.0)
+        assert [entry["model_key"] for entry in supervisor.resident] == ["kb"]
+
+    asyncio.run(scenario())
+
+
+def test_supervisor_rejects_a_worker_that_loaded_another_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        supervisor = ModelWorkerSupervisor.__new__(ModelWorkerSupervisor)
+        supervisor._resident = OrderedDict()
+
+        async def fake_request(command: Mapping[str, Any], _timeout: float) -> dict[str, Any]:
+            return {"model_id": "a", "task": "text_generation", "model_key": "other"}
+
+        monkeypatch.setattr(supervisor, "_request", fake_request)
+        with pytest.raises(WorkerFailure) as caught:
+            await supervisor.load_model(_descriptor("a"), {}, model_key="ka", timeout_seconds=1.0)
+        assert caught.value.error["code"] == "model_worker_state_mismatch"
+        assert supervisor.resident == []
+
+    asyncio.run(scenario())
+
+
+def test_supervisor_resident_map_clears_when_the_worker_dies() -> None:
+    async def scenario() -> None:
+        dead = SimpleNamespace(is_alive=lambda: False, exitcode=1)
+        supervisor = ModelWorkerSupervisor.__new__(ModelWorkerSupervisor)
+        supervisor._stopping = False
+        supervisor._process = dead
+        supervisor._resident = OrderedDict(ka={"model_key": "ka", "model_id": "a"})
+        supervisor._ledger = {"device": "cuda:0"}
+        supervisor._ledger_at = 0.0
+        supervisor._reply_futures = {}
+        supervisor._run_queues = {}
+
+        await supervisor._monitor(dead)
+
+        assert supervisor.resident == []
+        assert supervisor.loaded is None
+        assert supervisor.ledger is None
 
     asyncio.run(scenario())
 
@@ -346,8 +405,7 @@ def test_supervisor_timeout_replacement_is_atomic_and_ignores_stale_recyclers(
         supervisor._restart_lock = asyncio.Lock()
         supervisor._stopping = False
         supervisor._process = failed
-        supervisor._loaded = {"model_id": "old"}
-        supervisor._loaded_request = {"model": "old"}
+        supervisor._resident = OrderedDict(old={"model_id": "old"})
         supervisor._cancel_event = SimpleNamespace(set=lambda: None)
         pending: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         run_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
@@ -372,8 +430,7 @@ def test_supervisor_timeout_replacement_is_atomic_and_ignores_stale_recyclers(
         assert failed.terminated is True
         assert retired is True
         assert supervisor._process is replacement
-        assert supervisor._loaded is None
-        assert supervisor._loaded_request is None
+        assert supervisor.resident == []
         assert pending.result()["error"] == error
         assert run_queue.get_nowait()["event_type"] == "error"
 
@@ -395,8 +452,7 @@ def test_generation_timeout_recycles_worker_and_cleans_registered_channels(
         supervisor._commands = SimpleNamespace(put=lambda *_args: None)
         supervisor._cancel_event = cancel_event
         supervisor._cancelled_run_ids = set()
-        supervisor._run_lock = asyncio.Lock()
-        supervisor._active_run_id = None
+        supervisor._active_run_ids = set()
         supervisor._reply_futures = {}
         supervisor._run_queues = {}
         observed: list[tuple[object, dict[str, Any]]] = []
@@ -424,34 +480,28 @@ def test_generation_timeout_recycles_worker_and_cleans_registered_channels(
         assert observed == [(process, caught.value.error)]
         assert supervisor._reply_futures == {}
         assert supervisor._run_queues == {}
-        assert supervisor._active_run_id is None
+        assert supervisor._active_run_ids == set()
 
     asyncio.run(scenario())
 
 
 def _streaming_supervisor() -> tuple[ModelWorkerSupervisor, list[str | None]]:
-    """A supervisor whose fake worker acknowledges a cancel request at once."""
+    """A supervisor whose fake worker acknowledges a cancel command at once."""
 
     supervisor = ModelWorkerSupervisor.__new__(ModelWorkerSupervisor)
     cancel_requests: list[str | None] = []
 
-    class CancelEvent:
-        @staticmethod
-        def clear() -> None:
-            return None
-
-        @staticmethod
-        def set() -> None:
-            cancel_requests.append(supervisor._active_run_id)
-            for future in supervisor._reply_futures.values():
-                future.set_result({"ok": True})
+    def cancel_command(command: dict[str, Any]) -> None:
+        assert command["op"] == "cancel"
+        cancel_requests.append(command["run_id"])
+        for future in supervisor._reply_futures.values():
+            future.set_result({"ok": True})
 
     supervisor._process = SimpleNamespace(is_alive=lambda: True)
-    supervisor._commands = SimpleNamespace(put=lambda *_args: None)
-    supervisor._cancel_event = CancelEvent()
+    supervisor._commands = SimpleNamespace(put=lambda *_args: None, put_nowait=cancel_command)
+    supervisor._cancel_event = SimpleNamespace(clear=lambda: None, set=lambda: None)
     supervisor._cancelled_run_ids = set()
-    supervisor._run_lock = asyncio.Lock()
-    supervisor._active_run_id = None
+    supervisor._active_run_ids = set()
     supervisor._reply_futures = {}
     supervisor._run_queues = {}
     return supervisor, cancel_requests
@@ -469,7 +519,9 @@ async def _open_stream_with_one_event(
             supervisor._run_queues["run"].put_nowait, {"event_type": event_type, "payload": {}}
         )
 
-    supervisor._commands = SimpleNamespace(put=worker_receives_command)
+    supervisor._commands = SimpleNamespace(
+        put=worker_receives_command, put_nowait=supervisor._commands.put_nowait
+    )
     stream = supervisor.generate(
         run_id="run",
         messages=[{"role": "user", "content": "hello"}],
@@ -501,8 +553,7 @@ def test_abandoned_generation_stream_cancels_the_worker(abandon: str) -> None:
         assert cancel_requests == ["run"]
         assert supervisor._reply_futures == {}
         assert supervisor._run_queues == {}
-        assert supervisor._active_run_id is None
-        assert not supervisor._run_lock.locked()
+        assert supervisor._active_run_ids == set()
 
     asyncio.run(scenario())
 
@@ -515,7 +566,19 @@ def test_generation_stream_closed_after_terminal_event_does_not_cancel() -> None
         await stream.aclose()
 
         assert cancel_requests == []
-        assert supervisor._active_run_id is None
+        assert supervisor._active_run_ids == set()
+
+
+def test_a_run_cancelled_before_it_reached_the_worker_is_cancelled_right_after_it() -> None:
+    async def scenario() -> None:
+        supervisor, cancel_requests = _streaming_supervisor()
+        supervisor._cancelled_run_ids.add("run")
+        stream = await _open_stream_with_one_event(supervisor, "cancelled")
+
+        await stream.aclose()
+
+        assert cancel_requests == ["run"]
+        assert supervisor._cancelled_run_ids == set()
 
     asyncio.run(scenario())
 
@@ -547,8 +610,7 @@ def test_supervisor_fails_closed_when_a_timed_out_process_cannot_be_killed() -> 
         supervisor._stopping = False
         supervisor._poisoned = False
         supervisor._process = process
-        supervisor._loaded = {"model_id": "unsafe"}
-        supervisor._loaded_request = {"model": "unsafe"}
+        supervisor._resident = OrderedDict(unsafe={"model_id": "unsafe"})
         supervisor._cancel_event = SimpleNamespace(set=lambda: None)
         supervisor._reply_futures = {}
         supervisor._run_queues = {}
@@ -560,7 +622,7 @@ def test_supervisor_fails_closed_when_a_timed_out_process_cannot_be_killed() -> 
 
         assert caught.value.error["code"] == "model_worker_recycle_failed"
         assert supervisor.available is False
-        assert supervisor._loaded is None
+        assert supervisor.loaded is None
         with pytest.raises(WorkerFailure) as retry:
             await supervisor.start()
         assert retry.value.error["code"] == "model_worker_recycle_failed"

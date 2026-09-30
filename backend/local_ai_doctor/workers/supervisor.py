@@ -6,8 +6,11 @@ import asyncio
 import contextlib
 import multiprocessing as mp
 import queue
+import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 from ..domain.capabilities import Capability, CapabilityState
@@ -72,11 +75,13 @@ class ModelWorkerSupervisor:
         self._monitor_task: asyncio.Task[None] | None = None
         self._reply_futures: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._run_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
-        self._loaded: dict[str, Any] | None = None
-        self._loaded_request: dict[str, Any] | None = None
-        self._run_lock = asyncio.Lock()
-        self._active_run_id: str | None = None
+        # Mirrors the worker's residents, most recently used last. It is cleared
+        # whenever the worker process is replaced, because its models die with it.
+        self._resident: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._active_run_ids: set[str] = set()
         self._cancelled_run_ids: set[str] = set()
+        self._ledger: dict[str, Any] | None = None
+        self._ledger_at: float | None = None
         self._stopping = False
 
     def _build_worker(self) -> None:
@@ -95,7 +100,43 @@ class ModelWorkerSupervisor:
 
     @property
     def loaded(self) -> dict[str, Any] | None:
-        return dict(self._loaded) if self._loaded else None
+        """The most recently used resident, or None."""
+
+        if not self._resident:
+            return None
+        return dict(next(reversed(self._resident.values())))
+
+    @property
+    def resident(self) -> list[dict[str, Any]]:
+        """Every resident model, most recently used last."""
+
+        return [dict(entry) for entry in self._resident.values()]
+
+    @property
+    def ledger(self) -> dict[str, Any] | None:
+        return dict(self._ledger) if self._ledger is not None else None
+
+    @property
+    def ledger_age_seconds(self) -> float | None:
+        return None if self._ledger_at is None else time.monotonic() - self._ledger_at
+
+    def touch(self, model_key: str) -> None:
+        """Mark a resident as just used, so least-recently-used eviction skips it."""
+
+        entry = self._resident.get(model_key)
+        if entry is not None:
+            entry["last_used_at"] = datetime.now(UTC).isoformat()
+            self._resident.move_to_end(model_key)
+
+    def _forget_residents(self) -> None:
+        self._resident.clear()
+        self._ledger = None
+        self._ledger_at = None
+
+    def _note_ledger(self, payload: Any) -> None:
+        if isinstance(payload, Mapping) and isinstance(payload.get("ledger"), Mapping):
+            self._ledger = dict(payload["ledger"])
+            self._ledger_at = time.monotonic()
 
     @property
     def alive(self) -> bool:
@@ -149,6 +190,7 @@ class ModelWorkerSupervisor:
                 self._build_worker()
             ready_event = asyncio.Event()
             self._ready_event = ready_event
+            self._forget_residents()
             self._process.start()
             output = self._output
             process = self._process
@@ -253,8 +295,7 @@ class ModelWorkerSupervisor:
                 with contextlib.suppress(asyncio.QueueFull):
                     run_queue.put_nowait(terminal)
 
-            self._loaded = None
-            self._loaded_request = None
+            self._forget_residents()
             with contextlib.suppress(Exception):
                 self._cancel_event.set()
             if self.alive:
@@ -277,6 +318,7 @@ class ModelWorkerSupervisor:
             if item is None:
                 return
             kind = item.get("kind")
+            self._note_ledger(item.get("payload"))
             if kind == "reply":
                 future = self._reply_futures.get(str(item.get("request_id")))
                 if future is not None and not future.done():
@@ -304,8 +346,7 @@ class ModelWorkerSupervisor:
             ready_event = getattr(self, "_ready_event", None)
             if ready_event is not None:
                 ready_event.set()
-            self._loaded = None
-            self._loaded_request = None
+            self._forget_residents()
             error = {
                 "code": "model_worker_exited",
                 "message": f"model worker exited unexpectedly with code {process.exitcode}",
@@ -365,23 +406,17 @@ class ModelWorkerSupervisor:
         descriptor: ModelDescriptor,
         runtime: Mapping[str, Any],
         *,
+        model_key: str,
         timeout_seconds: float,
     ) -> dict[str, Any]:
         model = worker_model_payload(descriptor)
         requested = {"model": model, "runtime": dict(runtime)}
-        if (
-            self._loaded is not None
-            and self._loaded_request == requested
-            and self._process.is_alive()
-        ):
-            return dict(self._loaded)
-
-        # The worker unloads its current model before attempting a new load. Once
-        # that request starts, the previous cache entry can no longer describe the
-        # worker reliably, including when loading fails or times out.
-        self._loaded = None
-        self._loaded_request = None
-        result = await self._request({"op": "load", **requested}, timeout_seconds)
+        # The worker replaces this key when the request starts, so its entry cannot
+        # describe the worker any more, including when loading fails or times out.
+        self._resident.pop(model_key, None)
+        result = await self._request(
+            {"op": "load", "model_key": model_key, **requested}, timeout_seconds
+        )
         mismatches = {
             key: {"requested": expected, "loaded": result.get(key)}
             for key, expected in {
@@ -389,6 +424,7 @@ class ModelWorkerSupervisor:
                 "task": model["task"],
                 "device": requested["runtime"].get("device"),
                 "dtype": requested["runtime"].get("dtype"),
+                "model_key": model_key,
             }.items()
             if expected is not None and result.get(key) != expected
         }
@@ -401,14 +437,33 @@ class ModelWorkerSupervisor:
                     "details": mismatches,
                 }
             )
-        self._loaded = result
-        self._loaded_request = requested
-        return dict(result)
+        entry = {
+            **result,
+            "model_key": model_key,
+            "display_name": descriptor.display_name,
+            "last_used_at": datetime.now(UTC).isoformat(),
+        }
+        self._resident[model_key] = entry
+        return dict(entry)
 
-    async def unload(self, *, timeout_seconds: float = 30.0) -> dict[str, Any]:
-        result = await self._request({"op": "unload"}, timeout_seconds)
-        self._loaded = None
-        self._loaded_request = None
+    async def unload(
+        self, *, model_key: str | None = None, timeout_seconds: float = 30.0
+    ) -> dict[str, Any]:
+        """Unload one resident, or every resident when no key is given."""
+
+        command: dict[str, Any] = {"op": "unload"}
+        if model_key is not None:
+            command["model_key"] = model_key
+        try:
+            result = await self._request(command, timeout_seconds)
+        except WorkerFailure as exc:
+            if model_key is not None and exc.error.get("code") == "model_not_resident":
+                self._resident.pop(model_key, None)
+            raise
+        if model_key is None:
+            self._resident.clear()
+        for key in result.get("unloaded_model_keys") or ():
+            self._resident.pop(str(key), None)
         return result
 
     async def generate(
@@ -425,88 +480,86 @@ class ModelWorkerSupervisor:
         timeout_seconds: float,
         forced_prefix_token_ids: Sequence[int] = (),
         reasoning: bool | None = None,
+        model_key: str | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         if getattr(self, "_poisoned", False) or not self.alive:
             await self.start()
-        async with self._run_lock:
-            if getattr(self, "_poisoned", False) or not self.alive:
-                await self.start()
-            self._active_run_id = run_id
-            request_id = str(uuid.uuid4())
-            loop = asyncio.get_running_loop()
-            future: asyncio.Future[dict[str, Any]] = loop.create_future()
-            run_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=512)
-            self._reply_futures[request_id] = future
-            self._run_queues[run_id] = run_queue
-            cancel_event = self._cancel_event
-            cancel_event.clear()
-            process = self._process
-            deadline = loop.time() + timeout_seconds
-            # True once the worker is known to be finished with this run, either
-            # because a terminal event arrived or because a timeout replaced it.
-            settled = False
+        request_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        run_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=512)
+        self._reply_futures[request_id] = future
+        self._run_queues[run_id] = run_queue
+        if not self._active_run_ids:
+            # The shared event means "cancel everything"; it is only reset while no
+            # other run is in flight, so it can never swallow another run's stop.
+            self._cancel_event.clear()
+        self._active_run_ids.add(run_id)
+        process = self._process
+        deadline = loop.time() + timeout_seconds
+        # True once the worker is known to be finished with this run, either
+        # because a terminal event arrived or because a timeout replaced it.
+        settled = False
+        command: dict[str, Any] = {
+            "op": "generate",
+            "request_id": request_id,
+            "run_id": run_id,
+            "messages": messages,
+            "sampling": dict(sampling),
+            "effective_seed": effective_seed,
+            "instrumentation": instrumentation,
+            "deterministic_reference_mode": deterministic_reference_mode,
+            "max_prompt_tokens": max_prompt_tokens,
+            "reserved_output_tokens": reserved_output_tokens,
+            "forced_prefix_token_ids": list(forced_prefix_token_ids),
+            "reasoning": reasoning,
+        }
+        if model_key is not None:
+            command["model_key"] = model_key
+        try:
+            await asyncio.to_thread(self._commands.put, command, True, timeout_seconds)
             if run_id in self._cancelled_run_ids:
-                self._cancel_event.set()
-            try:
-                await asyncio.to_thread(
-                    self._commands.put,
-                    {
-                        "op": "generate",
-                        "request_id": request_id,
-                        "run_id": run_id,
-                        "messages": messages,
-                        "sampling": dict(sampling),
-                        "effective_seed": effective_seed,
-                        "instrumentation": instrumentation,
-                        "deterministic_reference_mode": deterministic_reference_mode,
-                        "max_prompt_tokens": max_prompt_tokens,
-                        "reserved_output_tokens": reserved_output_tokens,
-                        "forced_prefix_token_ids": list(forced_prefix_token_ids),
-                        "reasoning": reasoning,
-                    },
-                    True,
-                    timeout_seconds,
-                )
-                while True:
-                    remaining = deadline - loop.time()
-                    if remaining <= 0:
-                        raise TimeoutError
-                    event = await asyncio.wait_for(run_queue.get(), timeout=remaining)
-                    settled = event.get("event_type") in {"completed", "cancelled", "error"}
-                    yield event
-                    if settled:
-                        break
+                # Commands are FIFO, so the worker has created the session by the
+                # time it reads this cancel.
+                self._send_cancel(run_id)
+            while True:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise TimeoutError
-                reply = await asyncio.wait_for(future, timeout=min(5.0, remaining))
-                if not reply.get("ok") and event.get("event_type") != "error":
-                    raise WorkerFailure(reply.get("error", {"message": "generation failed"}))
-            except (OSError, TimeoutError, ValueError, queue.Full) as exc:
-                settled = True
-                self._cancel_event.set()
-                error = {
-                    "code": "inference_timeout",
-                    "message": f"generation exceeded the {timeout_seconds:g}-second timeout",
-                    "hint": "Reduce the output budget or increase workers.inference_timeout_seconds.",
-                }
-                await self._recycle_timed_out_worker(process, error)
-                raise WorkerFailure(error) from exc
-            finally:
-                if not settled and process is self._process and self._active_run_id == run_id:
-                    # The consumer abandoned the stream (closed it, raised, or was
-                    # cancelled) before a terminal event, so the worker would keep
-                    # generating an orphaned run. Stop it, and wait for its reply
-                    # while still holding the run lock so the next run's
-                    # cancel_event.clear() cannot swallow this request.
-                    cancel_event.set()
-                    with contextlib.suppress(Exception):
-                        await asyncio.wait_for(future, timeout=5.0)
-                self._reply_futures.pop(request_id, None)
-                self._run_queues.pop(run_id, None)
-                self._cancelled_run_ids.discard(run_id)
-                if self._active_run_id == run_id:
-                    self._active_run_id = None
+                event = await asyncio.wait_for(run_queue.get(), timeout=remaining)
+                settled = event.get("event_type") in {"completed", "cancelled", "error"}
+                yield event
+                if settled:
+                    break
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError
+            reply = await asyncio.wait_for(future, timeout=min(5.0, remaining))
+            if not reply.get("ok") and event.get("event_type") != "error":
+                raise WorkerFailure(reply.get("error", {"message": "generation failed"}))
+        except (OSError, TimeoutError, ValueError, queue.Full) as exc:
+            settled = True
+            self._cancel_event.set()
+            error = {
+                "code": "inference_timeout",
+                "message": f"generation exceeded the {timeout_seconds:g}-second timeout",
+                "hint": "Reduce the output budget or increase workers.inference_timeout_seconds.",
+            }
+            await self._recycle_timed_out_worker(process, error)
+            raise WorkerFailure(error) from exc
+        finally:
+            if not settled and process is self._process:
+                # The consumer abandoned the stream (closed it, raised, or was
+                # cancelled) before a terminal event, so the worker would keep
+                # generating an orphaned run. Stop that run only, and wait briefly
+                # for its reply so the worker is done with it before this returns.
+                self._send_cancel(run_id)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(future, timeout=5.0)
+            self._reply_futures.pop(request_id, None)
+            self._run_queues.pop(run_id, None)
+            self._cancelled_run_ids.discard(run_id)
+            self._active_run_ids.discard(run_id)
 
     async def embed(
         self,
@@ -535,20 +588,39 @@ class ModelWorkerSupervisor:
         )
 
     def cancel(self, run_id: str | None = None) -> None:
-        """Cancel one run without allowing a queued run to interrupt another."""
+        """Cancel one run without touching any other; no run ID cancels everything."""
 
         if run_id is None:
             self._cancel_event.set()
             return
         self._cancelled_run_ids.add(run_id)
-        if self._active_run_id == run_id:
+        if run_id in self._active_run_ids:
+            self._send_cancel(run_id)
+
+    def _send_cancel(self, run_id: str) -> None:
+        try:
+            self._commands.put_nowait({"op": "cancel", "run_id": run_id})
+        except (AssertionError, OSError, ValueError, queue.Full):
+            # A full or closed command queue must still stop the run; the shared
+            # event stops every session, which is the safe side of the trade.
             self._cancel_event.set()
 
     def forget_run(self, run_id: str) -> None:
         """Discard a cancellation queued before generation reached the worker."""
 
-        if self._active_run_id != run_id:
+        if run_id not in self._active_run_ids:
             self._cancelled_run_ids.discard(run_id)
+
+    async def memory_status(self, *, timeout_seconds: float) -> dict[str, Any]:
+        """Ask the worker for its memory ledger.
+
+        A timeout recycles the worker, so callers never send this while an admitted
+        job owns the worker.
+        """
+
+        result = await self._request({"op": "memory_status"}, timeout_seconds)
+        self._note_ledger(result)
+        return dict(result.get("ledger") or {})
 
     async def close(self, *, grace_seconds: float = 15.0) -> None:
         if self._stopping:
@@ -566,5 +638,4 @@ class ModelWorkerSupervisor:
                 self._process.kill()
                 await asyncio.to_thread(self._process.join, 5.0)
         await self._retire_dead_worker()
-        self._loaded = None
-        self._loaded_request = None
+        self._forget_residents()

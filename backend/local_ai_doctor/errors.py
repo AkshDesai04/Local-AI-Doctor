@@ -34,6 +34,7 @@ class ErrorCode(StrEnum):
     ADAPTER_CONFLICT = "adapter_conflict"
     MODEL_NOT_LOADED = "model_not_loaded"
     MODEL_ALREADY_LOADED = "model_already_loaded"
+    MODEL_NOT_RESIDENT = "model_not_resident"
     OUT_OF_MEMORY = "out_of_memory"
     INVALID_SAMPLING_SETTINGS = "invalid_sampling_settings"
     INVALID_LOGITS = "invalid_logits"
@@ -241,6 +242,11 @@ class ActiveRunConflictError(WorkbenchError):
 
 class ModelNotLoadedError(WorkbenchError):
     code = ErrorCode.MODEL_NOT_LOADED
+    http_status = 409
+
+
+class ModelNotResidentError(WorkbenchError):
+    code = ErrorCode.MODEL_NOT_RESIDENT
     http_status = 409
 
 
