@@ -129,7 +129,7 @@ test("desktop workbench exposes model controls and truthful empty telemetry", as
   await expect(page.getByRole("heading", { name: "What should we inspect?" })).toBeVisible();
   await expect(page.getByRole("combobox", { name: "Selected model" })).toHaveValue(model.id);
   await expect(page.getByText("No run selected", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: /Nerd Mode/i }).click();
+  await page.getByRole("switch", { name: "Nerd Mode" }).click();
   await expect(page.getByText("Token boundaries are visible.")).toBeVisible();
 });
 
@@ -137,7 +137,7 @@ test("mobile navigation opens without clipping the primary workspace", async ({ 
   test.skip(testInfo.project.name !== "mobile-chromium", "mobile-only assertion");
   await page.getByRole("button", { name: "Open navigation" }).click();
   await expect(page.getByRole("navigation", { name: "Workspaces" })).toBeVisible();
-  await page.getByRole("button", { name: "Model registry" }).click();
+  await page.getByRole("button", { name: "Models" }).click();
   await expect(page.getByRole("heading", { name: "Model registry" })).toBeVisible();
 });
 
@@ -207,4 +207,21 @@ test("system prompt is saved per chat from the prompt controls and shown in the 
   await expect.poll(() => systemPromptState.patches.at(-1)).toEqual({ systemPrompt: null });
   await expect(page.getByRole("img", { name: "System prompt active" })).toHaveCount(0);
   await expect(page.locator(".system-prompt-card")).toHaveCount(0);
+});
+
+test("laptop layout keeps the context meter inside the composer and inspector tab labels visible", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "desktop-only assertion");
+  await page.setViewportSize({ width: 1280, height: 800 });
+
+  const composer = await page.locator(".composer").boundingBox();
+  const meter = await page.getByRole("button", { name: /Context usage/ }).boundingBox();
+  if (!composer || !meter) throw new Error("Expected a measurable composer and context meter.");
+  expect(meter.x).toBeGreaterThanOrEqual(composer.x);
+  expect(meter.y).toBeGreaterThanOrEqual(composer.y);
+  expect(meter.x + meter.width).toBeLessThanOrEqual(composer.x + composer.width + 0.5);
+  expect(meter.y + meter.height).toBeLessThanOrEqual(composer.y + composer.height + 0.5);
+
+  await expect(page.getByRole("tab", { name: "Overview" })).toHaveText("Overview");
+  await expect(page.getByRole("tab", { name: "Overview" })).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Experts" })).toHaveAttribute("aria-disabled", "true");
 });

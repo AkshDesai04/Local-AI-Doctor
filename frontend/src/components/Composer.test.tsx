@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { GenerationSettings, ModelSummary } from "../api/types";
+import { SAMPLING_LIMITS } from "../domain/sampling";
 import { defaultGenerationSettings } from "../hooks/useWorkbench";
 import { Composer } from "./Composer";
 
@@ -84,6 +85,8 @@ describe("prompt controls", () => {
     expect(screen.getByRole("slider", { name: "Temperature" })).toHaveValue("0.7");
     expect(screen.getByRole("slider", { name: "Top K" })).toHaveValue("50");
     expect(screen.getByRole("slider", { name: "Top P" })).toHaveValue("0.95");
+    expect(screen.getByRole("slider", { name: "Top P" })).toHaveAttribute("min", String(SAMPLING_LIMITS.topP.min));
+    expect(screen.getByRole("slider", { name: "Top K" })).toHaveAttribute("max", String(SAMPLING_LIMITS.topK.max));
 
     await user.click(screen.getByRole("switch", { name: "Reason before answering" }));
     fireEvent.change(screen.getByRole("slider", { name: "Temperature" }), { target: { value: "1.25" } });

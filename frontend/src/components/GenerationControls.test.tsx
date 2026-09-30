@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { AUTH_SESSION_KEY } from "../api/auth";
 import type { ModelSummary } from "../api/types";
+import { SAMPLING_LIMITS } from "../domain/sampling";
 import { defaultGenerationSettings } from "../hooks/useWorkbench";
 import { GenerationControls } from "./GenerationControls";
 
@@ -90,5 +91,26 @@ describe("runtime device settings", () => {
     expect(onChange).toHaveBeenCalledOnce();
     const update = onChange.mock.calls[0]?.[0] as (current: typeof defaultGenerationSettings) => typeof defaultGenerationSettings;
     expect(update(defaultGenerationSettings)).toMatchObject({ device: "cuda" });
+  });
+});
+
+describe("generation control sections", () => {
+  it("separates next-response settings from model loading and shares the composer's bounds", () => {
+    render(
+      <GenerationControls
+        authRequired={false}
+        model={modelWithCuda("full")}
+        onChange={vi.fn()}
+        onClose={vi.fn()}
+        open
+        settings={defaultGenerationSettings}
+      />,
+    );
+
+    expect(screen.getByRole("region", { name: "Next response" })).toContainElement(screen.getByRole("spinbutton", { name: "Temperature" }));
+    expect(screen.getByRole("region", { name: "Model loading" })).toContainElement(screen.getByRole("combobox", { name: "Device" }));
+    expect(screen.getByRole("spinbutton", { name: "Top-P" })).toHaveAttribute("min", String(SAMPLING_LIMITS.topP.min));
+    expect(screen.getByRole("spinbutton", { name: "Top-K" })).toHaveAttribute("max", String(SAMPLING_LIMITS.topK.max));
+    expect(screen.getByRole("spinbutton", { name: "Repetition penalty" })).toHaveAttribute("min", String(SAMPLING_LIMITS.repetitionPenalty.min));
   });
 });
