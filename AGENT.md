@@ -799,7 +799,7 @@ The product-level layout contract is:
 - Left sidebar: new chat, persisted recent/archived chats, automatic titles, rename, search, pin, archive, confirmed delete, and confirmed clear-all.
 - Main chat: streaming output, stop, regenerate/replay, edit-and-retry, copy, branch selection, attachment previews, and response details.
 - Collapsible/right-side inspector: Overview, Tokens, Probability, Timing, Experts, Context, Embeddings, Hardware, Configuration, and Raw Events.
-- Bottom-right compact circular context meter.
+- Compact circular context meter in the composer toolbar (it must never overlap the message input).
 
 Do not remove an unsupported inspector area merely to make the UI appear complete. Keep it visible/disabled with the capability reason when that helps users understand the model/backend boundary.
 
@@ -917,8 +917,11 @@ The embeddings workspace supports capability-gated batches of text/media inputs,
 
 ### 14.10 Styling and accessibility
 
-- Primary accent is blue `#60a5fa`.
-- Preserve the dense-label readability floor and do not shrink important text to fit.
+- Primary accent is blue `#60a5fa`. Green is never used, including for success states (`--success` is a sky-blue variant) and chart series.
+- Every colour, space, font size, radius, shadow, focus ring, and duration comes from the tokens in `frontend/src/styles/tokens.css`. Do not add literal hex values elsewhere; add or reuse a token. Charts read the categorical `--viz-1`…`--viz-8` and sequential `--seq-*` tokens through CSS variables.
+- Styles live in four files imported by `main.tsx` in order: `tokens.css` (variables), `base.css` (element defaults and utilities), `components.css` (primitives), and `views.css` (layout and per-view rules, including breakpoints and workspace container queries).
+- Build UI from the typed primitives in `frontend/src/components/ui` (Button, IconButton, Tabs, SegmentedControl, Field/Input/Textarea/NumberInput/Select, Switch, Slider, Badge, Card, Stat, EmptyState, Callout, Popover, MenuButton, Drawer) instead of one-off buttons, tabs, selects, section titles, empty states, or callouts. `IconButton` requires a label, which also becomes its hover hint.
+- 11px is the minimum size for any text, including token-chip index labels, chart axis labels, and badges. Preserve the readability floor and do not shrink important text to fit.
 - Maintain global `:focus-visible`, ARIA labels/states, live status, alerts, visually hidden labels, and disabled explanations.
 - Respect `prefers-reduced-motion`.
 - Preserve current responsive behavior around 1320, 1120, 900, 760, and 480 px.

@@ -146,6 +146,8 @@ frontend/src/
   api/client.ts      all fetch + normalization (snake_case -> typed), subscribeToRun WS client; api/types.ts types
   api/auth.ts        tab-scoped token (sessionStorage `lad.auth_token`), events lad:auth-required / lad:auth-changed
   api/modelRoots.ts  GET/PUT /configuration/model-roots
+  components/ui/     design-system primitives (Button, Tabs, Field, Switch, Card, Callout, Popover, Drawer, ...)
+  styles/            tokens.css, base.css, components.css, views.css
   components/        ChatView, Composer, ContextMeter, Inspector, VirtualTokenTable, TraceChart, AttentionAttribution,
                      GenerationControls, ModelRegistry, ModelRootSettings, EmbeddingsWorkspace, Sidebar, WorkbenchHeader
   domain/capabilities.ts  isUsable() etc. for capability gating
@@ -392,9 +394,13 @@ Inside the worker (`_generate_impl`):
 - **Composer:** a popover sets reasoning, temperature, top-k, top-p, and the chat's system prompt (`useWorkbench` debounces the PATCH by 500 ms, flushes it before submit, and keeps a draft for a chat without an id until create). A "System prompt active" composer icon and a collapsed card at the top of `ChatView` show it. Enter sends and Shift+Enter inserts a newline. `GenerationControls` exposes the full settings: token, device, dtype, instrumentation, seed, deterministic mode, all sampler knobs, stop sequences, and reset to backend defaults. Ctrl/Cmd+K creates a new chat when connected.
 - **Styling and accessibility:**
   - Accent blue `#60a5fa`, never green. DM Sans for UI, JetBrains Mono for data.
-  - Dense text has a 10–11 px floor.
+  - 11 px is the floor for all text, including token-chip indexes and chart labels.
   - Breakpoints are 1320, 1120, 900, 760, and 480 px. At ≤760 px the sidebar becomes a drawer and the inspector goes full-screen (closed by default).
   - Keep focus-visible, ARIA, `role=alert` errors, `role=status` notices, `prefers-reduced-motion`, and `title` hints on compact or disabled controls.
+- **UI conventions:**
+  - Tokens live in `src/styles/tokens.css`; `main.tsx` imports `tokens.css`, `base.css`, `components.css` (primitives), then `views.css` (layout, breakpoints, workspace container queries). No literal hex values outside `tokens.css`; charts use the `--viz-*`/`--seq-*` tokens.
+  - No green anywhere, including success states (`--success` is sky blue) and chart series.
+  - Use the primitives in `src/components/ui` (Button, IconButton, Tabs, SegmentedControl, Field/Input/Textarea/NumberInput/Select, Switch, Slider, Badge, Card, Stat, EmptyState, Callout, Popover, MenuButton, Drawer) rather than one-off markup. Sampling bounds shared by the composer and generation controls live in `src/domain/sampling.ts`.
 - **TypeScript and ESLint:** TS `strict`, `noUncheckedIndexedAccess`, and `noUnused*`. ESLint `recommendedTypeChecked`, `no-floating-promises` (use `void`), `consistent-type-imports`.
 - **Vitest:** `src/test/setup.ts` mocks `matchMedia` and `scrollIntoView` and clears the auth token. Blob realm differences between jsdom and Node mean tests should assert on behavior (size, type, bytes), not `toBeInstanceOf(Blob)`.
 - **Env:** `VITE_API_BASE` (default `/api/v1`) and `VITE_WS_BASE` (optional).

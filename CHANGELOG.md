@@ -18,6 +18,9 @@ This project follows a Keep a Changelog-style structure. Versions and dates are 
 - Architecture, adapter, configuration, API, metrics, benchmarking, deployment, security, contribution, model-capability, and limitations documentation.
 - Per-chat system prompt: edited in the composer's prompt controls, persisted on the chat (migration `0004`), prepended to generation, snapshotted in each run's settings so replay and token branching reuse the original, carried in portable chat workspaces, and merged into the first user message with a `system_prompt_merged` warning for chat templates that have no system role.
 - Image and video attachments in chat for vision-language generators with a processor (validated on Qwen3-VL-2B-Thinking). Media turns are rendered with the checkpoint processor's chat template, pixel inputs reach only the prefill forward, earlier attachments are re-sent with history, replay, and token branches, and the attention catalogue labels media positions. Generator `vision`/`video` capabilities are reported `partial`.
+- A frontend design system: colour, spacing, type, radius, elevation, focus, and motion tokens in `frontend/src/styles/tokens.css` (blue accent, no green, an 11px text floor, and a colour-blind-separable data-visualisation palette), and typed, accessible primitives in `frontend/src/components/ui` (Button, IconButton, Tabs, SegmentedControl, Field, Input, Textarea, NumberInput, Select, Switch, Slider, Badge, Card, Stat, EmptyState, Callout, Popover, MenuButton, Drawer).
+- A restyled workbench on those primitives: a 56px header with a model lifecycle pill, one Load/Unload action, a Nerd Mode switch, and an overflow menu; a sidebar with data-driven navigation, chats grouped as Pinned, Today, and Earlier, and Clear all data inside a settings menu; generation controls in a drawer split into Next response and Model loading; always-labelled, scrollable inspector tabs; and registry model cards that report weight size and conflicting declared and tokenizer context lengths.
+- A dismissible warning when nvidia-smi reports an NVIDIA GPU but the backend's PyTorch has no usable CUDA runtime, so models run on the CPU.
 
 ### Fixed
 
@@ -54,6 +57,13 @@ This project follows a Keep a Changelog-style structure. Versions and dates are 
 - Discovery reads the classic sentence-transformers pooled width (`word_embedding_dimension`), so XLM-R and BERT embedding models such as Vyakyarth report their vector width.
 - The plain-text fallback prompt now starts with the BOS token the tokenizer inserts by default. Tokenizing with `add_special_tokens=false` dropped it, so base checkpoints such as Llama 3.2 generated without BOS. Templated prompts are unchanged.
 - Decoder calls pass `cache_position`. Qwen3-VL derives decode positions from it, so every generated token was placed at position zero and output drifted from Transformers `generate()` (on Qwen3-VL-2B-Thinking from the fifth token), including text-only prompts and the split eager prefill used for attention capture.
+- The context meter sits in the composer toolbar instead of floating over the message input.
+- The context bar paints rendered-prompt and multimodal positions in different colours; both were the accent blue.
+- The composer's quick sampling controls and the generation controls share one set of bounds that stays inside backend validation (for example Top-P and the repetition penalty can no longer be set to zero in one editor).
+- The inspector never renders a capability-disabled tab, even for the render before it falls back to the overview.
+- The capability matrix shows a short state label per cell with the reason on hover, focus, and an expandable row, instead of long sentences at a 7px size.
+- Chart axis labels keep their size because charts are drawn at their measured width; the unused expand icon on every chart is gone.
+- The embeddings NumPy export reuses the shared download helper.
 
 ### Security
 
