@@ -80,9 +80,14 @@ jobs:
     if: github.event_name == 'push'
     needs: [backend, frontend, desktop]
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     permissions:
       contents: write
+    env:
+      # Every release ships the pinned CUDA 12.8 PyTorch runtime. The runner has
+      # no GPU, so the build asserts the +cu128 wheels and DLL set, and the CUDA
+      # kernel self-check runs on local builds with an NVIDIA driver.
+      LAD_DESKTOP_TORCH_VARIANT: cuda
     steps:
       - uses: actions/checkout@v4
         with:
@@ -96,6 +101,7 @@ jobs:
           cache-dependency-path: |
             requirements.lock
             requirements-ml.lock
+            requirements-cuda.lock
             requirements-desktop.lock
 
       - uses: actions/setup-node@v4
@@ -124,7 +130,7 @@ jobs:
             default { throw "Unsupported release branch: ${{ github.ref_name }}" }
           }
           $tag = "v$version"
-          $title = "Local AI Doctor $version"
+          $title = "Local AI Doctor $version ($($env:LAD_DESKTOP_TORCH_VARIANT.ToUpperInvariant()))"
 
           $matchingTagOutput = git tag --list $tag
           if ($LASTEXITCODE -ne 0) { throw "Could not inspect release tags." }
@@ -150,13 +156,8 @@ jobs:
       - name: Install desktop build dependencies
         shell: pwsh
         run: |
-          python -m pip install pip==26.2.1
-          python -m pip install -r requirements.lock
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch==2.8.0+cpu torchvision==0.23.0+cpu
-          python -m pip install -r requirements-ml.lock
-          python -m pip install -r requirements-desktop.lock
-          python -m pip install --no-deps .
-          python -c "import torch; assert torch.__version__.endswith('+cpu'), torch.__version__; assert torch.version.cuda is None; assert not torch.cuda.is_available(); print(f'CPU desktop runtime: torch {torch.__version__}')"
+          # Creates .venv-desktop and fails unless torch reports the pinned variant.
+          ./desktop/scripts/prepare-build-env.ps1 -Variant $env:LAD_DESKTOP_TORCH_VARIANT -BasePython (Get-Command python).Source
           npm ci --prefix frontend
           npm ci --prefix desktop
 
@@ -190,12 +191,13 @@ jobs:
             throw "Expected exactly one release/*.exe artifact, found $($executables.Count)."
           }
 
-          $expectedName = "Local-AI-Doctor-${{ steps.release.outputs.version }}.exe"
+          $expectedName = "Local-AI-Doctor-${{ steps.release.outputs.version }}-$env:LAD_DESKTOP_TORCH_VARIANT.exe"
           if ($executables[0].Name -ne $expectedName) {
             throw "Expected $expectedName, found $($executables[0].Name)."
           }
-          if ($executables[0].Length -ge 2GB) {
-            throw "The executable is larger than GitHub's 2 GiB release-asset limit."
+          $sizeLimit = [long](node -p "require('./desktop/scripts/build-guard.cjs').INSTALLER_SIZE_LIMIT")
+          if ($executables[0].Length -ge $sizeLimit) {
+            throw "The executable is $($executables[0].Length) bytes; the limit is $sizeLimit bytes (1.95 GiB)."
           }
 
           $digest = (Get-FileHash -LiteralPath $executables[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -271,6 +273,11 @@ jobs:
           $integrityPattern = '(?m)^[ \t]*<!-- local-ai-doctor-release-integrity:v1 commit=(?<commit>[0-9a-f]{40,64}) asset=(?<asset>[^ \r\n]+) digest=(?<digest>sha256:[0-9a-f]{64}) -->[ \t]*\r?$'
           $integrityRemovalPattern = '(?m)^[ \t]*<!-- local-ai-doctor-release-integrity:v1\b.*?-->[ \t]*(?:\r?\n|\z)'
           $expectedMarker = "<!-- local-ai-doctor-release-integrity:v1 commit=$currentSha asset=$artifactName digest=$expectedDigest -->"
+          $runtimeNote = if ($env:LAD_DESKTOP_TORCH_VARIANT -eq "cuda") {
+            "Runtime: bundled PyTorch 2.8.0 with CUDA 12.8. NVIDIA GPUs are used when the installed driver supports CUDA 12.8; other machines run on CPU."
+          } else {
+            "Runtime: CPU-only PyTorch build. Build the CUDA installer locally for NVIDIA GPUs (see README)."
+          }
 
           function Assert-ReleaseTarget {
             param([object] $Release)
@@ -298,11 +305,11 @@ jobs:
           function Set-ReleaseIntegrity {
             param([object] $Release)
 
-            $cleanBody = [regex]::Replace([string] $Release.body, $integrityRemovalPattern, '').TrimEnd()
+            $cleanBody = [regex]::Replace([string] $Release.body, $integrityRemovalPattern, '').Replace($runtimeNote, '').Trim()
             $updatedBody = if ([string]::IsNullOrWhiteSpace($cleanBody)) {
-              $expectedMarker
+              "$runtimeNote`n`n$expectedMarker"
             } else {
-              "$cleanBody`n`n$expectedMarker"
+              "$runtimeNote`n`n$cleanBody`n`n$expectedMarker"
             }
             $payload = @{ body = $updatedBody } | ConvertTo-Json -Compress
             return Invoke-RestMethod `
@@ -414,6 +421,7 @@ jobs:
             "### $releaseTitle",
             "",
             "- Channel: $channel",
+            "- $runtimeNote",
             "- Tag: $tag",
             "- Asset: $artifactName",
             "- SHA-256: $publishedSha256"
