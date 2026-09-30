@@ -54,6 +54,11 @@ const taskTones: Record<ModelSummary["task"], BadgeTone> = {
   unknown: "neutral",
 };
 
+function taskLabel(task: ModelSummary["task"]): string {
+  const text = task.replaceAll("_", " ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 function StateIcon({ state }: { state: CapabilityState }): React.ReactNode {
   if (state === "full") return <Check aria-hidden="true" size={13} />;
   if (state === "partial") return <CircleDashed aria-hidden="true" size={13} />;
@@ -105,7 +110,7 @@ function ModelCard({ model, onToggleLoaded, onSelectModel }: { model: ModelSumma
         <div className="model-card-copy">
           <div className="model-card-title">
             <h3 title={model.name}>{model.name}</h3>
-            <Badge tone={taskTones[model.task]}>{model.task.replaceAll("_", " ")}</Badge>
+            <Badge tone={taskTones[model.task]}>{taskLabel(model.task)}</Badge>
             {loaded && <Badge tone="accent">Loaded{model.loadedDevice ? ` · ${model.loadedDevice}` : ""}</Badge>}
             {model.lifecycle === "error" && <Badge tone="danger">Load error</Badge>}
           </div>
