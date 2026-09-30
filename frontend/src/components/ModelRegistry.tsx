@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Check,
   ChevronDown,
   ChevronRight,
@@ -15,22 +16,29 @@ import {
 } from "lucide-react";
 import { Fragment, useState } from "react";
 import { api } from "../api/client";
-import type { CapabilityKey, CapabilityState, ModelInspection, ModelSummary } from "../api/types";
+import type { CapabilityKey, CapabilityState, LoadOptions, ModelInspection, ModelSummary, ResidentModel } from "../api/types";
 import { capabilityKeys, capabilityLabel, capabilityOf } from "../domain/capabilities";
+import { residentsOf, residentSummary } from "../domain/residency";
 import { formatBytes, formatNumber, shortFingerprint } from "../utils/format";
+import { LoadOptionsFields } from "./LoadOptionsFields";
 import { ModelRootSettings } from "./ModelRootSettings";
 import { Badge, type BadgeTone, Button, Callout, Card, EmptyState, IconButton, Stat } from "./ui";
 
 interface ModelRegistryProps {
   models: ModelSummary[];
+  residents: ResidentModel[];
+  maxLoadedModels: number | null;
   connected: boolean;
+  loadOptionsFor: (modelId: string) => LoadOptions;
+  onLoadOptionsChange: (modelId: string, options: LoadOptions) => void;
+  onLoad: (model: ModelSummary, options: LoadOptions) => void;
+  onUnloadResident: (resident: ResidentModel) => void;
   onRefresh: () => void;
   onSynchronize: () => void;
-  onToggleLoaded: (model: ModelSummary) => void;
   onSelectModel: (id: string) => void;
 }
 
-const matrixKeys: CapabilityKey[] = ["text_generation", "embeddings", "vision", "audio", "video", "reasoning_segments", "moe_routing", "raw_logits", "prompt_scoring", "streaming", "cpu", "cuda"];
+const matrixKeys: CapabilityKey[] = ["text_generation", "embeddings", "vision", "audio", "video", "reasoning_segments", "moe_routing", "raw_logits", "prompt_scoring", "streaming", "cpu", "cuda", "cpu_offload"];
 
 const stateLabels: Record<CapabilityState, string> = {
   full: "Full",
@@ -76,14 +84,58 @@ function contextSummary(model: ModelSummary): { text: string; conflict: boolean 
     : { text: formatNumber(limit, 0), conflict: false };
 }
 
-function ModelCard({ model, onToggleLoaded, onSelectModel }: { model: ModelSummary; onToggleLoaded: (model: ModelSummary) => void; onSelectModel: (id: string) => void }): React.ReactNode {
+const placementLabels: Record<NonNullable<ResidentModel["placement"]>, string | null> = { gpu: "GPU", cpu: "CPU", offload: null };
+
+function ResidentRow({ model, resident, busy, onUnload }: { model: ModelSummary; resident: ResidentModel; busy: boolean; onUnload: (resident: ResidentModel) => void }): React.ReactNode {
+  const summary = [residentSummary(resident), resident.placement ? placementLabels[resident.placement] : null].filter(Boolean).join(" · ");
+  const usage: Array<[string, string]> = [
+    ...(resident.gpuBytes !== null ? [["GPU", formatBytes(resident.gpuBytes)] as [string, string]] : []),
+    ...(resident.cpuBytes !== null ? [["RAM", formatBytes(resident.cpuBytes)] as [string, string]] : []),
+    ...(resident.kvReserveBytes ? [["KV reserve", formatBytes(resident.kvReserveBytes)] as [string, string]] : []),
+    ...(resident.loadSeconds !== null ? [["Load", `${formatNumber(resident.loadSeconds, 1)} s`] as [string, string]] : []),
+  ];
+  return (
+    <li className="resident-row">
+      <div className="resident-badges">
+        <Badge tone="accent">{summary}</Badge>
+        {resident.placement === "offload" && <Badge icon={<AlertTriangle aria-hidden="true" size={11} />} title="Layers that did not fit in VRAM run from system RAM, which is much slower." tone="warning">Offloaded to system RAM</Badge>}
+        {resident.strictVram && resident.placement === "gpu" && <Badge title="Loaded with Strict VRAM: this copy never spills into system RAM.">Strict VRAM</Badge>}
+        {resident.quantization && resident.quantization !== "none" && <Badge>{resident.quantization}</Badge>}
+        {resident.inUse && <Badge tone="info">In use</Badge>}
+      </div>
+      {usage.length > 0 && <dl className="resident-usage">{usage.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>}
+      <Button
+        aria-label={`Unload ${model.name} on ${summary}`}
+        disabled={resident.inUse}
+        icon={<Square size={11} />}
+        loading={busy}
+        onClick={() => onUnload(resident)}
+        size="sm"
+        title={resident.inUse ? "In use by a running job; unload it when the job finishes" : "Unload this copy and free its memory"}
+      >Unload</Button>
+    </li>
+  );
+}
+
+interface ModelCardProps {
+  model: ModelSummary;
+  residents: ResidentModel[];
+  connected: boolean;
+  loadOptions: LoadOptions;
+  onLoadOptionsChange: (modelId: string, options: LoadOptions) => void;
+  onLoad: (model: ModelSummary, options: LoadOptions) => void;
+  onUnloadResident: (resident: ResidentModel) => void;
+  onSelectModel: (id: string) => void;
+}
+
+function ModelCard({ model, residents, connected, loadOptions, onLoadOptionsChange, onLoad, onUnloadResident, onSelectModel }: ModelCardProps): React.ReactNode {
   const [expanded, setExpanded] = useState(false);
   const [inspection, setInspection] = useState<ModelInspection | null>(null);
   const [inspectionOpen, setInspectionOpen] = useState(false);
   const [inspectionLoading, setInspectionLoading] = useState(false);
   const [inspectionError, setInspectionError] = useState<string | null>(null);
   const busy = model.lifecycle === "loading" || model.lifecycle === "unloading";
-  const loaded = model.lifecycle === "loaded";
+  const loadable = model.task !== "unknown";
   const fullCount = capabilityKeys.filter((key) => capabilityOf(model, key).state === "full").length;
   const context = contextSummary(model);
   const detailId = `model-detail-${model.id}`;
@@ -111,7 +163,7 @@ function ModelCard({ model, onToggleLoaded, onSelectModel }: { model: ModelSumma
           <div className="model-card-title">
             <h3 title={model.name}>{model.name}</h3>
             <Badge tone={taskTones[model.task]}>{taskLabel(model.task)}</Badge>
-            {loaded && <Badge tone="accent">Loaded{model.loadedDevice ? ` · ${model.loadedDevice}` : ""}</Badge>}
+            {residents.length > 0 && <Badge tone="accent">{residents.length === 1 ? "Resident" : `${String(residents.length)} resident copies`}</Badge>}
             {model.lifecycle === "error" && <Badge tone="danger">Load error</Badge>}
           </div>
           <p className="model-card-arch">{model.architecture ?? "Architecture not identified"}</p>
@@ -124,22 +176,33 @@ function ModelCard({ model, onToggleLoaded, onSelectModel }: { model: ModelSumma
           </dl>
         </div>
         <div className="model-card-actions">
-          <Button
-            disabled={busy}
-            icon={loaded ? <Square size={11} /> : <Play size={13} />}
-            loading={busy}
-            onClick={() => { onSelectModel(model.id); onToggleLoaded(model); }}
-            size="sm"
-            variant={loaded ? "secondary" : "primary"}
-          >{loaded ? "Unload" : busy ? (model.lifecycle === "loading" ? "Loading…" : "Unloading…") : "Load"}</Button>
           <IconButton aria-controls={detailId} aria-expanded={expanded} icon={<ChevronDown className={expanded ? "rotated" : ""} size={16} />} label={expanded ? `Hide details for ${model.name}` : `Show details for ${model.name}`} onClick={() => setExpanded((value) => !value)} size="sm" title={expanded ? "Hide details" : "Show details"} />
         </div>
       </div>
+      {loadable && (
+        <div aria-label={`Load options for ${model.name}`} className="model-load-panel" role="group">
+          <LoadOptionsFields disabled={!connected || busy} model={model} onChange={(options) => onLoadOptionsChange(model.id, options)} size="sm" value={loadOptions} />
+          <Button
+            disabled={!connected || model.lifecycle === "unloading"}
+            icon={<Play size={13} />}
+            loading={model.lifecycle === "loading"}
+            onClick={() => { onSelectModel(model.id); onLoad(model, loadOptions); }}
+            size="sm"
+            title={connected ? `Load ${model.name} with these options; a resident copy with the same options is reused` : "Start the local backend first"}
+            variant={residents.length ? "secondary" : "primary"}
+          >{model.lifecycle === "loading" ? "Loading…" : "Load"}</Button>
+        </div>
+      )}
+      {residents.length > 0 && (
+        <ul aria-label={`Resident copies of ${model.name}`} className="resident-list">
+          {residents.map((resident) => <ResidentRow busy={model.lifecycle === "unloading"} key={resident.modelKey} model={model} onUnload={onUnloadResident} resident={resident} />)}
+        </ul>
+      )}
       {expanded && (
         <div className="model-card-detail" id={detailId}>
           <dl className="kv-grid">
             <div><dt>Fingerprint</dt><dd className="mono" title={model.fingerprint ?? undefined}>{shortFingerprint(model.fingerprint)}</dd></div>
-            <div><dt>Lifecycle</dt><dd>{model.lifecycle}{model.loadedDevice ? ` on ${model.loadedDevice}` : ""}</dd></div>
+            <div><dt>Lifecycle</dt><dd>{model.lifecycle}{residents.length ? ` · ${String(residents.length)} resident` : ""}</dd></div>
             <div><dt>Remote code</dt><dd>{model.trustRemoteCode ? "Narrowly enabled" : "Disabled"}</dd></div>
             <div><dt>Task selection</dt><dd>{model.task.replaceAll("_", " ")}</dd></div>
           </dl>
@@ -222,26 +285,40 @@ function CapabilityMatrix({ models }: { models: ModelSummary[] }): React.ReactNo
   );
 }
 
-export function ModelRegistry({ models, connected, onRefresh, onSynchronize, onToggleLoaded, onSelectModel }: ModelRegistryProps): React.ReactNode {
+export function ModelRegistry({ models, residents, maxLoadedModels, connected, loadOptionsFor, onLoadOptionsChange, onLoad, onUnloadResident, onRefresh, onSynchronize, onSelectModel }: ModelRegistryProps): React.ReactNode {
   return (
     <main className="workspace model-registry">
       <header className="page-header">
         <div><h1>Model registry</h1><p>Read-only discovery. Capabilities are adapter claims with reasons—not guesses based on architecture names.</p></div>
         <Button disabled={!connected} icon={<RefreshCw size={14} />} onClick={onRefresh}>Rescan roots</Button>
       </header>
-      <ModelRootSettings connected={connected} modelLoaded={models.some((model) => model.lifecycle === "loaded")} onRefresh={onSynchronize} />
+      <ModelRootSettings connected={connected} modelLoaded={residents.length > 0} onRefresh={onSynchronize} />
       {!models.length ? (
         <EmptyState description={connected ? "Check the effective configuration for a readable model root, then rescan. Model roots are never modified." : "Start the local backend before scanning configured roots."} icon={Database} title={connected ? "No model folders discovered" : "Backend offline"} />
       ) : (
         <>
           <div className="stat-row">
             <Stat label="Discovered" value={String(models.length)} />
-            <Stat label="Loaded" value={String(models.filter((model) => model.lifecycle === "loaded").length)} />
+            <Stat caption={maxLoadedModels ? `of ${String(maxLoadedModels)} allowed` : undefined} label="Resident" value={String(residents.length)} />
             <Stat label="Fingerprinted" value={String(models.filter((model) => model.fingerprint).length)} />
           </div>
           <section aria-labelledby="registry-models" className="page-section">
-            <div className="section-head"><h2 id="registry-models">Local models</h2><p>One model is resident at a time.</p></div>
-            <div className="model-list">{models.map((model) => <ModelCard key={model.id} model={model} onSelectModel={onSelectModel} onToggleLoaded={onToggleLoaded} />)}</div>
+            <div className="section-head"><div><h2 id="registry-models">Local models</h2><p>Several models can stay resident. A load that needs room unloads the least recently used idle model first.</p></div></div>
+            <div className="model-list">
+              {models.map((model) => (
+                <ModelCard
+                  connected={connected}
+                  key={model.id}
+                  loadOptions={loadOptionsFor(model.id)}
+                  model={model}
+                  onLoad={onLoad}
+                  onLoadOptionsChange={onLoadOptionsChange}
+                  onSelectModel={onSelectModel}
+                  onUnloadResident={onUnloadResident}
+                  residents={residentsOf(residents, model.id)}
+                />
+              ))}
+            </div>
           </section>
           <section aria-labelledby="registry-matrix" className="page-section">
             <div className="section-head">

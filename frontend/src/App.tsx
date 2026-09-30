@@ -178,11 +178,16 @@ export default function App(): React.ReactNode {
             {view === "models" && (
               <ModelRegistry
                 connected={workbench.connected}
+                loadOptionsFor={workbench.loadOptionsFor}
+                maxLoadedModels={workbench.maxLoadedModels}
                 models={workbench.models}
+                onLoad={(model, options) => void workbench.loadModel(model, options)}
+                onLoadOptionsChange={workbench.setLoadOptions}
                 onRefresh={() => void workbench.refreshModels()}
                 onSelectModel={workbench.setSelectedModelId}
                 onSynchronize={() => void workbench.synchronizeRuntimeState()}
-                onToggleLoaded={(model) => void workbench.toggleModelLoaded(model)}
+                onUnloadResident={(resident) => void workbench.unloadResident(resident)}
+                residents={workbench.residents}
               />
             )}
           </div>
