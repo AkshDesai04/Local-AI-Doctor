@@ -59,6 +59,8 @@
 .chat-row .menu-anchor { opacity: 0; position: absolute; right: var(--space-1); top: 50%; transform: translateY(-50%); }
 .chat-row:hover .menu-anchor, .chat-row .menu-anchor:focus-within, .chat-row .menu-anchor:has([aria-expanded="true"]) { opacity: 1; }
 .chat-row:hover .chat-pin, .chat-row:focus-within .chat-pin { display: none; }
+/* Lift the row whose menu is open above the rows painted after it. */
+.chat-row:focus-within, .chat-row:has([aria-expanded="true"]) { z-index: 5; }
 .chat-rename-input { margin: 5px var(--space-1); }
 .sidebar-footer { border-top: 1px solid var(--border-subtle); padding: var(--space-2) var(--space-2) var(--space-3); }
 .sidebar-footer-row { align-items: center; display: flex; gap: var(--space-1); }
