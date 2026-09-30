@@ -602,11 +602,11 @@ button.attention-source-token:hover { border-color: var(--accent-text); }
 }
 
 
-@media (max-width: 1440px) {
+@media (max-width: 1320px) {
   :root { --inspector-width: 360px; --sidebar-width: 240px; }
 }
 
-@media (max-width: 1440px) and (min-width: 1121px) {
+@media (max-width: 1320px) and (min-width: 1121px) {
   .inspector-visible .header-controls-text { display: none; }
 }
 
