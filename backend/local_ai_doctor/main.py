@@ -439,7 +439,6 @@ def create_app(
         registry = ModelRegistry(effective_settings, repository, worker)
         await registry.refresh()
         await repository.recover_incomplete_runs()
-        runs = RunManager(effective_settings, repository, registry, worker, events, telemetry)
         uploads = UploadStore(
             effective_settings.paths.uploads,
             repository,
@@ -449,6 +448,10 @@ def create_app(
             maximum_video_frame_pixels=effective_settings.limits.video_frame_pixels,
             maximum_decoded_media_pixels=effective_settings.limits.decoded_media_pixels,
             maximum_media_duration_seconds=effective_settings.limits.media_duration_seconds,
+        )
+        # Generation resolves chat attachments through the confined upload store.
+        runs = RunManager(
+            effective_settings, repository, registry, worker, events, telemetry, uploads
         )
         workspace = WorkspaceService(repository)
         app.state.services = ApplicationServices(

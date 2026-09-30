@@ -7,7 +7,7 @@ import json
 import logging
 import secrets
 import uuid
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
@@ -20,6 +20,7 @@ from ..api.schemas import (
     TokenBranchCreate,
 )
 from ..config import AppSettings, DeviceMode, DType, InstrumentationLevel
+from ..domain.capabilities import Capability, CapabilityState
 from ..domain.models import ModelDescriptor, ModelTask
 from ..errors import (
     CapabilityUnavailableError,
@@ -32,6 +33,7 @@ from ..persistence import TelemetryWriter, WorkspaceRepository
 from ..workers import InferenceReservation, ModelWorkerSupervisor, WorkerFailure
 from .events import EventBroker
 from .models import ModelRegistry
+from .uploads import UploadStore
 
 logger = logging.getLogger(__name__)
 
@@ -60,20 +62,31 @@ def _now() -> str:
 
 _GENERATION_ROLES = frozenset({"system", "user", "assistant", "tool"})
 _HISTORICAL_MESSAGE_STATUSES = frozenset({"complete", "cancelled", "failed"})
+_CHAT_MEDIA_CAPABILITIES = {"image": Capability.VISION, "video": Capability.VIDEO}
 
 
-def _generation_messages(lineage: list[dict[str, Any]]) -> list[dict[str, str]]:
-    return [
-        {"role": str(message["role"]), "content": str(message["content"])}
-        for message in lineage
-        if message["role"] in _GENERATION_ROLES
-        and message["status"] in _HISTORICAL_MESSAGE_STATUSES
-    ]
+def _generation_messages(
+    lineage: list[dict[str, Any]],
+    media: Mapping[str, list[dict[str, str]]] | None = None,
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for message in lineage:
+        if (
+            message["role"] not in _GENERATION_ROLES
+            or message["status"] not in _HISTORICAL_MESSAGE_STATUSES
+        ):
+            continue
+        entry: dict[str, Any] = {"role": str(message["role"]), "content": str(message["content"])}
+        attachments = (media or {}).get(str(message["id"]))
+        if attachments:
+            entry["attachments"] = attachments
+        messages.append(entry)
+    return messages
 
 
 def _with_system_prompt(
-    messages: list[dict[str, str]], system_prompt: object
-) -> tuple[list[dict[str, str]], str | None]:
+    messages: list[dict[str, Any]], system_prompt: object
+) -> tuple[list[dict[str, Any]], str | None]:
     """Prepend the chat-level system prompt unless the lineage already opens with one.
 
     Returns the messages plus the prompt that was actually applied (the run snapshot).
@@ -86,7 +99,7 @@ def _with_system_prompt(
     return [{"role": "system", "content": system_prompt}, *messages], system_prompt
 
 
-def _rendered_history_bytes(messages: list[dict[str, str]]) -> int:
+def _rendered_history_bytes(messages: list[dict[str, Any]]) -> int:
     """Measure the deterministic conversation envelope used by the fallback renderer."""
 
     if len(messages) == 1 and messages[0]["role"] == "user":
@@ -128,6 +141,7 @@ class RunManager:
         worker: ModelWorkerSupervisor,
         events: EventBroker,
         telemetry: TelemetryWriter,
+        uploads: UploadStore,
     ) -> None:
         self.settings = settings
         self.repository = repository
@@ -135,8 +149,59 @@ class RunManager:
         self.worker = worker
         self.events = events
         self.telemetry = telemetry
+        self.uploads = uploads
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._reservations: dict[str, InferenceReservation] = {}
+
+    async def _chat_media(
+        self, descriptor: ModelDescriptor, attachment_ids: Sequence[str]
+    ) -> list[dict[str, str]]:
+        """Resolve stored attachments the selected generator can read natively.
+
+        Paths come only from the upload store, which confines them to its root; the
+        worker decodes nothing else. Kinds without a usable capability are rejected
+        before any chat or run state is written.
+        """
+
+        media: list[dict[str, str]] = []
+        for attachment_id in attachment_ids:
+            attachment, path = await self.uploads.resolve(attachment_id)
+            kind = str(attachment["media_type"]).split("/", maxsplit=1)[0]
+            capability = _CHAT_MEDIA_CAPABILITIES.get(kind)
+            support = descriptor.capabilities.support(capability) if capability else None
+            if support is None or support.state not in {
+                CapabilityState.FULL,
+                CapabilityState.PARTIAL,
+            }:
+                raise CapabilityUnavailableError(
+                    "the selected generation adapter does not expose native media input",
+                    hint="Choose a generation model whose vision or video capability is available, or remove the attachment.",
+                    details={
+                        "attachment_id": attachment_id,
+                        "media_kind": kind,
+                        "reason": support.reason
+                        if support is not None
+                        else "only image and video attachments can accompany a chat message",
+                    },
+                )
+            media.append({"kind": kind, "path": str(path)})
+        return media
+
+    async def _lineage_media(
+        self, descriptor: ModelDescriptor, lineage: list[dict[str, Any]]
+    ) -> dict[str, list[dict[str, str]]]:
+        """Media attached to earlier messages, so re-rendered history keeps it."""
+
+        linked = await self.repository.list_message_attachments(
+            [str(message["id"]) for message in lineage]
+        )
+        return {
+            message_id: await self._chat_media(
+                descriptor, [str(item["id"]) for item in attachments]
+            )
+            for message_id, attachments in linked.items()
+            if attachments
+        }
 
     def _release_generation_reservation(
         self,
@@ -163,11 +228,7 @@ class RunManager:
                 "attachment count exceeds the configured per-request limit",
                 details={"limit": self.settings.limits.attachment_count},
             )
-        if request.attachment_ids:
-            raise CapabilityUnavailableError(
-                "the selected generation adapter does not expose native media input",
-                hint="Choose a generation model with a reviewed ProcessorAdapter or remove the attachments.",
-            )
+        new_media = await self._chat_media(descriptor, request.attachment_ids)
         chat = await self.repository.get_chat(request.chat_id)
         if chat is None:
             raise ChatNotFoundError("chat not found", details={"chat_id": request.chat_id})
@@ -188,8 +249,11 @@ class RunManager:
                         "parent_message_id": request.parent_message_id,
                     },
                 )
-        messages = _generation_messages(lineage)
-        messages.append({"role": "user", "content": request.prompt})
+        messages = _generation_messages(lineage, await self._lineage_media(descriptor, lineage))
+        user_turn: dict[str, Any] = {"role": "user", "content": request.prompt}
+        if new_media:
+            user_turn["attachments"] = new_media
+        messages.append(user_turn)
         messages, system_prompt = _with_system_prompt(messages, chat.get("system_prompt"))
         rendered_bytes = _rendered_history_bytes(messages)
         if rendered_bytes > self.settings.limits.prompt_bytes:
@@ -225,7 +289,7 @@ class RunManager:
         request: GenerationRunCreate,
         descriptor: ModelDescriptor,
         chat: Mapping[str, Any],
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         system_prompt: str | None,
         run_id: str,
         reservation: InferenceReservation,
@@ -299,6 +363,7 @@ class RunManager:
                 "quantization": self.settings.runtime.quantization.value,
             },
             chat_title=(title or "New chat") if chat["title"] == "New chat" else None,
+            attachment_ids=request.attachment_ids,
         )
         user_message = setup["user_message"]
         assistant_message = setup["assistant_message"]
@@ -391,7 +456,7 @@ class RunManager:
         run_id: str,
         message_id: str,
         model_id: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         sampling: dict[str, Any],
         effective_seed: int,
         instrumentation: str,
@@ -692,7 +757,8 @@ class RunManager:
             )
         settings = dict(source.get("settings") or {})
         messages, system_prompt = _with_system_prompt(
-            _generation_messages(branch), settings.get("system_prompt")
+            _generation_messages(branch, await self._lineage_media(descriptor, branch)),
+            settings.get("system_prompt"),
         )
         settings["system_prompt"] = system_prompt
         rendered_bytes = _rendered_history_bytes(messages)
@@ -778,7 +844,7 @@ class RunManager:
         descriptor: ModelDescriptor,
         source_message: Mapping[str, Any],
         branch_parent_id: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         settings: dict[str, Any],
         sampling: dict[str, Any],
         instrumentation: InstrumentationLevel,
@@ -968,7 +1034,8 @@ class RunManager:
             )
         settings = dict(source.get("settings") or {})
         messages, system_prompt = _with_system_prompt(
-            _generation_messages(lineage), settings.get("system_prompt")
+            _generation_messages(lineage, await self._lineage_media(descriptor, lineage)),
+            settings.get("system_prompt"),
         )
         settings["system_prompt"] = system_prompt
         rendered_bytes = _rendered_history_bytes(messages)

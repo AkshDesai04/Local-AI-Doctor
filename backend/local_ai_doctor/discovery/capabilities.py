@@ -95,13 +95,31 @@ def build_capability_matrix(evidence: ModelEvidence) -> CapabilityMatrix:
         (Capability.AUDIO, "audio"),
         (Capability.VIDEO, "video"),
     ):
-        entries[capability] = (
-            _full()
-            if modality in evidence.modalities and evidence.has_processor
-            else _unsupported(f"no native {modality} processor was discovered")
-        )
+        if modality not in evidence.modalities or not evidence.has_processor:
+            entries[capability] = _unsupported(f"no native {modality} processor was discovered")
+        elif embedding:
+            entries[capability] = _full()
+        elif evidence.task is not ModelTask.TEXT_GENERATION or modality == "audio":
+            entries[capability] = _unsupported(
+                f"{modality} chat input is not implemented for this generation path"
+            )
+        else:
+            # Chat media goes through the checkpoint's own processor and chat template.
+            entries[capability] = _partial(
+                "validated on Qwen3-VL; other processor families best-effort",
+                "media is decoded only from uploaded attachments",
+                "video frames are sampled by the processor's own defaults",
+            )
 
-    native_modalities = evidence.modalities.intersection({"image", "audio", "video"})
+    native_modalities = {
+        modality
+        for capability, modality in (
+            (Capability.VISION, "image"),
+            (Capability.AUDIO, "audio"),
+            (Capability.VIDEO, "video"),
+        )
+        if entries[capability].state is not CapabilityState.UNSUPPORTED
+    }
     entries[Capability.NATIVE_FILE_INPUT] = (
         _partial(
             "only processor-declared native media types are accepted",

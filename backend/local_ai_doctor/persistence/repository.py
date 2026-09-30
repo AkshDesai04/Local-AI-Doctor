@@ -212,34 +212,44 @@ class WorkspaceRepository:
             (chat_id,),
         )
         decoded_messages = [_decode_json_columns(message) for message in messages]
-        message_ids = [str(message["id"]) for message in decoded_messages]
-        attachments_by_message: dict[str, list[dict[str, Any]]] = {
-            message_id: [] for message_id in message_ids
-        }
-        if message_ids:
-            placeholders = ",".join("?" for _ in message_ids)
-            attachment_rows = await self.database.fetch_all(
-                f"""
-                SELECT association.message_id, association.ordinal,
-                       attachment.id, attachment.original_name, attachment.media_type,
-                       attachment.size_bytes, attachment.metadata_json,
-                       attachment.preprocessing_json, attachment.created_at
-                FROM message_attachments AS association
-                JOIN attachments AS attachment ON attachment.id = association.attachment_id
-                WHERE association.message_id IN ({placeholders})
-                ORDER BY association.message_id, association.ordinal
-                """,
-                tuple(message_ids),
-            )
-            for attachment in attachment_rows:
-                decoded = _decode_json_columns(attachment)
-                message_id = str(decoded.pop("message_id"))
-                decoded.pop("ordinal", None)
-                attachments_by_message.setdefault(message_id, []).append(decoded)
+        attachments_by_message = await self.list_message_attachments(
+            [str(message["id"]) for message in decoded_messages]
+        )
         for message in decoded_messages:
             message["attachments"] = attachments_by_message.get(str(message["id"]), [])
         chat["messages"] = decoded_messages
         return chat
+
+    async def list_message_attachments(
+        self, message_ids: Sequence[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return each message's attachments in their stored order."""
+
+        attachments_by_message: dict[str, list[dict[str, Any]]] = {
+            message_id: [] for message_id in message_ids
+        }
+        if not message_ids:
+            return attachments_by_message
+        placeholders = ",".join("?" for _ in message_ids)
+        attachment_rows = await self.database.fetch_all(
+            f"""
+            SELECT association.message_id, association.ordinal,
+                   attachment.id, attachment.original_name, attachment.media_type,
+                   attachment.size_bytes, attachment.metadata_json,
+                   attachment.preprocessing_json, attachment.created_at
+            FROM message_attachments AS association
+            JOIN attachments AS attachment ON attachment.id = association.attachment_id
+            WHERE association.message_id IN ({placeholders})
+            ORDER BY association.message_id, association.ordinal
+            """,
+            tuple(message_ids),
+        )
+        for attachment in attachment_rows:
+            decoded = _decode_json_columns(attachment)
+            message_id = str(decoded.pop("message_id"))
+            decoded.pop("ordinal", None)
+            attachments_by_message.setdefault(message_id, []).append(decoded)
+        return attachments_by_message
 
     async def list_chat_runs(self, chat_id: str) -> list[dict[str, Any]]:
         rows = await self.database.fetch_all(
@@ -498,6 +508,7 @@ class WorkspaceRepository:
         software: Mapping[str, Any],
         backend: Mapping[str, Any],
         chat_title: str | None = None,
+        attachment_ids: Sequence[str] = (),
     ) -> dict[str, dict[str, Any]]:
         """Create a generation's messages, run, and snapshot atomically."""
 
@@ -531,6 +542,16 @@ class WorkspaceRepository:
                     now,
                     now,
                 ),
+            )
+            await connection.executemany(
+                """
+                INSERT INTO message_attachments(message_id, attachment_id, ordinal)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (user_message_id, attachment_id, ordinal)
+                    for ordinal, attachment_id in enumerate(attachment_ids)
+                ],
             )
             await connection.execute(
                 """
