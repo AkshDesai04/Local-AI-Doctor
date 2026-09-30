@@ -21,11 +21,22 @@ const model = {
   },
 };
 
+const GiB = 1024 ** 3;
+const MiB = 1024 ** 2;
+
+const emptyResidency = {
+  models: [],
+  memory: { device: "cpu", total_bytes: null, free_bytes: null, torch_allocated_bytes: null, torch_reserved_bytes: null, cap_bytes: null, process_rss_bytes: 512 * MiB, system_available_bytes: 8 * GiB, safety_margin_bytes: 512 * MiB, ledger_age_seconds: 0.5, stale: false },
+  max_loaded_models: 4,
+};
+
 async function fixtureApi(page: Page): Promise<void> {
   await page.route("**/api/v1/**", async (route) => {
     const url = route.request().url();
     if (url.endsWith("/health")) {
-      await route.fulfill({ json: { status: "ok", version: "test", selectedBackend: "cpu" } });
+      await route.fulfill({ json: { status: "ok", version: "test", selectedBackend: "cpu", loaded_model: null, loaded_models: [] } });
+    } else if (url.endsWith("/models/resident")) {
+      await route.fulfill({ json: emptyResidency });
     } else if (url.endsWith("/models")) {
       await route.fulfill({ json: [model] });
     } else if (url.includes("/chats?")) {
@@ -84,6 +95,45 @@ async function conversationFixtureApi(page: Page): Promise<void> {
   });
 }
 
+const secondModel = { ...model, id: "fixture-second", name: "Second UI Fixture", fingerprint: "fixture-second" };
+const residents = [
+  { model_key: "key-first", model_id: model.id, display_name: model.name, device: "cuda:0", dtype: "bfloat16", quantization: "none", strict_vram: true, placement: "gpu", gpu_bytes: 2 * GiB, cpu_bytes: 96 * MiB, kv_reserve_bytes: 256 * MiB, load_seconds: 4.2, last_used_at: "2026-10-01T09:00:00Z", in_use: false },
+  { model_key: "key-second", model_id: secondModel.id, display_name: secondModel.name, device: "cuda:0", dtype: "float16", quantization: "none", strict_vram: false, placement: "offload", gpu_bytes: 1.5 * GiB, cpu_bytes: GiB, kv_reserve_bytes: 256 * MiB, load_seconds: 9.8, last_used_at: "2026-10-01T09:05:00Z", in_use: false },
+];
+let loadRequests: unknown[] = [];
+
+async function residencyFixtureApi(page: Page): Promise<void> {
+  loadRequests = [];
+  await page.route("**/api/v1/**", async (route) => {
+    const url = route.request().url();
+    if (url.endsWith("/health")) {
+      await route.fulfill({ json: {
+        status: "ok",
+        worker: "ready",
+        loaded_model: { model_id: secondModel.id, device: "cuda:0" },
+        loaded_models: residents.map(({ model_key, model_id, device, dtype, quantization, placement, strict_vram }) => ({ model_key, model_id, device, dtype, quantization, placement, strict_vram })),
+      } });
+    } else if (url.endsWith("/models/resident")) {
+      await route.fulfill({ json: {
+        models: residents,
+        memory: { device: "cuda:0", total_bytes: 8 * GiB, free_bytes: 3.5 * GiB, torch_allocated_bytes: 3.5 * GiB, torch_reserved_bytes: 4 * GiB, cap_bytes: 7 * GiB, process_rss_bytes: 1.2 * GiB, system_available_bytes: 10 * GiB, safety_margin_bytes: 512 * MiB, ledger_age_seconds: 1.2, stale: false },
+        max_loaded_models: 4,
+      } });
+    } else if (url.endsWith(`/models/${model.id}/load`)) {
+      loadRequests.push(route.request().postDataJSON());
+      await route.fulfill({ json: { ...model, lifecycle: "loaded", loaded_device: "cuda:0", model_key: "key-first", placement: "gpu", strict_vram: false, evicted_model_keys: [] } });
+    } else if (url.endsWith("/models")) {
+      await route.fulfill({ json: [model, secondModel] });
+    } else if (url.includes("/chats?")) {
+      await route.fulfill({ json: [] });
+    } else if (url.endsWith("/configuration")) {
+      await route.fulfill({ json: { effective: { runtime: { device: "auto", dtype: "auto", strict_vram: true, max_loaded_models: 4 } }, precedence: [] } });
+    } else {
+      await route.fulfill({ status: 404, json: { message: "Not part of this UI fixture." } });
+    }
+  });
+}
+
 const systemPromptChat = { id: "chat-sp", title: "Prompted chat", created_at: "2026-09-12T00:00:00Z", updated_at: "2026-09-12T00:00:02Z" };
 let systemPromptState: { stored: string | null; patches: unknown[] } = { stored: null, patches: [] };
 
@@ -120,6 +170,7 @@ async function systemPromptFixtureApi(page: Page): Promise<void> {
 test.beforeEach(async ({ page }, testInfo) => {
   if (testInfo.title.includes("mobile chat cleans")) await conversationFixtureApi(page);
   else if (testInfo.title.includes("system prompt")) await systemPromptFixtureApi(page);
+  else if (testInfo.title.includes("GPU memory ledger")) await residencyFixtureApi(page);
   else await fixtureApi(page);
   await page.goto("/");
 });
@@ -224,4 +275,40 @@ test("laptop layout keeps the context meter inside the composer and inspector ta
   await expect(page.getByRole("tab", { name: "Overview" })).toHaveText("Overview");
   await expect(page.getByRole("tab", { name: "Overview" })).toBeVisible();
   await expect(page.getByRole("tab", { name: "Experts" })).toHaveAttribute("aria-disabled", "true");
+});
+
+test("model registry shows the GPU memory ledger, load options, and every resident copy", async ({ page }, testInfo) => {
+  const mobile = testInfo.project.name === "mobile-chromium";
+  await expect(page.getByText("cuda:0 · fp16 · offload")).toHaveCount(1);
+  if (!mobile) await expect(page.getByRole("meter", { name: "GPU memory in use" })).toHaveAttribute("aria-valuetext", "4.5 GiB of 8 GiB");
+  if (mobile) await page.getByRole("button", { name: "Open navigation" }).click();
+  await page.getByRole("button", { name: "Models" }).click();
+
+  const ledger = page.getByRole("region", { name: "Resident memory" });
+  await expect(ledger.getByRole("heading", { name: "GPU memory" })).toBeVisible();
+  await expect(ledger.getByText("2 of 4 resident")).toBeVisible();
+  const breakdown = ledger.getByRole("list", { name: "GPU memory breakdown" });
+  await expect(breakdown.getByRole("listitem").filter({ hasText: model.name })).toContainText("2 GiB");
+  await expect(breakdown.getByRole("listitem").filter({ hasText: "Safety margin" })).toContainText("512 MiB");
+  await breakdown.getByRole("listitem").filter({ hasText: secondModel.name }).focus();
+  await expect(ledger.getByText(/^Second UI Fixture: 1.5 GiB/)).toBeVisible();
+
+  await expect(page.getByRole("list", { name: /^Resident copies of/ })).toHaveCount(2);
+  const secondCopies = page.getByRole("list", { name: `Resident copies of ${secondModel.name}` });
+  await expect(secondCopies.getByText("Offloaded to system RAM")).toBeVisible();
+  await expect(secondCopies.getByRole("button", { name: /^Unload Second UI Fixture/ })).toBeEnabled();
+
+  const panel = page.getByRole("group", { name: `Load options for ${model.name}` });
+  await expect(panel.getByRole("combobox", { name: "Device" })).toHaveValue("auto");
+  await expect(panel.getByRole("combobox", { name: "Data type" })).toHaveValue("auto");
+  const strict = panel.getByRole("switch", { name: /Strict VRAM/ });
+  await expect(strict).toBeChecked();
+  await strict.click();
+  await panel.getByRole("button", { name: "Load" }).click();
+  await expect.poll(() => loadRequests).toEqual([{ device: "auto", dtype: "auto", strictVram: false }]);
+
+  const bounds = await ledger.boundingBox();
+  const viewport = page.viewportSize();
+  if (!bounds || !viewport) throw new Error("Expected a measurable memory ledger.");
+  expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.width + 0.5);
 });
