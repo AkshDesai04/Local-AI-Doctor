@@ -28,18 +28,44 @@ Structured application errors use:
 }
 ```
 
-Validation errors use code `invalid_request` with a bounded `details.issues` array. Resource and conflict errors use the same envelope: `chat_not_found` (404, including creating a message or run in a chat that does not exist) and `run_not_found` (404), `not_found` for an unknown `/api` path (404), `run_not_cancellable`, `confirmation_required`, and `model_not_loaded` (409, unloading a model by ID while a different model is resident), and `limit_exceeded` (413). Errors raised by the router itself use the envelope too: an unsupported method on a known or unknown path returns 405 `method_not_allowed` (with the `Allow` header), and a missing static asset returns 404 `not_found`; any other framework status uses code `http_error`. The message is the canned HTTP status phrase, never request text. Client-side application routes still fall back to the frontend shell for `GET`. The bundled client also accepts the older `{"detail":"..."}` shape.
+Validation errors use code `invalid_request` with a bounded `details.issues` array. Resource and conflict errors use the same envelope: `chat_not_found` (404, including creating a message or run in a chat that does not exist) and `run_not_found` (404), `not_found` for an unknown `/api` path (404), `run_not_cancellable`, `confirmation_required`, and `model_not_resident` (409, unloading a model or resident key that is not resident), `worker_busy` (409, including when `runtime.max_loaded_models` residents are all pinned by the running job), and `limit_exceeded` (413). Errors raised by the router itself use the envelope too: an unsupported method on a known or unknown path returns 405 `method_not_allowed` (with the `Allow` header), and a missing static asset returns 404 `not_found`; any other framework status uses code `http_error`. The message is the canned HTTP status phrase, never request text. Client-side application routes still fall back to the frontend shell for `GET`. The bundled client also accepts the older `{"detail":"..."}` shape.
 
 Failures reported by the model worker (model load and unload, embeddings, prompt scoring) use the same envelope with the worker's error code and a status chosen from it. The message and hint are the worker's fixed, redacted text; exception text and paths never appear.
 
 | Worker code | HTTP status | Envelope `code` |
 | --- | --- | --- |
-| `model_out_of_memory`, `out_of_memory` | 507 | `out_of_memory` (the original worker code is kept in `details.worker_code`) |
+| `model_out_of_memory`, `out_of_memory`, `insufficient_memory` | 507 | `out_of_memory` (the original worker code is kept in `details.worker_code`) |
 | `model_worker_timeout`, `inference_timeout` | 504 | unchanged |
-| `model_worker_state_mismatch` | 409 | unchanged |
+| `model_worker_state_mismatch`, `model_not_resident`, `worker_busy` | 409 | unchanged |
 | any other code (for example `cuda_runtime_error`, `model_worker_error`) | 502 | unchanged |
 
-Out-of-memory and timeout failures are marked `retryable`.
+Out-of-memory and timeout failures are marked `retryable`. A worker's `insufficient_memory` report carries only codes and numbers (`memory_kind` `vram` or `ram`, `required_bytes`, `available_bytes`, and `estimate` `{weights, kv_reserve, margin}`), which the envelope returns in `details`.
+
+A model load that does not fit after evicting idle residents returns 507 `out_of_memory` built by the registry:
+
+```json
+{
+  "error": {
+    "code": "out_of_memory",
+    "message": "the model does not fit the available memory",
+    "retryable": true,
+    "hint": "Quantize the model, unload another model, or turn off Strict VRAM to allow system-RAM offload.",
+    "details": {
+      "memory_kind": "vram",
+      "required_bytes": 8053063680,
+      "available_bytes": 6442450944,
+      "estimate": {"weights": 7642398720, "kv_reserve": 410664960, "margin": 536870912},
+      "strict_vram": true,
+      "placement": "gpu_only",
+      "resident_model_keys": ["3f1c..."],
+      "pinned_model_keys": [],
+      "evicted_model_keys": ["9ab2..."]
+    }
+  }
+}
+```
+
+`evicted_model_keys` lists residents that were unloaded while trying to make room; a CPU (`memory_kind: "ram"`) failure has a different hint.
 
 POST, PUT, and PATCH bodies are bounded before route parsing. Non-multipart bodies may use at most `limits.prompt_bytes + 1 MiB`; upload multipart bodies may use at most `limits.upload_bytes + 1 MiB`. The inner services separately enforce the exact prompt/content and uploaded-file limits. A declared or streamed envelope overrun returns HTTP 413 with code `limit_exceeded`.
 
@@ -49,7 +75,7 @@ POST, PUT, and PATCH bodies are bounded before route parsing. Non-multipart bodi
 
 | Method | Path | Result |
 | --- | --- | --- |
-| `GET` | `/health` | API, database, worker, loaded-model, and protocol status. |
+| `GET` | `/health` | API, database, worker, resident-model, and protocol status. |
 | `GET` | `/configuration` | Redacted effective configuration and precedence list. |
 | `GET` | `/hardware` | Hardware inventory and explainable current selection. |
 | `GET` | `/storage` | SQLite size and row counts for core tables. |
@@ -61,18 +87,116 @@ POST, PUT, and PATCH bodies are bounded before route parsing. Non-multipart bodi
 | --- | --- | --- |
 | `GET` | `/models` | Current startup/refresh scan with redacted roots, descriptors, diagnostics, and capability matrices. |
 | `POST` | `/models/refresh` | Re-scan configured roots and return the new report. Does not load weights. |
-| `POST` | `/models/{model_id}/load` | Load or reuse a checkpoint on optional `device`/`dtype`. Loading another model unloads the previous one. |
-| `POST` | `/models/unload` | Unload whichever model is resident. |
-| `POST` | `/models/{model_id}/unload` | Unload only if that ID is selected; conflicts when another model is loaded. |
+| `POST` | `/models/{model_id}/load` | Make a checkpoint resident (or reuse its resident) on optional `device`/`dtype`, evicting least-recently-used idle residents only when needed. |
+| `GET` | `/models/resident` | Every resident model plus the worker memory ledger. |
+| `POST` | `/models/resident/{model_key}/unload` | Unload one resident; 409 `model_not_resident` for an unknown key. |
+| `POST` | `/models/unload` | Unload every resident. |
+| `POST` | `/models/{model_id}/unload` | Unload every resident of that model; 409 `model_not_resident` when it has none. |
 | `GET` | `/models/{model_id}/inspect` | Redacted descriptor plus bounded tokenizer/generation/special-token metadata, chat template, and sampler order. |
 
 Load body, all fields optional:
 
 ```json
-{"device":"cuda","dtype":"bfloat16"}
+{"device":"cuda","dtype":"bfloat16","quantization":"none","strictVram":true}
 ```
 
-`device` is `auto`, `cpu`, or `cuda`; dtype is `auto`, `float32`, `float16`, or `bfloat16`.
+`device` is `auto`, `cpu`, or `cuda`; dtype is `auto`, `float32`, `float16`, or `bfloat16`. `quantization` accepts only `none` in this release (other values return 409 `capability_unavailable`). `strictVram` (or `strict_vram`) defaults to `runtime.strict_vram`.
+
+#### Resident models
+
+One worker process holds several resident models at once. A resident is identified by `model_key`, the first 20 hex characters of `sha256(json([model_id, fingerprint, device, effective_dtype, quantization]))`, so the same checkpoint on another device or dtype is a separate resident. A load with the same key reuses the resident and marks it most recently used, except that a Strict VRAM request for a resident that was offloaded to system RAM unloads and re-places it on the GPU.
+
+Before loading, the worker estimates the resident bytes (weights at the compute dtype plus a KV reserve of `runtime.kv_reserve_tokens`) and compares them with free device memory plus the allocator's unused cache, less `runtime.vram_safety_margin_bytes` and clipped to `runtime.vram_budget_bytes` when set. When the model does not fit, the registry evicts least-recently-used residents that the running job does not use, but only when their measured `gpu_bytes` can make room, then retries. If it still does not fit, Strict VRAM returns the 507 above; with Strict VRAM off, a generation model retries once with accelerate layer offload (`device_map="auto"` bounded by `max_memory`), which is much slower. Residents beyond `runtime.max_loaded_models` are evicted the same way. While any strict CUDA resident exists, the worker caps its allocator with `torch.cuda.set_per_process_memory_fraction`, so an allocation beyond free memory fails instead of spilling into system RAM through the driver.
+
+The load response keeps its previous fields (the descriptor, `lifecycle`, `loaded_device`, `selection`, and the worker's `load` payload) and adds:
+
+```json
+{
+  "model_key": "3f1c0d9e8b7a6c5d4e3f",
+  "placement": "gpu",
+  "quantization": "none",
+  "strict_vram": true,
+  "evicted_model_keys": [],
+  "load": {
+    "model_key": "3f1c0d9e8b7a6c5d4e3f",
+    "placement": "gpu",
+    "gpu_bytes": 2006974464,
+    "cpu_bytes": 104857600,
+    "kv_reserve_bytes": 109051904,
+    "device_map_summary": {"cuda:0": 1},
+    "estimate": {"weights": 1999994880, "kv_reserve": 109051904, "margin": 536870912},
+    "ledger": {}
+  }
+}
+```
+
+`placement` is `gpu`, `offload` (layers split between GPU and system RAM), or `cpu`, read back from the device map the load produced. `gpu_bytes` is the allocator growth measured across the load; `cpu_bytes` is the process resident-set growth and is approximate.
+
+`GET /models/resident` response (`models` is ordered least recently used first):
+
+```json
+{
+  "models": [
+    {
+      "model_key": "3f1c0d9e8b7a6c5d4e3f",
+      "model_id": "MODEL_ID",
+      "display_name": "gemma-3-1b-it",
+      "device": "cuda:0",
+      "dtype": "bfloat16",
+      "quantization": "none",
+      "strict_vram": true,
+      "placement": "gpu",
+      "gpu_bytes": 2006974464,
+      "cpu_bytes": 104857600,
+      "kv_reserve_bytes": 109051904,
+      "load_seconds": 3.4,
+      "last_used_at": "2026-10-01T00:00:00+00:00",
+      "in_use": false
+    }
+  ],
+  "memory": {
+    "device": "cuda:0",
+    "total_bytes": 8585216000,
+    "free_bytes": 5100273664,
+    "torch_allocated_bytes": 2006974464,
+    "torch_reserved_bytes": 2147483648,
+    "cap_bytes": 6710886400,
+    "process_rss_bytes": 1932735283,
+    "system_available_bytes": 17179869184,
+    "safety_margin_bytes": 536870912,
+    "ledger_age_seconds": 0.01,
+    "stale": false
+  },
+  "max_loaded_models": 4
+}
+```
+
+`in_use` marks residents the currently admitted job has loaded. The worker ledger is refreshed only while nothing is admitted or running, because a timed-out worker request recycles the worker; otherwise the last ledger is served with `stale: true`. `cap_bytes` is `null` while no strict CUDA resident exists. Before the worker has used CUDA, the device totals are `null` rather than creating a CUDA context just to report them; on a CPU-only host `device` is `cpu` and the totals describe system RAM.
+
+`POST /models/{model_id}/unload` returns the descriptor with `lifecycle: "unloaded"`, `loaded_device: null`, and `unload: {unloaded_model_id, unloaded_model_keys, freed_bytes, leaked_bytes, ledger}`. The key and unload-all routes return the worker payload: `unloaded_model_id`, `unloaded_model_ids`, `unloaded_model_keys`, `freed_bytes` (allocator bytes actually returned), `leaked_bytes` (measured load bytes that were not returned), `memory_before`, `memory_after`, and `ledger`.
+
+`GET /health` keeps `status`, `database`, `worker`, `loaded_model` (the most recently used resident, or `null`), and `protocol_version: 1`, and adds `loaded_models`, ordered least recently used first:
+
+```json
+{
+  "status": "ok",
+  "database": "ready",
+  "worker": "ready",
+  "loaded_model": {"model_key": "3f1c0d9e8b7a6c5d4e3f", "model_id": "MODEL_ID"},
+  "loaded_models": [
+    {
+      "model_key": "3f1c0d9e8b7a6c5d4e3f",
+      "model_id": "MODEL_ID",
+      "device": "cuda:0",
+      "dtype": "bfloat16",
+      "quantization": "none",
+      "placement": "gpu",
+      "strict_vram": true
+    }
+  ],
+  "protocol_version": 1
+}
+```
 
 In the scan report, each descriptor's `dtype` is the SafeTensors header dtype that stores the most parameters (`null` when no header exists, for example pickle-only folders); the configuration's claim is `metadata.declared_dtype`. `fingerprint.total_weight_bytes` counts only the files a Transformers load reads. A descriptor with any `error` diagnostic has `loadable: false` and every capability `unsupported`. Each `roots[]` entry carries root-level diagnostics, including `empty_model_directory` and `gguf_only_directory` for folders that cannot be candidates, with root-relative names only.
 
@@ -123,6 +247,8 @@ Canonical generation request:
   "dtype": "auto",
   "instrumentation": "token",
   "deterministic_reference_mode": false,
+  "strict_vram": true,
+  "quantization": "none",
   "sampling": {
     "max_output_tokens": 64,
     "temperature": 0.6,
@@ -139,7 +265,7 @@ Canonical generation request:
 }
 ```
 
-The endpoint also accepts a browser-shaped body: `chatId`, `modelId`, `content`, `parentMessageId`, `attachmentIds`, and a nested `settings` object with `device`, `dtype`, `instrumentation`, `reasoning`, `seed`, `deterministic`, `temperature`, `alternatives`, `maxOutputTokens`, `topK`, `topP`, `minP`, `repetitionPenalty`, `frequencyPenalty`, `presencePenalty`, and `stopSequences`. Canonical top-level fields (including `deterministic_reference_mode`) and an explicit `sampling` object always win; `settings` only fills what is not already set. An unrecognized key inside `settings` (including a snake_case one) or a `settings` value that is not an object is rejected with 422 `invalid_request`.
+The endpoint also accepts a browser-shaped body: `chatId`, `modelId`, `content`, `parentMessageId`, `attachmentIds`, and a nested `settings` object with `device`, `dtype`, `instrumentation`, `reasoning`, `seed`, `deterministic`, `strictVram`, `quantization`, `temperature`, `alternatives`, `maxOutputTokens`, `topK`, `topP`, `minP`, `repetitionPenalty`, `frequencyPenalty`, `presencePenalty`, and `stopSequences`. Canonical top-level fields (including `deterministic_reference_mode`) and an explicit `sampling` object always win; `settings` only fills what is not already set. An unrecognized key inside `settings` (including a snake_case one) or a `settings` value that is not an object is rejected with 422 `invalid_request`.
 
 The response includes camel-case convenience fields and canonical objects:
 
@@ -162,7 +288,9 @@ When the chat has a system prompt, generation prepends it as a `system` message 
 
 `sampling.max_output_tokens` is the normal generated-token limit. For explicitly tagged reasoning models only, if the whole configured budget is spent before any visible answer text, the worker can use one additional context-clipped answer window of at most the configured size. Warning events and the terminal summary expose whether that allowance activated and how many additional tokens were used.
 
-Generation, embeddings, and prompt scoring share single-worker admission. At most one inference is runnable/active and `runtime.queue_limit` additional operations may wait. Queue overflow is a structured 429 and occurs before a generation creates chat/run state. Explicit model load/unload returns a worker-busy conflict while any inference is admitted.
+`strict_vram` and `quantization` choose how the run's model is made resident; when omitted they fall back to `runtime.strict_vram` and `runtime.quantization`. They are recorded in `settings` and `reproducibility` together with the real `placement` and `model_key` once the model is resident, and `reproducibility.scheduling` (`{concurrent_sessions_max, interleaved}`) once the run ends. Replay and token branching reuse the source run's recorded choices.
+
+Generation, embeddings, and prompt scoring share single-worker admission. At most one job is runnable/active and `runtime.queue_limit` additional operations may wait. Queue overflow is a structured 429 and occurs before a generation creates chat/run state. Explicit model load/unload returns a worker-busy conflict while any inference is admitted.
 
 Replay requires a completed generation, an attached assistant/user branch, and a currently registered model with the recorded fingerprint. It creates a new assistant sibling and run linked through `parent_run_id`, reconstructs that branch's messages, and executes with the recorded seed, sampler, instrumentation, and deterministic-mode settings. The response has the same `runId`, `messageId`, `websocketUrl`, `run`, and `assistant_message` fields as creation, plus `parentRunId`. Replay is a new forward pass; matching output still depends on the recorded environment being reproducible.
 
@@ -246,12 +374,12 @@ Sequence numbers are per run and begin at one. They order the live stream and, f
 | Type | Important payload |
 | --- | --- |
 | `run_created` | queued status and effective seed. |
-| `stage` | `model_loading` or `prefill`; the latter includes rendered prompt, prompt count, context, template and tokenization durations. |
-| `model_loaded` | lifecycle, device/dtype selection, load duration, and memory. |
+| `stage` | `model_loading` or `prefill`; the latter includes rendered prompt, prompt count, context, template and tokenization durations, and the resident's `model_key`, `placement`, `quantization`, and `concurrent_sessions`. |
+| `model_loaded` | the load response above: lifecycle, device/dtype selection, `model_key`, `placement`, `evicted_model_keys`, load duration, and memory. |
 | `metric` | sampler order, seed/RNG, prefill, and prompt throughput. |
 | `token` | token identity, selected sampler likelihood, timing, decoded replacement, and segment; exact raw likelihood/rank, entropy/perplexity, and alternatives are populated only at `token`/`full`/`expert` instrumentation. |
 | `warning` | bounded model/runtime warning, for example `system_prompt_merged`. |
-| `completed` | finish reason, response/segment metrics, throughput, memory, and routing applicability. |
+| `completed` | finish reason, response/segment metrics, throughput, memory, the worker `ledger`, `scheduling` (`concurrent_sessions_max`, `interleaved`), and routing applicability. |
 | `cancelled` | same terminal summary shape with cancellation finish reason. |
 | `error` | structured failure code, message, and optional hint. |
 

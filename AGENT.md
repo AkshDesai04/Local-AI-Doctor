@@ -63,7 +63,7 @@ The following requirements came directly from the project conversation and are b
 - The Model registry settings UI is the user-facing wrapper for model-root configuration. It must persist backend-visible absolute paths into the writable user-local config and rescan.
 - Choosing CUDA must result in actual CUDA execution or a clear failure. The CPU Docker profile must never accept an explicit CUDA request and silently run it on CPU.
 - Verify CUDA with the installed PyTorch build, `torch.cuda.is_available()`, the selected device recorded by the backend, container smoke checks, and run metadata. A UI dropdown alone is not evidence.
-- Load one model at a time by default. Unload releases references and backend caches. Do not kill unrelated GPU processes just because VRAM is in use.
+- One worker process, N resident models bounded by VRAM and `runtime.max_loaded_models`, one admitted job at a time (a comparison is one job). Loading a model that does not fit evicts least-recently-used idle residents first; residents the running job uses are never evicted. If it still does not fit, Strict VRAM (the default, chosen per load) fails clearly with a 507, and only an explicit Strict VRAM off may offload layers to system RAM. Unload releases every reference and backend cache. Do not kill unrelated GPU processes just because VRAM is in use.
 
 ### 3.3 Reasoning and response presentation
 
@@ -134,7 +134,7 @@ The current 0.1-series implementation includes:
 - Stable directory fingerprints and complete reason-bearing capability matrices.
 - Reference causal and generic encoder-decoder generation loops with cache reuse.
 - SentenceTransformers-based embedding execution for supported inputs.
-- One spawned model worker, one resident model, and serialized inference admission.
+- One spawned model worker holding several resident models (least-recently-used eviction, Strict VRAM preflight and allocator cap, optional layer offload), round-robin generation sessions within one admitted job, and serialized job admission.
 - CPU and CUDA selection with explicit device/dtype reporting.
 - Streaming REST/WebSocket run orchestration, cancellation, replay, and persisted partial results.
 - Tiered token telemetry, raw and sampler distributions, timing, perplexity, and bounded alternatives.
@@ -148,8 +148,8 @@ Do not overstate these boundaries:
 
 - Discovery is not proof that a checkpoint can execute.
 - The adapter registry contracts exist, but the running worker still owns explicit built-in Transformers/SentenceTransformers paths.
-- Only one worker/model and one active/runnable inference are supported. `queue_limit` controls additional waiters.
-- ROCm, Metal, general multi-GPU placement, CPU offload, and non-`none` model-weight quantization are not implemented runtime paths.
+- Only one worker process and one active/runnable job are supported; the worker holds up to `max_loaded_models` residents and interleaves up to `max_concurrent_runs` generation sessions inside that job. `queue_limit` controls additional waiters.
+- ROCm, Metal, general multi-GPU placement, and non-`none` model-weight quantization are not implemented runtime paths. Layer offload to system RAM exists only for generation models on CUDA with Strict VRAM off.
 - MoE schemas/interfaces exist, but no production router hook is currently composed. The supplied checkpoints are dense.
 - Hidden-state probes, activation probes, logit lens, KV-cache inspection, and continuous hardware sampling are not implemented production telemetry.
 - Attention capture is partial, bounded, decoder-only, and unavailable when the model cannot return alignable eager attention tensors.
@@ -247,7 +247,7 @@ templates/SafeTensors
 
 Heavy model objects, tokenizer/processor instances, CUDA state, KV caches, and raw full-vocabulary tensors stay inside the worker. Only bounded, serializable commands/results/events cross the process boundary. A worker exception or process exit becomes a structured failure and must not leak an arbitrary traceback or local path through the public API.
 
-The application is optimized for one local user, one web process, one worker, one resident model, batch size one, and one inference lease at a time. Do not increase web/model workers merely to chase throughput without validating SQLite ordering, GPU ownership, admission semantics, and shutdown behavior.
+The application is optimized for one local user, one web process, one worker process holding several resident models, batch size one, and one inference lease at a time. Do not increase web/model workers merely to chase throughput without validating SQLite ordering, GPU ownership, admission semantics, and shutdown behavior.
 
 ## 7. Configuration contract
 
@@ -304,7 +304,7 @@ Configuration schema version is 1. Unknown fields fail. Future schema versions f
 - `features`: experimental attention/hidden-state/activation/logit-lens/router/multi-GPU flags.
 - `platform`: portable container paths/profile hints.
 
-Only claim a typed option works when the runtime path supports it. For example, CPU offload and non-`none` quantization are typed but rejected by the current reference loader.
+Only claim a typed option works when the runtime path supports it. For example, non-`none` quantization is typed but rejected by the current reference loader, and `runtime.cpu_offload: true` is rejected as superseded by `runtime.strict_vram: false`.
 
 Several fields are forward-looking or only partially honored today, including general backend selection, device placement, multi-worker/multi-model concurrency, scheduled retention, router controls, periodic utilization sampling, and most experimental probes. `features.attention_probe` is not the current capture gate: choosing `full` or `expert` instrumentation requests compatible causal attention capture.
 
@@ -383,8 +383,8 @@ The last recorded real-model workstation evidence used an RTX 4060 Laptop GPU wi
 - CUDA `auto` dtype resolves to BF16 on compute capability 8 or newer, otherwise FP16.
 - Physical NVIDIA hardware reported by `nvidia-smi` does not prove that the installed PyTorch runtime can use it.
 - Docker CPU and NVIDIA profiles both disable CPU fallback; an unavailable explicit CUDA request must fail clearly.
-- The worker loads local files only, calls evaluation mode, and places the model on the exact selected device.
-- A load is reused only when model identity and the complete runtime selection match.
+- The worker loads local files only, calls evaluation mode, and always places the model through a device map (never `.to()`): the exact selected device, CPU, or accelerate layer offload when Strict VRAM is off.
+- A resident is reused only when its key matches: model ID, fingerprint, device, effective dtype, and quantization. A Strict VRAM request re-places an offloaded resident on the GPU.
 - A worker timeout poisons IPC state. The supervisor retires/replaces the worker and queues atomically; if the old process cannot be terminated, fail closed.
 
 ## 9. Backend lifecycle and execution
@@ -408,8 +408,7 @@ Shutdown cancels orchestration, asks the worker to unload and exit, drains telem
 - Capacity is one runnable/active inference plus `runtime.queue_limit` waiters.
 - Queue overflow returns structured HTTP 429 before generation creates chat/run state.
 - Explicit load/unload conflicts while inference is admitted so lifecycle changes cannot overtake queued work.
-- Loading a different model unloads the resident model first.
-- RAM/VRAM budget checks compare discovered weight bytes with configured budgets. They are a lower-bound preflight, not a peak-memory guarantee.
+- Loading another model keeps existing residents when they fit. The worker preflight estimates weights at the compute dtype plus a KV reserve and compares them with free memory less `vram_safety_margin_bytes` (clipped to the configured budgets) before `from_pretrained`; the registry evicts least-recently-used residents the running job does not use, then fails with 507 under Strict VRAM or retries once with layer offload. It is an estimate, not a peak-memory guarantee.
 - OOMs, corrupt files, unsupported dtypes/devices, worker exits, and timeouts become bounded structured errors.
 
 ### 9.3 Generation flow
@@ -704,6 +703,8 @@ Models:
 - `GET /models`
 - `POST /models/refresh`
 - `POST /models/{model_id}/load`
+- `GET /models/resident`
+- `POST /models/resident/{model_key}/unload`
 - `POST /models/unload`
 - `POST /models/{model_id}/unload`
 - `GET /models/{model_id}/inspect`
@@ -1174,7 +1175,7 @@ NVIDIA execution requires all of:
 
 A loaded 1.5B-class BF16 checkpoint legitimately reserves roughly 3.5–4.3 GiB in the recorded environment. To release project-owned VRAM:
 
-1. Use the UI Unload control or `POST /api/v1/models/unload`.
+1. Use the UI Unload control, `POST /api/v1/models/resident/{model_key}/unload` for one resident, or `POST /api/v1/models/unload` for all of them.
 2. Verify the runtime released references and called CUDA cache/IPC collection.
 3. If the service is stale, gracefully stop the exact NVIDIA service.
 4. Recheck `nvidia-smi` and ownership before touching any remaining process.
@@ -1486,7 +1487,7 @@ The model-root update route uses HTTP `PUT`. Same-origin production does not req
 
 ## 23. Known limitations that must remain visible
 
-- One local user, one worker, one resident model, one inference at a time.
+- One local user, one worker process (several resident models bounded by VRAM), one admitted job at a time.
 - No universal Transformers compatibility guarantee.
 - No production MoE router capture for current supplied models.
 - No hidden-chain-of-thought access.

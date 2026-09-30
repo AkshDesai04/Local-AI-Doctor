@@ -4,7 +4,7 @@
 
 Local AI Doctor separates model-specific execution from application state and transport. The web process remains responsive when a model is slow, model files remain read-only, high-volume telemetry is batched, and every public capability is backed by discovered evidence rather than a model-name allowlist.
 
-The current release optimizes for one local user, one isolated model worker, one loaded model, and one active inference operation at a time. A bounded FIFO admission layer permits one runnable operation plus a configured number of waiters. Interfaces anticipate additional adapters and hardware backends, but the implementation does not claim universal model coverage.
+The current release optimizes for one local user and one isolated model worker process that holds several resident models, bounded by VRAM and `runtime.max_loaded_models`, with one admitted job at a time. A bounded FIFO admission layer permits one runnable job plus a configured number of waiters. Interfaces anticipate additional adapters and hardware backends, but the implementation does not claim universal model coverage.
 
 ## Runtime topology
 
@@ -27,7 +27,8 @@ FastAPI application                                                            :
         |  bounded multiprocessing queues
         v
       spawned worker process
-        |-- Transformers generation + KV cache + sampler
+        |-- resident models keyed by model_key (model, device, dtype, quantization)
+        |-- generation sessions (own KV cache + sampler), stepped round-robin
         `-- SentenceTransformers embeddings
 
 Configured model roots (read-only)       Application data (read/write)
@@ -44,6 +45,16 @@ Worker readiness is established by an IPC handshake from the spawned inference p
 initialized and entered its command loop; a live process identifier alone is not considered ready.
 
 Only serializable commands and events cross the worker boundary. PyTorch modules, tokenizer instances, CUDA state, and raw logits stay inside the spawned child process. A Python exception or process exit is translated into a structured worker failure; it does not intentionally expose a traceback through the API.
+
+## Resident models and sessions
+
+A pool of worker processes was rejected: each extra CUDA context costs 0.3 to 0.5 GB, per-process memory caps would compete, and GPU time-slicing would pollute timings. One worker instead keeps several `ResidentModel` records, each with its model, tokenizer or processor, placement (`gpu`, `offload`, or `cpu`), and measured `gpu_bytes`/`cpu_bytes`. Every model command may name a `model_key`; without one the most recently activated resident is used.
+
+Loads always pass a device map (`{"": "cuda:0"}`, `{"": "cpu"}`, or `"auto"` with `max_memory` for layer offload), never `.to(device)`. Before `from_pretrained` the worker estimates resident bytes from the SafeTensors headers (weights at the compute dtype plus a KV reserve) and refuses with a structured `insufficient_memory` report when free memory less the safety margin cannot hold them. While any strict CUDA resident exists, the worker caps its CUDA allocator so the driver cannot spill allocations into system RAM. Unloading removes accelerate hooks, drops every reference, empties the CUDA cache, and reports freed and leaked bytes.
+
+The parent `ModelWorkerSupervisor` mirrors the resident set (most recently used last) and clears it whenever the worker process is replaced. `ModelRegistry` owns the policy: it derives the resident key, reuses a matching resident, evicts least-recently-used residents that the running job does not use when the count limit or memory requires it, and then either fails with a 507 (Strict VRAM) or retries once with layer offload.
+
+A generation is a `GenerationSession`: construction renders and tokenizes, `prefill()` produces token-0 logits, and each `step()` samples and emits one token and runs the next forward pass. The worker loop blocks on its command queue only while no session is running; otherwise it polls, handles one command, and advances every session by one step, restoring each session's deterministic-algorithm flag, attention kernel, and multimodal RoPE state first. A per-run `cancel` command stops one session, while the shared cancel event stops them all. A session that raises reports its own error and the others continue.
 
 ## Package responsibilities
 
@@ -93,14 +104,14 @@ A changed fingerprint represents a new model identity, but an unchanged quick fi
 
 1. The API validates the request shape, capability, prompt byte limit, chat, and sampling settings, then reserves admission. A full queue returns 429 before chat or run state is created.
 2. Once admitted, it resolves the requested hardware selection, then creates user and pending assistant messages and persists a queued run with its reproducibility snapshot.
-3. A background task emits `run_created`, loads or reuses the selected model, and changes the run to `running`.
+3. A background task emits `run_created`, makes the selected model resident (reusing, evicting, or offloading as the registry decides), records the real placement and `model_key` in the run's reproducibility record, and changes the run to `running`.
 4. The worker renders the complete branch (led by the chat's system prompt when one is set) with the tokenizer chat template and `add_generation_prompt=true`, or a deterministic plain-text fallback when no template is available, then tokenizes with `add_special_tokens=false`. The fallback alone prepends the BOS token the tokenizer inserts by default.
 5. For a causal model, prompt prefill produces token-0 logits and a KV cache. Every decoder call receives absolute `cache_position` values, which multimodal-RoPE families such as Qwen3-VL require for decode positions. During compatible `full`/`expert` attention capture, the worker prefills the prompt prefix and then runs its final token as the single eager query that predicts token 0, avoiding a quadratic full-prompt attention result. For an encoder-decoder model, the source is encoded once, the decoder starts from a resolved decoder-start token, and both encoder outputs and decoder cache are reused. Each selected token produces the following distribution without an unnecessary final forward pass.
 6. The application sampler applies penalties, temperature, and filters in a fixed order. Every token event carries chosen-token/sampler fields, timing, and emitted reasoning classification; `token`, `full`, and `expert` additionally carry exact raw likelihood/rank, uncertainty/perplexity, and bounded distribution views. On supported causal decoders, `full` and `expert` also reduce each generated token's post-softmax attention rows to a mean across captured layers/heads, retain the top 128 source positions with explicit omitted mass, and attach the complete rendered-prompt token catalogue to token 0.
 7. Subject to persistence settings and per-run event/byte limits, token rows go to the telemetry writer and raw protocol events are persisted before fan-out. Live delivery continues when token persistence is disabled or truncated. Partial message text is checkpointed every eight tokens and at the terminal event.
 8. Completion, cancellation, or failure finalizes both message and run state while preserving partial data.
 
-Generation, embeddings, and prompt scoring share one FIFO execution lease. Capacity is one active/runnable inference plus `runtime.queue_limit` waiting reservations. Queued generation creation is asynchronous, so clients should follow the returned run ID over WebSocket or poll the run resource. Explicit load/unload operations reject while any inference is admitted, preventing lifecycle changes from overtaking queued work.
+Generation, embeddings, and prompt scoring share one FIFO execution lease. Capacity is one active/runnable job plus `runtime.queue_limit` waiting reservations; residents the admitted job has loaded are never evicted while it runs. Queued generation creation is asynchronous, so clients should follow the returned run ID over WebSocket or poll the run resource. Explicit load/unload operations reject while any inference is admitted, preventing lifecycle changes from overtaking queued work.
 
 ## Replay and portable workspaces
 

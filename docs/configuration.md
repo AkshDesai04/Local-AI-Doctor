@@ -106,17 +106,20 @@ Non-loopback configuration is rejected unless external access and a token are bo
 | `device` | `auto` | `auto`, `cpu`, or `cuda`. Auto chooses the first usable CUDA device, otherwise CPU. |
 | `allow_cpu_fallback` | `true` | Allows an unavailable CUDA request to fall back to CPU. |
 | `cpu_threads` | logical CPU count | Passed to `torch.set_num_threads`; test and container profiles override it. |
-| `ram_budget_bytes`, `vram_budget_bytes` | `null` | Before load, the selected backend rejects a checkpoint whose discovered SafeTensors weight bytes exceed its configured budget. This is a lower-bound preflight, not an estimate or cap for peak runtime memory. |
+| `ram_budget_bytes`, `vram_budget_bytes` | `null` | Optional caps used by the worker's load preflight. `vram_budget_bytes` bounds everything the worker allocates on the GPU, so a new resident must fit in the budget less the bytes already allocated; `ram_budget_bytes` bounds the worker's resident set for CPU and offloaded loads. The estimate counts weights and the KV reserve, not peak activations. |
 | `low_memory_loading` | `true` | Passed to Transformers model loading. |
-| `cpu_offload` | `false` | The reference adapter rejects model load when true; no offload map is implemented. |
+| `cpu_offload` | `false` | Superseded and rejected when `true`; set `strict_vram: false` to allow layer offload instead. |
 | `device_placement` | `sequential` | Reserved for adapter placement policies. |
 | `dtype` | `auto` | `float32`, `float16`, or `bfloat16`; auto uses BF16 on CUDA capability 8+, FP16 on older CUDA, and FP32 on CPU. CPU FP16 is rejected. |
 | `quantization` | `none` | Any non-`none` value is rejected at model load because no compatible weight-quantization adapter is installed. |
 | `attention_backend` | `auto` | `eager`, `sdpa`, or `flash-attention-2` is passed to Transformers when selected. A compatible decoder-only `full`/`expert` run temporarily selects eager attention so post-softmax rows can be returned, then restores this configured implementation. The run warns and continues without attribution when switching is unavailable. |
-| `load_one_model_at_a_time` | `true` | Requires `max_loaded_models=1`; the worker unloads before loading a different checkpoint. |
-| `max_loaded_models` | `1` | Values above one require disabling the policy, but the current single worker still holds one model. |
+| `strict_vram` | `true` | Default for each load (the load body, generation `settings.strictVram`, or `strict_vram` override it). Strict VRAM never spills weights into system RAM: a model that does not fit after evicting idle residents fails with 507 `out_of_memory`, and while any strict CUDA resident exists the worker caps its CUDA allocator (`torch.cuda.set_per_process_memory_fraction`) at the memory free when the cap is computed, less the safety margin, so the driver cannot page allocations into system RAM. When `false`, a generation model that does not fit retries once with accelerate layer offload (`device_map="auto"` with `max_memory`), which is much slower. The cap is process-wide, so a non-strict resident next to a strict one is capped too. |
+| `vram_safety_margin_bytes` | `536870912` (512 MiB) | Kept free by the load preflight and the allocator cap; `0` through 16 GiB. Also subtracted from available system RAM for CPU and offloaded loads. |
+| `kv_reserve_tokens` | `4096` | Tokens of KV cache reserved per generation model at load time: `2 x layers x kv_heads x head_dim x dtype_bytes x tokens`, read from the checkpoint's `text_config` when present. `0` disables the reserve. |
+| `load_one_model_at_a_time` | `false` | When `true`, requires `max_loaded_models=1`, so loading another checkpoint evicts the resident one. |
+| `max_loaded_models` | `4` | Maximum resident models in the worker. Loading beyond it evicts the least recently used resident that the running job does not use; if every resident is in use, the load returns 409 `worker_busy`. |
 | `max_batch_size` | `1` | Used as the maximum SentenceTransformers encode batch; generation remains batch one. |
-| `max_concurrent_runs` | `1` | Validated policy; the single admission lease serializes generation, embeddings, and prompt scoring regardless of larger values. |
+| `max_concurrent_runs` | `2` | Maximum generation sessions the worker interleaves (one decode step per session per round). The admission lease still runs one job at a time, so this bounds the sessions inside one job; a generation beyond it is refused with `worker_busy`. |
 | `queue_limit` | `32` | Number of inference reservations allowed to wait beyond the one runnable/active slot. `0` permits one inference with no waiter. Overflow returns a structured 429 before chat/run mutation. Explicit model load/unload rejects while any inference is admitted. |
 
 ### `inference`

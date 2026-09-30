@@ -21,6 +21,9 @@ This project follows a Keep a Changelog-style structure. Versions and dates are 
 - A frontend design system: colour, spacing, type, radius, elevation, focus, and motion tokens in `frontend/src/styles/tokens.css` (blue accent, no green, an 11px text floor, and a colour-blind-separable data-visualisation palette), and typed, accessible primitives in `frontend/src/components/ui` (Button, IconButton, Tabs, SegmentedControl, Field, Input, Textarea, NumberInput, Select, Switch, Slider, Badge, Card, Stat, EmptyState, Callout, Popover, MenuButton, Drawer).
 - A restyled workbench on those primitives: a 56px header with a model lifecycle pill, one Load/Unload action, a Nerd Mode switch, and an overflow menu; a sidebar with data-driven navigation, chats grouped as Pinned, Today, and Earlier, and Clear all data inside a settings menu; generation controls in a drawer split into Next response and Model loading; always-labelled, scrollable inspector tabs; and registry model cards that report weight size and conflicting declared and tokenizer context lengths.
 - A dismissible warning when nvidia-smi reports an NVIDIA GPU but the backend's PyTorch has no usable CUDA runtime, so models run on the CPU.
+- Several models resident in one worker at once, bounded by VRAM and `runtime.max_loaded_models` (default 4). A resident is keyed by model, fingerprint, device, dtype, and quantization; loading one that does not fit unloads least-recently-used idle residents first, and residents the running job uses are never evicted. `GET /models/resident` lists residents with a worker memory ledger, `POST /models/resident/{modelKey}/unload` unloads one, and health adds `loaded_models`.
+- Strict VRAM (`runtime.strict_vram`, default on, overridable per load and per generation with `strictVram`): a model that does not fit fails with a structured 507 before any weights load, and while a strict resident exists the worker caps its CUDA allocator so the driver cannot spill into system RAM. With Strict VRAM off, a generation model that does not fit retries once with accelerate layer offload. New settings `vram_safety_margin_bytes` and `kv_reserve_tokens` size the preflight, and a new `cpu_offload` capability reports offload support.
+- The worker runs generations as step-based sessions and can interleave up to `runtime.max_concurrent_runs` (default 2) of them round-robin, with per-run cancellation. Runs record their real placement, resident key, Strict VRAM choice, and scheduling in `reproducibility`.
 
 ### Fixed
 
@@ -64,6 +67,9 @@ This project follows a Keep a Changelog-style structure. Versions and dates are 
 - The capability matrix shows a short state label per cell with the reason on hover, focus, and an expandable row, instead of long sentences at a 7px size.
 - Chart axis labels keep their size because charts are drawn at their measured width; the unused expand icon on every chart is gone.
 - The embeddings NumPy export reuses the shared download helper.
+- Unloading a model by ID unloads every resident of that model and returns 409 `model_not_resident` when it has none, instead of `model_not_loaded` when another model was loaded. Unload now removes accelerate hooks and reports the device bytes actually freed and any that leaked.
+- A model that cannot fit in memory is refused before `from_pretrained` with the required and available bytes, and an out-of-memory error during loading frees the partial load and reports the same structured error, instead of failing midway through the load.
+- `runtime.cpu_offload: true` is rejected as superseded by `runtime.strict_vram: false`; it was previously accepted and then refused at every model load.
 
 ### Security
 

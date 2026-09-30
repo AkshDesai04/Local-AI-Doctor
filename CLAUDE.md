@@ -134,7 +134,8 @@ backend/local_ai_doctor/
   domain/            ModelDescriptor, ModelTask, Capability enum, CapabilityMatrix (non-full needs reason)
   discovery/         scanner.py (bounded read-only scan), safetensors.py (header parse), fingerprint.py, capabilities.py
   hardware/          probe.py (psutil/torch/nvidia-smi inventory), selection.py (device/dtype choice)
-  workers/           supervisor.py (async side, spawn ctx), runtime.py (in-worker model code), admission.py (FIFO lease)
+  workers/           supervisor.py (async side, spawn ctx, resident map), runtime.py (in-worker residents + sessions),
+                     memory.py (pure load estimate, device maps, VRAM cap), admission.py (FIFO lease)
   services/          models.py (ModelRegistry), runs.py (RunManager), events.py (EventBroker), uploads.py, workspace.py
   persistence/       database.py (aiosqlite, migrations, TelemetryWriter batcher), repository.py (all SQL), migrations/*.sql
   sampling/metrics.py  numpy fp32 reference math for distributions/ranks/perplexity (see §5.7)
@@ -171,11 +172,14 @@ Browser/Electron -> static UI + same-origin /api/v1 + /ws/v1
        --multiprocessing "spawn" Queues (bounded dicts only)--> worker process: workers/runtime.py WorkerRuntime
 ```
 - Model, tokenizer, processor, CUDA state, KV caches, and full-vocabulary tensors exist **only** in the worker.
-- Worker commands are dicts with `op` set to one of `load | unload | generate | embed | score_prompt | shutdown`.
+- Worker commands are dicts with `op` set to one of `load | unload | generate | cancel | embed | score_prompt | memory_status | shutdown`. Model ops take an optional `model_key` (absent means the active resident).
 - The worker sends back `ready`, `reply` (`request_id`, `ok`, `payload|error`), `run_event` (`run_id`, `event_type`, `payload`), and `diagnostic` (a bounded traceback that stays in logs).
 - Errors crossing the boundary go through `_safe_error`, which returns a generic code/message plus the exception class name only, with no paths or exception text.
 - The worker sets `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`, and `CUBLAS_WORKSPACE_CONFIG` before torch is imported.
-- Supervisor details: `available` requires the IPC ready handshake, not just a live PID. A timeout "poisons" the worker, which gets retired and replaced. If it cannot be terminated, the supervisor fails closed. One active run at a time.
+- Supervisor details: `available` requires the IPC ready handshake, not just a live PID. A timeout "poisons" the worker, which gets retired and replaced. If it cannot be terminated, the supervisor fails closed.
+- **One worker, N residents.** `WorkerRuntime.residents` holds `ResidentModel` records (model, tokenizer/processor, placement `gpu|offload|cpu`, `gpu_bytes`, `cpu_bytes`); `runtime.model`/`tokenizer`/`device`/... are properties of the active resident (assigning one on an empty runtime creates a `"default"` resident, which the unit tests rely on). The supervisor's `_resident` OrderedDict mirrors it (MRU last) and is cleared whenever the process is replaced; `loaded` is the MRU entry.
+- **Sessions.** `GenerationSession` (constructor renders/tokenizes and emits `stage: prefill`, `prefill()`, `step()` one token) replaces the old monolithic loop; `_generate(command)` runs one to completion. `run()` blocks on the queue only while no session exists, then round-robins `_step_round` (at most `runtime.max_concurrent_runs` sessions, else `worker_busy`). `_activate` restores the deterministic flag, attention kernel, and `rope_deltas` per session. Per-run `cancel` commands stop one session; the shared `mp.Event` stops all.
+- **Loader.** Always a device map (`workers/memory.py` builds it), never `.to()`. A preflight (`estimate_load_bytes`: weights at compute dtype + KV reserve) raises `WorkerReportedError(insufficient_memory)` before `from_pretrained`; `_safe_error` passes that dict through. `_apply_vram_cap()` sets `torch.cuda.set_per_process_memory_fraction` while any strict CUDA resident exists. Unload removes accelerate hooks and reports `freed_bytes`/`leaked_bytes`.
 
 ### 5.2 Startup and shutdown (`main.py` lifespan). The order matters.
 1. `Database.initialize()` opens SQLite with WAL and foreign keys. It backs up an existing DB to `paths.backups` before applying pending migrations.
@@ -186,7 +190,7 @@ Browser/Electron -> static UI + same-origin /api/v1 + /ws/v1
 6. `repository.recover_incomplete_runs()` marks queued/loading/running runs failed with `interrupted_by_restart`.
 7. `RunManager`, `UploadStore`, and `WorkspaceService` are built into `app.state.services` (`ApplicationServices` dataclass). Routes get them via `_services(request)`.
 
-Shutdown runs in reverse: `runs.close()`, worker close with the grace period, `telemetry.stop()`, `database.close()`. `/api/v1/health` returns `{"status":"ok","database":"ready","worker":"ready","loaded_model":…,"protocol_version":1}`, or 503 `degraded` when the worker is unavailable. The Docker and Electron readiness gates parse exactly these fields.
+Shutdown runs in reverse: `runs.close()`, worker close with the grace period, `telemetry.stop()`, `database.close()`. `/api/v1/health` returns `{"status":"ok","database":"ready","worker":"ready","loaded_model":…,"loaded_models":[…],"protocol_version":1}`, or 503 `degraded` when the worker is unavailable. The Docker and Electron readiness gates parse exactly these fields.
 
 ### 5.3 Request pipeline (`main.py`)
 Middleware order, outermost first:
@@ -202,14 +206,14 @@ Error shapes:
 - `WorkbenchError` → `{"error": exc.to_dict()}` with the class's `http_status`. See `errors.py` for the code→status map, e.g. `capability_unavailable` 409, `limit_exceeded` 429/413, `out_of_memory` 507, `worker_busy` 409.
 - Validation → 422 `invalid_request` with `details.issues`.
 - Uncaught errors → 500 `internal_error` with no text.
-- `WorkerFailure` (from load, unload, embeddings, prompt scoring) → the same envelope with the worker's code: out-of-memory → 507 `out_of_memory` (original code kept in `details.worker_code`), timeouts → 504, `model_worker_state_mismatch` → 409, anything else → 502 (`errors.worker_failure_response`).
+- `WorkerFailure` (from load, unload, embeddings, prompt scoring) → the same envelope with the worker's code: out-of-memory and `insufficient_memory` → 507 `out_of_memory` (original code kept in `details.worker_code`, byte counts in `details`), timeouts → 504, `model_worker_state_mismatch`/`model_not_resident`/`worker_busy` → 409, anything else → 502 (`errors.worker_failure_response`). A load that still does not fit after eviction is a registry `OutOfMemoryError` 507 with `required_bytes`, `available_bytes`, `resident_model_keys`, `pinned_model_keys`, `evicted_model_keys`.
 - Routes raise `WorkbenchError` subclasses (`ChatNotFoundError`, `RunNotFoundError`, `RunNotCancellableError`, `ConfirmationRequiredError`, `ModelNotLoadedError`, `NotFoundError`), so they return the envelope too. Router-level `StarletteHTTPException`s (405 `method_not_allowed`, missing static asset 404 `not_found`, other statuses `http_error`) are mapped to the envelope by `framework_http_error`; the client still tolerates the older `{"detail": …}` shape.
 
 The WebSocket `/ws/v1/runs/{run_id}?after=N` checks Host (close 4403), auth via the `lad.auth.<base64url>` subprotocol or Bearer (close 4401), and Origin (4403). It then accepts with subprotocol `lad.events.v1`. A disconnect does **not** cancel the run.
 
 Routes (all under `/api/v1`):
 - **Service:** `health`, `configuration`, `GET/PUT configuration/model-roots`, `hardware`, `storage`, `DELETE storage/telemetry?before=<tz-aware>&confirm=true`.
-- **Models:** `models`, `models/refresh`, `models/{id}/load` (body `{device?,dtype?}`), `models/unload`, `models/{id}/unload`, `models/{id}/inspect`.
+- **Models:** `models`, `models/refresh`, `models/{id}/load` (body `{device?,dtype?,quantization?,strictVram?}`), `models/resident` (GET), `models/resident/{modelKey}/unload`, `models/unload` (all), `models/{id}/unload` (every resident of that model; 409 `model_not_resident`), `models/{id}/inspect`.
 - **Chats:** `chats` (POST, GET `?search=&archived=`; POST/PATCH accept `systemPrompt`), `chats/import`, `chats/{id}` (GET, PATCH, DELETE), `chats/{id}/export`, `chats/{id}/messages` (GET, POST), `DELETE chats?confirm=true&include_archived=`.
 - **Runs:**
   - `runs` or `runs/generation` (202; returns `runId`, `messageId`, `websocketUrl` plus `run`/`user_message`/`assistant_message`)
@@ -242,13 +246,14 @@ Anything outside `/api` and `/ws` falls back to `frontend/dist/index.html`.
   - Refuses while a model is loaded or while lifecycle/admission is busy.
   - Refuses while `LAD_PATHS__MODEL_ROOTS` or `--set paths.model_roots` overrides are active; the UI shows the reason.
   - Writes the active profile section of the user file atomically, falling back to a guarded fsync overwrite on bind mounts, then rescans.
-- Typed-but-unimplemented options: non-`none` quantization, `cpu_offload`, multi-GPU, most `features.*` probes, and the `retention_days` scheduler. `features.attention_probe` is **not** the attention gate; instrumentation `full`/`expert` is.
+- Typed-but-unimplemented options: non-`none` quantization, multi-GPU, most `features.*` probes, and the `retention_days` scheduler. `cpu_offload: true` is rejected as superseded by `strict_vram: false`. `features.attention_probe` is **not** the attention gate; instrumentation `full`/`expert` is.
 - Portable defaults:
   - Context 4096 (fallback only, when a checkpoint declares none), max prompt tokens 32768, reserved output 512.
   - Sampling: max output 512, temperature 0.7, top-k 50, top-p 0.95, min-p 0, penalties 1/0/0, 10 alternatives.
   - Instrumentation `token`, queue limit 32.
   - Limits: prompt 4 MiB, upload 100 MiB, 16 attachments, 100k token events and 128 MiB of trace per run.
   - Worker timeouts: startup 120 s, load 600 s, unload 60 s, inference 3600 s, shutdown 15 s.
+  - Residency: `strict_vram` true, `vram_safety_margin_bytes` 512 MiB, `kv_reserve_tokens` 4096, `max_loaded_models` 4, `max_concurrent_runs` 2 (worker session limit), `load_one_model_at_a_time` false.
 
 ### 5.5 Discovery and capabilities (`discovery/`)
 - **Scan:** depth 2 below each root, without following directory symlinks and skipping dot-directories (`.git`, `.cache`). A candidate folder has `config.json` or a SafeTensors file. Empty and GGUF-only folders are not candidates; they produce root diagnostics `empty_model_directory` / `gguf_only_directory` with root-relative names (`ModelScanReport.public_roots()`, shared by `GET /models` and the `scan` CLI).
@@ -271,8 +276,8 @@ Anything outside `/api` and `/ws` falls back to `frontend/dist/index.html`.
 ### 5.6 Hardware, admission, lifecycle
 - `select_hardware`: `cpu` → CPU, FP32 by default (explicit CPU FP16 is rejected). With `auto`/`cuda`, the first torch-usable CUDA device is chosen, with BF16 on compute capability ≥ 8 and FP16 otherwise. If CUDA is requested but unavailable and `allow_cpu_fallback=false`, it raises `BackendUnavailableError`. `nvidia-smi` presence is not proof of a usable CUDA runtime.
 - Docker sets `LAD_RUNTIME__ALLOW_CPU_FALLBACK=false` for **both** profiles. Built-in `container-cpu` alone would allow fallback; compose overrides that.
-- `SingleWorkerAdmission`: generation, embeddings, and prompt scoring share one FIFO lease. Capacity is 1 active plus `queue_limit` waiters. Overflow returns 429 **before** any chat or run rows are written. `admission.lifecycle(op)` serializes load, unload, and model-root changes against admitted work.
-- `ModelRegistry.load_reserved` reuses a load only when model identity and the complete runtime selection match. A different model is unloaded first. RAM/VRAM budget checks are lower-bound preflights only.
+- `SingleWorkerAdmission`: generation, embeddings, and prompt scoring share one FIFO lease. Capacity is 1 active plus `queue_limit` waiters. Overflow returns 429 **before** any chat or run rows are written. `admission.lifecycle(op)` serializes load, unload, model-root changes, and the resident-status ledger refresh against admitted work.
+- `ModelRegistry._ensure_resident` (behind `load`, and `load_reserved(..., pinned=)` for admitted jobs): key = `sha256(json([model_id, fingerprint, device, effective_dtype, quantization]))[:20]`; reuse touches the key (a strict request re-places an offloaded one); `max_loaded_models` and `insufficient_memory` evict LRU residents not pinned by the running job (only when their `gpu_bytes` make room); then Strict VRAM → 507, non-strict → one retry with `placement=offload` (models whose `cpu_offload` capability is `partial`). `resident_status()` refreshes `memory_status` only when admission is idle.
 
 ### 5.7 Generation (`services/runs.py` RunManager + `workers/runtime.py`)
 `create_generation` runs these steps:
@@ -283,21 +288,21 @@ Anything outside `/api` and `/ws` falls back to `frontend/dist/index.html`.
 5. Calls `repository.create_generation_setup`, which writes the user message, pending assistant, queued run, and environment snapshot in one transaction and auto-titles "New chat" from the prompt.
 6. Starts the background task `_execute_generation`.
 
-`_execute_generation` then:
+`_execute_generation` (keyword arguments kept for the test fakes; builds a `RunContext`) then:
 1. Publishes `run_created`.
-2. Waits for the lease and sets the run to `loading`.
-3. Publishes `stage: model_loading`, loads the model, and publishes `model_loaded`.
+2. Waits for the lease; `_load_side` sets the run to `loading`.
+3. Publishes `stage: model_loading`, makes the model resident (`quantization`/`strict_vram` from the request or config), merges the real `placement`/`model_key`/`strict_vram` into `reproducibility` (`repository.merge_run_reproducibility`), and publishes `model_loaded` (with `evicted_model_keys`).
 4. Sets the run to `running`.
 5. Streams worker events:
    - `stage: prefill` persists `rendered_prompt`, `prompt_token_count`, `reasoning_primed`, and the template/tokenization phase metrics.
    - A `metric` with `prefill_ms` records the prefill phase.
    - Each `token` applies `output = output[:replace_from] + display_text`. Tokens are persisted via `TelemetryWriter` within the event/byte limits; hitting a limit emits one `telemetry_persistence_truncated` warning. The assistant text is checkpointed every **8** tokens.
    - `completed`/`cancelled`/`error`: records the generation phase, **flushes telemetry**, then finalizes the message and run.
-6. On any exception it flushes, marks the message and run failed, and publishes exactly one `error`. Partial output is always preserved.
+6. `_stream_generation` also merges `scheduling` into `reproducibility` at the terminal event. On any exception `_fail_run` flushes, marks the message and run failed, and publishes exactly one `error`. Partial output is always preserved.
 
-Cancel works in two ways. A run still waiting in the queue is cancelled in place (`cancelled_before_start`). A running run is cancelled through the worker cancel event, which is checked between decode steps.
+Cancel works in two ways. A run still waiting in the queue is cancelled in place (`cancelled_before_start`). A running run gets a per-run `cancel` worker command (the shared cancel event only as a fallback when the command queue is full), checked between decode steps.
 
-Inside the worker (`_generate_impl`):
+Inside the worker (`GenerationSession`):
 1. Renders the chat template with `add_generation_prompt=True`. `create_generation` leads the branch with the chat's `system_prompt` (unless the lineage already starts with a system message) and snapshots it as `settings.system_prompt`; replay and token branch reuse the source run's snapshot. `_render_messages` folds the system text into the first user turn when the template raises or drops it and reports renderer `chat_template_system_merged`, which emits a `system_prompt_merged` warning. The request's `reasoning` is forwarded as `enable_thinking` only to compatible templates. Without a template, a deterministic "Role: content" fallback is used and a `chat_template_unavailable` warning is emitted.
 2. Tokenizes with `add_special_tokens=False`. Media turns instead go through the processor loaded for models with `media_modalities` (`worker_model_payload`): content-part messages render via the processor's chat template, images decode with Pillow, videos with `transformers.video_utils.load_video` (pyav, processor frame sampler), and processor outputs (`pixel_values`, grids) go to the prefill forward only. Attention catalogue positions holding media get a `media` field while staying `prompt` sources. Only for the plain-text fallback, the BOS the tokenizer inserts by default (`_default_bos_token_id`) is prepended, because no template wrote it.
 3. Causal models prefill, then reuse the KV cache. Every decoder-body call passes `cache_position` (derived from attention-mask length minus new tokens); Qwen3-VL computes decode positions from it plus prefill `rope_deltas`, so omitting it put every decoded token at position 0. Families rejecting the keyword fall back without it. Encoder-decoder models encode once and resolve the decoder start token.
@@ -466,7 +471,7 @@ Inside the worker (`_generate_impl`):
 - Model roots are external and read-only. Never copy, modify, or commit weights, host paths, WSL distro or user names. Docker stores `/models`.
 - Local-only loading: offline HF, `local_files_only=true`, `trust_remote_code=false` (a validator forbids enabling it globally), no pickle fallback.
 - A CUDA request runs on CUDA or fails clearly. There is no silent CPU fallback in Docker. The UI's device selection is intent, not proof.
-- One worker, one resident model, one active inference. Don't raise worker counts without revalidating ordering and shutdown.
+- One worker process, N resident models bounded by VRAM and `max_loaded_models`, one admitted job at a time (a comparison is one job). Residents the running job uses are never evicted; Strict VRAM (default) fails with 507 rather than spilling into system RAM. Don't raise worker counts without revalidating ordering and shutdown.
 - Reasoning presentation rules (normal vs Nerd Mode). Never rebuild visible text by concatenating tokenizer pieces.
 - Attention is described only as allocation, never causation. Perplexity is not factuality. Alternatives are "top alternatives under this distribution".
 - Unsupported features stay visible and disabled with a reason. No demo or fake telemetry in real sessions.

@@ -196,7 +196,7 @@ Configuration also supports `LAD_` environment variables with `__` between neste
 ## Using the workbench
 
 1. Inspect the model registry and its diagnostics, context candidates, and capability states.
-2. Load only one model at a time. Auto selection prefers the first usable CUDA device and otherwise uses CPU when fallback is permitted.
+2. Load one or more models. Several models stay resident together while they fit in VRAM (up to `runtime.max_loaded_models`); loading one that does not fit unloads the least recently used idle model first. With Strict VRAM on (the default) a model that still does not fit fails with a clear error; turn Strict VRAM off for that load to offload layers to system RAM, which is much slower. Auto selection prefers the first usable CUDA device and otherwise uses CPU when fallback is permitted.
 3. For generation, create or select a chat, set sampling and instrumentation controls, then stream the response. Nerd Mode links visible token boundaries to probability and timing views. A new decoder-only run at `full` or `expert` also lets you select a token and inspect its bounded context-attention map.
 4. For an embedding model, open the Embeddings workspace, provide text or supported uploaded media, choose an advertised dimension, and compare normalized vectors.
 5. Export a generation run as JSON, replayable JSONL events, or token CSV. The API also exports/imports a path-free chat workspace and can replay a completed generation as a sibling assistant branch using its recorded settings.
