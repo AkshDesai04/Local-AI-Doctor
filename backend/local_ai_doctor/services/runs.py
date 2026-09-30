@@ -9,6 +9,7 @@ import secrets
 import uuid
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -19,7 +20,7 @@ from ..api.schemas import (
     SamplingRequest,
     TokenBranchCreate,
 )
-from ..config import AppSettings, DeviceMode, DType, InstrumentationLevel
+from ..config import AppSettings, DeviceMode, DType, InstrumentationLevel, Quantization
 from ..domain.capabilities import Capability, CapabilityState
 from ..domain.models import ModelDescriptor, ModelTask
 from ..errors import (
@@ -132,6 +133,50 @@ def _effective_deterministic_mode(settings: AppSettings, request: GenerationRunC
     return settings.inference.deterministic_reference_mode
 
 
+# Reproducibility fields that describe one execution, never copied from a source run.
+_EXECUTION_FIELDS = ("placement", "model_key", "scheduling")
+
+
+@dataclass
+class RunContext:
+    """Everything one generation run needs, plus its partial output while it streams."""
+
+    run_id: str
+    message_id: str
+    model_id: str
+    messages: list[dict[str, Any]]
+    sampling: dict[str, Any]
+    seed: int
+    instrumentation: str
+    deterministic: bool
+    reasoning: bool | None
+    forced_prefix: list[int]
+    device: DeviceMode | None
+    dtype: DType | None
+    quantization: Quantization | None
+    strict_vram: bool | None
+    model_key: str | None = None
+    stream: AsyncGenerator[dict[str, Any], None] | None = None
+    output: str = ""
+    token_count: int = 0
+    persisted_token_count: int = 0
+    persisted_trace_bytes: int = 0
+    persistence_limit_reported: bool = False
+
+
+def _recorded_placement(
+    settings: AppSettings, recorded: Mapping[str, Any]
+) -> tuple[Quantization, bool]:
+    """Quantization and Strict VRAM a source run asked for, else the configured defaults."""
+
+    try:
+        quantization = Quantization(recorded.get("quantization") or settings.runtime.quantization)
+    except ValueError:
+        quantization = settings.runtime.quantization
+    strict = recorded.get("strict_vram")
+    return quantization, strict if isinstance(strict, bool) else settings.runtime.strict_vram
+
+
 class RunManager:
     def __init__(
         self,
@@ -228,6 +273,13 @@ class RunManager:
                 "attachment count exceeds the configured per-request limit",
                 details={"limit": self.settings.limits.attachment_count},
             )
+        quantization = request.quantization or self.settings.runtime.quantization
+        if quantization is not Quantization.NONE:
+            raise CapabilityUnavailableError(
+                "the requested model-weight quantization has no installed compatible adapter",
+                hint="Use quantization none.",
+                details={"quantization": quantization.value},
+            )
         new_media = await self._chat_media(descriptor, request.attachment_ids)
         chat = await self.repository.get_chat(request.chat_id)
         if chat is None:
@@ -300,6 +352,12 @@ class RunManager:
         instrumentation = request.instrumentation or self.settings.inference.instrumentation
         deterministic_reference_mode = _effective_deterministic_mode(self.settings, request)
         reasoning = request.reasoning
+        quantization = request.quantization or self.settings.runtime.quantization
+        strict_vram = (
+            self.settings.runtime.strict_vram
+            if request.strict_vram is None
+            else request.strict_vram
+        )
         reproducibility = {
             "requested_seed": None if request.seed is None else str(request.seed),
             "effective_seed": str(effective_seed),
@@ -310,7 +368,8 @@ class RunManager:
             "backend": "transformers-reference-loop",
             "device": selection.model_dump(mode="json"),
             "dtype": selection.effective_dtype.value,
-            "quantization": self.settings.runtime.quantization.value,
+            "quantization": quantization.value,
+            "strict_vram": strict_vram,
             "attention_implementation": self.settings.runtime.attention_backend.value,
             "deterministic_reference_mode": deterministic_reference_mode,
             "reasoning": reasoning,
@@ -340,6 +399,8 @@ class RunManager:
                 "deterministic_reference_mode": deterministic_reference_mode,
                 "reasoning": reasoning,
                 "system_prompt": system_prompt,
+                "quantization": quantization.value,
+                "strict_vram": strict_vram,
             },
             "effective_config": self.settings.inference_snapshot(),
             "reproducibility": reproducibility,
@@ -360,7 +421,8 @@ class RunManager:
                 "name": "transformers-reference-loop",
                 "selection": selection.model_dump(mode="json"),
                 "attention_implementation": self.settings.runtime.attention_backend.value,
-                "quantization": self.settings.runtime.quantization.value,
+                "quantization": quantization.value,
+                "strict_vram": strict_vram,
             },
             chat_title=(title or "New chat") if chat["title"] == "New chat" else None,
             attachment_ids=request.attachment_ids,
@@ -382,6 +444,8 @@ class RunManager:
                 device=request.device,
                 dtype=request.dtype,
                 reservation=reservation,
+                quantization=quantization,
+                strict_vram=strict_vram,
             ),
             name=f"generation-{run_id}",
         )
@@ -466,13 +530,25 @@ class RunManager:
         reservation: InferenceReservation,
         forced_prefix_token_ids: list[int] | None = None,
         reasoning: bool | None = None,
+        quantization: Quantization | None = None,
+        strict_vram: bool | None = None,
     ) -> None:
-        output = ""
-        token_count = 0
-        persisted_token_count = 0
-        persisted_trace_bytes = 0
-        persistence_limit_reported = False
-        stream: AsyncGenerator[dict[str, Any], None] | None = None
+        ctx = RunContext(
+            run_id=run_id,
+            message_id=message_id,
+            model_id=model_id,
+            messages=messages,
+            sampling=sampling,
+            seed=effective_seed,
+            instrumentation=instrumentation,
+            deterministic=deterministic_reference_mode,
+            reasoning=reasoning,
+            forced_prefix=list(forced_prefix_token_ids or ()),
+            device=device,
+            dtype=dtype,
+            quantization=quantization,
+            strict_vram=strict_vram,
+        )
         try:
             await self.events.publish(
                 run_id,
@@ -480,203 +556,242 @@ class RunManager:
                 {"status": "queued", "effective_seed": str(effective_seed)},
             )
             await reservation.acquire()
-            await self.repository.update_run(run_id, status="loading", queue_exited_at=_now())
-            await self.events.publish(run_id, "stage", {"stage": "model_loading"})
-            loaded = await self.registry.load_reserved(
-                reservation, model_id, device=device, dtype=dtype
-            )
-            await self.events.publish(run_id, "model_loaded", loaded)
-            started = _now()
-            await self.repository.update_run(run_id, status="running", started_at=started)
-            await self.repository.update_message(message_id, content="", status="streaming")
-            stream = self.worker.generate(
-                run_id=run_id,
-                messages=messages,
-                sampling=sampling,
-                effective_seed=effective_seed,
-                instrumentation=instrumentation,
-                deterministic_reference_mode=deterministic_reference_mode,
-                max_prompt_tokens=self.settings.inference.max_prompt_tokens,
-                reserved_output_tokens=self.settings.inference.reserved_output_tokens,
-                timeout_seconds=self.settings.workers.inference_timeout_seconds,
-                forced_prefix_token_ids=forced_prefix_token_ids or (),
-                reasoning=reasoning,
-            )
-            async for worker_event in stream:
-                event_type = str(worker_event["event_type"])
-                payload = dict(worker_event.get("payload", {}))
-                if event_type == "stage" and payload.get("stage") == "prefill":
-                    current_message = await self.repository.get_message(message_id)
-                    await self.repository.update_message(
-                        message_id,
-                        content=output,
-                        status="streaming",
-                        metadata={
-                            **dict((current_message or {}).get("metadata") or {}),
-                            "reasoning_primed": bool(payload.get("reasoning_primed")),
-                        },
-                    )
-                    await self.repository.update_run(
-                        run_id,
-                        rendered_prompt=payload.get("rendered_prompt"),
-                        prompt_token_count=payload.get("prompt_tokens"),
-                    )
-                    await self.repository.upsert_phase_metric(
-                        run_id,
-                        "chat_template",
-                        duration_ms=payload.get("template_ms"),
-                        details={"rendered_prompt_tokens": payload.get("prompt_tokens")},
-                    )
-                    await self.repository.upsert_phase_metric(
-                        run_id,
-                        "tokenization",
-                        duration_ms=payload.get("tokenization_ms"),
-                        details={
-                            "prompt_tokens": payload.get("prompt_tokens"),
-                            "context_limit": payload.get("context_limit"),
-                            "attention_capture_requested": payload.get(
-                                "attention_capture_requested"
-                            ),
-                            "attention_capture_active": payload.get("attention_capture_active"),
-                            "attention_capture_method": payload.get("attention_capture_method"),
-                            "attention_source_limit": payload.get("attention_source_limit"),
-                            "attention_implementation": payload.get("attention_implementation"),
-                        },
-                    )
-                elif event_type == "metric" and payload.get("prefill_ms") is not None:
-                    await self.repository.upsert_phase_metric(
-                        run_id,
-                        "prefill",
-                        duration_ms=payload.get("prefill_ms"),
-                        details={
-                            "prompt_tokens_per_second": payload.get("prompt_tokens_per_second"),
-                            "sampling_operation_order": payload.get("sampling_operation_order"),
-                        },
-                    )
-                if event_type == "token":
-                    if token_count == 0:
-                        await self.repository.update_run(run_id, first_token_at=_now())
-                    replace_from = int(payload.get("replace_from", len(output)))
-                    output = output[:replace_from] + str(payload.get("display_text", ""))
-                    token_count += 1
-                    if self.settings.telemetry.persist_token_events:
-                        payload_bytes = len(
-                            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
-                                "utf-8"
-                            )
-                        )
-                        within_event_limit = (
-                            persisted_token_count < self.settings.limits.telemetry_events_per_run
-                        )
-                        within_byte_limit = (
-                            persisted_trace_bytes + payload_bytes
-                            <= self.settings.limits.trace_bytes_per_run
-                        )
-                        if within_event_limit and within_byte_limit:
-                            await self._persist_token(run_id, payload)
-                            persisted_token_count += 1
-                            persisted_trace_bytes += payload_bytes
-                        elif not persistence_limit_reported:
-                            persistence_limit_reported = True
-                            await self.events.publish(
-                                run_id,
-                                "warning",
-                                {
-                                    "code": "telemetry_persistence_truncated",
-                                    "message": "Per-run telemetry persistence reached a configured limit; live generation continues.",
-                                    "persisted_token_events": persisted_token_count,
-                                    "persisted_trace_bytes": persisted_trace_bytes,
-                                },
-                            )
-                    if token_count % 8 == 0:
-                        await self.repository.update_message(
-                            message_id, content=output, status="streaming"
-                        )
-                if event_type in {"completed", "cancelled"}:
-                    status = "complete" if event_type == "completed" else "cancelled"
-                    await self.repository.upsert_phase_metric(
-                        run_id,
-                        "generation",
-                        duration_ms=payload.get("total_generation_ms"),
-                        details={
-                            "decode_tokens_per_second": payload.get("decode_tokens_per_second"),
-                            "end_to_end_tokens_per_second": payload.get(
-                                "end_to_end_tokens_per_second"
-                            ),
-                            "engine_ttft_ms": payload.get("engine_ttft_ms"),
-                            "prefill_ms": payload.get("prefill_ms"),
-                            "conditional_response_perplexity": payload.get(
-                                "conditional_response_perplexity"
-                            ),
-                            "segment_metrics": payload.get("segment_metrics"),
-                            "memory": payload.get("memory"),
-                            "expert_routing": payload.get("expert_routing"),
-                            "attention_capture": payload.get("attention_capture"),
-                        },
-                    )
-                    # A terminal run status promises that every accepted token and
-                    # alternative is durable, including to polling API clients.
-                    await self.telemetry.flush()
-                    await self.repository.update_message(message_id, content=output, status=status)
-                    await self.repository.update_run(
-                        run_id,
-                        status=status,
-                        generated_token_count=token_count,
-                        finish_reason=payload.get("finish_reason"),
-                        completed_at=_now(),
-                    )
-                elif event_type == "error":
-                    await self.telemetry.flush()
-                    await self.repository.update_message(
-                        message_id, content=output, status="failed"
-                    )
-                    await self.repository.update_run(
-                        run_id,
-                        status="failed",
-                        generated_token_count=token_count,
-                        error_code=payload.get("code"),
-                        error_message=payload.get("message"),
-                        completed_at=_now(),
-                    )
-                await self.events.publish(run_id, event_type, payload)
+            await self._load_side(ctx, reservation, frozenset())
+            await self._stream_generation(ctx)
         except Exception as exc:
-            logger.error("generation run %s failed (%s)", run_id, type(exc).__name__)
-            if isinstance(exc, WorkerFailure):
-                error = exc.error
-            elif isinstance(exc, WorkbenchError):
-                error = exc.to_dict()
-            else:
-                error = {
-                    "code": "internal_error",
-                    "message": "generation failed at an application boundary",
-                    "hint": "Review local application logs for the private diagnostic details.",
-                }
-            # Establish the same durability barrier used by normal terminal
-            # events before making the failed state visible to polling clients.
-            with suppress(Exception):
-                await self.telemetry.flush()
-            await self.repository.update_message(message_id, content=output, status="failed")
-            await self.repository.update_run(
-                run_id,
-                status="failed",
-                generated_token_count=token_count,
-                error_code=error.get("code"),
-                error_message=error.get("message"),
-                completed_at=_now(),
-            )
-            # EventBroker fans out before surfacing an optional persistence
-            # failure, so suppressing here avoids an unhandled background task
-            # while connected clients still receive exactly one terminal error.
-            with suppress(Exception):
-                await self.events.publish(run_id, "error", error)
+            await self._fail_run(ctx, exc)
         finally:
             # Close the worker stream before freeing the lease so a failure in the
             # loop above stops the worker at once instead of when the generator is
             # garbage collected.
-            if stream is not None:
+            if ctx.stream is not None:
                 with suppress(Exception):
-                    await stream.aclose()
+                    await ctx.stream.aclose()
             reservation.release()
+
+    async def _load_side(
+        self,
+        ctx: RunContext,
+        reservation: InferenceReservation,
+        pinned: frozenset[str],
+    ) -> None:
+        """Make the run's model resident and record where it actually landed."""
+
+        await self.repository.update_run(ctx.run_id, status="loading", queue_exited_at=_now())
+        await self.events.publish(ctx.run_id, "stage", {"stage": "model_loading"})
+        loaded = await self.registry.load_reserved(
+            reservation,
+            ctx.model_id,
+            device=ctx.device,
+            dtype=ctx.dtype,
+            quantization=ctx.quantization,
+            strict_vram=ctx.strict_vram,
+            pinned=pinned,
+        )
+        model_key = loaded.get("model_key")
+        ctx.model_key = str(model_key) if model_key else None
+        placement = {
+            field: loaded.get(field)
+            for field in ("model_key", "placement", "quantization", "strict_vram")
+            if loaded.get(field) is not None
+        }
+        if placement:
+            await self.repository.merge_run_reproducibility(ctx.run_id, placement)
+        await self.events.publish(ctx.run_id, "model_loaded", loaded)
+
+    async def _stream_generation(self, ctx: RunContext) -> None:
+        """Run the worker stream, persisting partial output and telemetry as it arrives."""
+
+        run_id = ctx.run_id
+        message_id = ctx.message_id
+        started = _now()
+        await self.repository.update_run(run_id, status="running", started_at=started)
+        await self.repository.update_message(message_id, content="", status="streaming")
+        ctx.stream = self.worker.generate(
+            run_id=run_id,
+            messages=ctx.messages,
+            sampling=ctx.sampling,
+            effective_seed=ctx.seed,
+            instrumentation=ctx.instrumentation,
+            deterministic_reference_mode=ctx.deterministic,
+            max_prompt_tokens=self.settings.inference.max_prompt_tokens,
+            reserved_output_tokens=self.settings.inference.reserved_output_tokens,
+            timeout_seconds=self.settings.workers.inference_timeout_seconds,
+            forced_prefix_token_ids=ctx.forced_prefix,
+            reasoning=ctx.reasoning,
+            model_key=ctx.model_key,
+        )
+        async for worker_event in ctx.stream:
+            event_type = str(worker_event["event_type"])
+            payload = dict(worker_event.get("payload", {}))
+            if event_type == "stage" and payload.get("stage") == "prefill":
+                current_message = await self.repository.get_message(message_id)
+                await self.repository.update_message(
+                    message_id,
+                    content=ctx.output,
+                    status="streaming",
+                    metadata={
+                        **dict((current_message or {}).get("metadata") or {}),
+                        "reasoning_primed": bool(payload.get("reasoning_primed")),
+                    },
+                )
+                await self.repository.update_run(
+                    run_id,
+                    rendered_prompt=payload.get("rendered_prompt"),
+                    prompt_token_count=payload.get("prompt_tokens"),
+                )
+                await self.repository.upsert_phase_metric(
+                    run_id,
+                    "chat_template",
+                    duration_ms=payload.get("template_ms"),
+                    details={"rendered_prompt_tokens": payload.get("prompt_tokens")},
+                )
+                await self.repository.upsert_phase_metric(
+                    run_id,
+                    "tokenization",
+                    duration_ms=payload.get("tokenization_ms"),
+                    details={
+                        "prompt_tokens": payload.get("prompt_tokens"),
+                        "context_limit": payload.get("context_limit"),
+                        "attention_capture_requested": payload.get("attention_capture_requested"),
+                        "attention_capture_active": payload.get("attention_capture_active"),
+                        "attention_capture_method": payload.get("attention_capture_method"),
+                        "attention_source_limit": payload.get("attention_source_limit"),
+                        "attention_implementation": payload.get("attention_implementation"),
+                    },
+                )
+            elif event_type == "metric" and payload.get("prefill_ms") is not None:
+                await self.repository.upsert_phase_metric(
+                    run_id,
+                    "prefill",
+                    duration_ms=payload.get("prefill_ms"),
+                    details={
+                        "prompt_tokens_per_second": payload.get("prompt_tokens_per_second"),
+                        "sampling_operation_order": payload.get("sampling_operation_order"),
+                    },
+                )
+            if event_type == "token":
+                if ctx.token_count == 0:
+                    await self.repository.update_run(run_id, first_token_at=_now())
+                replace_from = int(payload.get("replace_from", len(ctx.output)))
+                ctx.output = ctx.output[:replace_from] + str(payload.get("display_text", ""))
+                ctx.token_count += 1
+                if self.settings.telemetry.persist_token_events:
+                    payload_bytes = len(
+                        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+                            "utf-8"
+                        )
+                    )
+                    within_event_limit = (
+                        ctx.persisted_token_count < self.settings.limits.telemetry_events_per_run
+                    )
+                    within_byte_limit = (
+                        ctx.persisted_trace_bytes + payload_bytes
+                        <= self.settings.limits.trace_bytes_per_run
+                    )
+                    if within_event_limit and within_byte_limit:
+                        await self._persist_token(run_id, payload)
+                        ctx.persisted_token_count += 1
+                        ctx.persisted_trace_bytes += payload_bytes
+                    elif not ctx.persistence_limit_reported:
+                        ctx.persistence_limit_reported = True
+                        await self.events.publish(
+                            run_id,
+                            "warning",
+                            {
+                                "code": "telemetry_persistence_truncated",
+                                "message": "Per-run telemetry persistence reached a configured limit; live generation continues.",
+                                "persisted_token_events": ctx.persisted_token_count,
+                                "persisted_trace_bytes": ctx.persisted_trace_bytes,
+                            },
+                        )
+                if ctx.token_count % 8 == 0:
+                    await self.repository.update_message(
+                        message_id, content=ctx.output, status="streaming"
+                    )
+            if event_type in {"completed", "cancelled"}:
+                status = "complete" if event_type == "completed" else "cancelled"
+                await self.repository.upsert_phase_metric(
+                    run_id,
+                    "generation",
+                    duration_ms=payload.get("total_generation_ms"),
+                    details={
+                        "decode_tokens_per_second": payload.get("decode_tokens_per_second"),
+                        "end_to_end_tokens_per_second": payload.get("end_to_end_tokens_per_second"),
+                        "engine_ttft_ms": payload.get("engine_ttft_ms"),
+                        "prefill_ms": payload.get("prefill_ms"),
+                        "conditional_response_perplexity": payload.get(
+                            "conditional_response_perplexity"
+                        ),
+                        "segment_metrics": payload.get("segment_metrics"),
+                        "memory": payload.get("memory"),
+                        "ledger": payload.get("ledger"),
+                        "expert_routing": payload.get("expert_routing"),
+                        "attention_capture": payload.get("attention_capture"),
+                    },
+                )
+                if isinstance(payload.get("scheduling"), Mapping):
+                    await self.repository.merge_run_reproducibility(
+                        run_id, {"scheduling": payload["scheduling"]}
+                    )
+                # A terminal run status promises that every accepted token and
+                # alternative is durable, including to polling API clients.
+                await self.telemetry.flush()
+                await self.repository.update_message(message_id, content=ctx.output, status=status)
+                await self.repository.update_run(
+                    run_id,
+                    status=status,
+                    generated_token_count=ctx.token_count,
+                    finish_reason=payload.get("finish_reason"),
+                    completed_at=_now(),
+                )
+            elif event_type == "error":
+                await self.telemetry.flush()
+                await self.repository.update_message(
+                    message_id, content=ctx.output, status="failed"
+                )
+                await self.repository.update_run(
+                    run_id,
+                    status="failed",
+                    generated_token_count=ctx.token_count,
+                    error_code=payload.get("code"),
+                    error_message=payload.get("message"),
+                    completed_at=_now(),
+                )
+            await self.events.publish(run_id, event_type, payload)
+
+    async def _fail_run(self, ctx: RunContext, exc: Exception) -> None:
+        """Persist a failed run with its partial output and publish exactly one error."""
+
+        logger.error("generation run %s failed (%s)", ctx.run_id, type(exc).__name__)
+        if isinstance(exc, WorkerFailure):
+            error = exc.error
+        elif isinstance(exc, WorkbenchError):
+            error = exc.to_dict()
+        else:
+            error = {
+                "code": "internal_error",
+                "message": "generation failed at an application boundary",
+                "hint": "Review local application logs for the private diagnostic details.",
+            }
+        # Establish the same durability barrier used by normal terminal
+        # events before making the failed state visible to polling clients.
+        with suppress(Exception):
+            await self.telemetry.flush()
+        await self.repository.update_message(ctx.message_id, content=ctx.output, status="failed")
+        await self.repository.update_run(
+            ctx.run_id,
+            status="failed",
+            generated_token_count=ctx.token_count,
+            error_code=error.get("code"),
+            error_message=error.get("message"),
+            completed_at=_now(),
+        )
+        # EventBroker fans out before surfacing an optional persistence
+        # failure, so suppressing here avoids an unhandled background task
+        # while connected clients still receive exactly one terminal error.
+        with suppress(Exception):
+            await self.events.publish(ctx.run_id, "error", error)
 
     async def cancel(self, run_id: str) -> bool:
         run = await self.repository.get_run(run_id)
@@ -791,7 +906,13 @@ class RunManager:
         deterministic_reference_mode = bool(settings.get("deterministic_reference_mode", False))
         recorded_reasoning = settings.get("reasoning")
         reasoning = recorded_reasoning if isinstance(recorded_reasoning, bool) else None
-        recorded_reproducibility = dict(source.get("reproducibility") or {})
+        recorded_reproducibility = {
+            key: value
+            for key, value in dict(source.get("reproducibility") or {}).items()
+            if key not in _EXECUTION_FIELDS
+        }
+        quantization, strict_vram = _recorded_placement(self.settings, settings)
+        settings.update(quantization=quantization.value, strict_vram=strict_vram)
         recorded_device = recorded_reproducibility.get("device")
         device: DeviceMode | None = None
         if isinstance(recorded_device, Mapping):
@@ -826,6 +947,8 @@ class RunManager:
                 deterministic_reference_mode=deterministic_reference_mode,
                 reasoning=reasoning,
                 recorded_reproducibility=recorded_reproducibility,
+                quantization=quantization,
+                strict_vram=strict_vram,
                 selection=selection,
                 device=device,
                 dtype=dtype,
@@ -852,6 +975,8 @@ class RunManager:
         deterministic_reference_mode: bool,
         reasoning: bool | None,
         recorded_reproducibility: dict[str, Any],
+        quantization: Quantization,
+        strict_vram: bool,
         selection: Any,
         device: DeviceMode | None,
         dtype: DType | None,
@@ -881,6 +1006,8 @@ class RunManager:
             "model_fingerprint": descriptor.fingerprint.model_dump(mode="json"),
             "device": selection.model_dump(mode="json"),
             "dtype": selection.effective_dtype.value,
+            "quantization": quantization.value,
+            "strict_vram": strict_vram,
             "software_versions": (
                 self.registry.hardware.software_versions if self.registry.hardware else {}
             ),
@@ -921,7 +1048,8 @@ class RunManager:
                 "name": "transformers-reference-loop",
                 "selection": selection.model_dump(mode="json"),
                 "attention_implementation": self.settings.runtime.attention_backend.value,
-                "quantization": self.settings.runtime.quantization.value,
+                "quantization": quantization.value,
+                "strict_vram": strict_vram,
                 "replayed_from_run_id": parent_run_id,
             },
         )
@@ -939,6 +1067,8 @@ class RunManager:
                 device=device,
                 dtype=dtype,
                 reservation=reservation,
+                quantization=quantization,
+                strict_vram=strict_vram,
             ),
             name=f"generation-replay-{run_id}",
         )
@@ -1071,7 +1201,13 @@ class RunManager:
         deterministic_reference_mode = bool(settings.get("deterministic_reference_mode", False))
         recorded_reasoning = settings.get("reasoning")
         reasoning = recorded_reasoning if isinstance(recorded_reasoning, bool) else None
-        recorded_reproducibility = dict(source.get("reproducibility") or {})
+        recorded_reproducibility = {
+            key: value
+            for key, value in dict(source.get("reproducibility") or {}).items()
+            if key not in _EXECUTION_FIELDS
+        }
+        quantization, strict_vram = _recorded_placement(self.settings, settings)
+        settings.update(quantization=quantization.value, strict_vram=strict_vram)
         recorded_device = recorded_reproducibility.get("device")
         device: DeviceMode | None = None
         if isinstance(recorded_device, Mapping):
@@ -1112,7 +1248,8 @@ class RunManager:
             "backend": "transformers-reference-loop",
             "device": selection.model_dump(mode="json"),
             "dtype": selection.effective_dtype.value,
-            "quantization": self.settings.runtime.quantization.value,
+            "quantization": quantization.value,
+            "strict_vram": strict_vram,
             "attention_implementation": self.settings.runtime.attention_backend.value,
             "deterministic_reference_mode": deterministic_reference_mode,
             "reasoning": reasoning,
@@ -1172,7 +1309,8 @@ class RunManager:
                     "name": "transformers-reference-loop",
                     "selection": selection.model_dump(mode="json"),
                     "attention_implementation": self.settings.runtime.attention_backend.value,
-                    "quantization": self.settings.runtime.quantization.value,
+                    "quantization": quantization.value,
+                    "strict_vram": strict_vram,
                     "token_branch": branch_details,
                 },
             )
@@ -1192,6 +1330,8 @@ class RunManager:
                     reservation=reservation,
                     forced_prefix_token_ids=forced_prefix_token_ids,
                     reasoning=reasoning,
+                    quantization=quantization,
+                    strict_vram=strict_vram,
                 ),
                 name=f"generation-token-branch-{run_id}",
             )

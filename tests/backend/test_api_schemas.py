@@ -111,3 +111,23 @@ def test_canonical_snake_case_request_is_unchanged() -> None:
     assert request.seed is None
     assert request.deterministic_reference_mode is True
     assert request.sampling.top_k == 9
+
+
+def test_browser_strict_vram_and_quantization_map_to_canonical_fields() -> None:
+    from local_ai_doctor.api.schemas import ModelLoadRequest
+    from local_ai_doctor.config import Quantization
+
+    request = GenerationRunCreate.model_validate(
+        {**_BASE, "settings": {"strictVram": False, "quantization": "none"}}
+    )
+    assert request.strict_vram is False
+    assert request.quantization is Quantization.NONE
+    assert GenerationRunCreate.model_validate(_BASE).strict_vram is None
+    top_level = GenerationRunCreate.model_validate(
+        {**_BASE, "strict_vram": True, "settings": {"strictVram": False}}
+    )
+    assert top_level.strict_vram is True
+    assert ModelLoadRequest.model_validate({"strictVram": False}).strict_vram is False
+    assert ModelLoadRequest.model_validate({"strict_vram": True}).strict_vram is True
+    with pytest.raises(ValidationError):
+        ModelLoadRequest.model_validate({"placement": "offload"})

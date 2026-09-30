@@ -1130,6 +1130,15 @@ class WorkspaceRepository:
             (*selected.values(), run_id),
         )
 
+    async def merge_run_reproducibility(self, run_id: str, values: Mapping[str, Any]) -> None:
+        """Merge execution facts known only after admission (placement, scheduling)."""
+
+        await self.database.execute(
+            "UPDATE inference_runs SET reproducibility_json = json_patch(reproducibility_json, ?), "
+            "updated_at = ? WHERE id = ?",
+            (_json(dict(values)), utc_now(), run_id),
+        )
+
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
         row = await self.database.fetch_one("SELECT * FROM inference_runs WHERE id = ?", (run_id,))
         return _decode_json_columns(row) if row else None

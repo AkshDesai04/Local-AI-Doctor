@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from ..config import DeviceMode, DType, InstrumentationLevel, SamplingDefaults
+from ..config import DeviceMode, DType, InstrumentationLevel, Quantization, SamplingDefaults
 
 _SAMPLING_DEFAULTS = SamplingDefaults()
 
@@ -100,7 +100,16 @@ class SamplingRequest(StrictRequest):
 
 # Keys of the browser-shaped `settings` object (the frontend's GenerationSettings).
 _BROWSER_SETTINGS_KEYS = frozenset(
-    {"device", "dtype", "instrumentation", "reasoning", "seed", "deterministic"}
+    {
+        "device",
+        "dtype",
+        "instrumentation",
+        "reasoning",
+        "seed",
+        "deterministic",
+        "quantization",
+        "strictVram",
+    }
 )
 _BROWSER_SAMPLING_KEYS = {
     "temperature": "temperature",
@@ -127,6 +136,9 @@ class GenerationRunCreate(StrictRequest):
     instrumentation: InstrumentationLevel | None = None
     reasoning: bool | None = None
     deterministic_reference_mode: bool = False
+    # None means the configured runtime default applies.
+    quantization: Quantization | None = None
+    strict_vram: bool | None = None
     sampling: SamplingRequest = Field(default_factory=SamplingRequest)
     attachment_ids: list[str] = Field(default_factory=list, max_length=1024)
 
@@ -159,9 +171,11 @@ class GenerationRunCreate(StrictRequest):
             if unknown:
                 raise ValueError(f"unknown settings fields: {', '.join(unknown[:10])}")
             # Top-level canonical fields always win over the nested browser shape.
-            for name in ("device", "dtype", "instrumentation", "reasoning"):
+            for name in ("device", "dtype", "instrumentation", "reasoning", "quantization"):
                 if name in settings and name not in data:
                     data[name] = settings[name]
+            if "strictVram" in settings and "strict_vram" not in data:
+                data["strict_vram"] = settings["strictVram"]
             raw_seed = settings.get("seed")
             if raw_seed not in (None, "") and "seed" not in data:
                 try:
@@ -252,6 +266,8 @@ class EmbeddingRunCreate(StrictRequest):
 class ModelLoadRequest(StrictRequest):
     device: DeviceMode | None = None
     dtype: DType | None = None
+    quantization: Quantization | None = None
+    strict_vram: bool | None = Field(default=None, alias="strictVram")
 
 
 class PromptScoreRequest(StrictRequest):
