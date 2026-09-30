@@ -44,8 +44,10 @@ describe("attachments", () => {
         onSettingsChange={vi.fn()}
         onStop={vi.fn()}
         onSubmit={vi.fn()}
+        onSystemPromptChange={vi.fn()}
         running={false}
         settings={defaultGenerationSettings}
+        systemPrompt=""
       />,
     );
 
