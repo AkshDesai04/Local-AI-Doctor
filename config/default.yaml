@@ -23,15 +23,17 @@ defaults:
     device: auto
     allow_cpu_fallback: true
     low_memory_loading: true
-    cpu_offload: false
     device_placement: sequential
     dtype: auto
     quantization: none
     attention_backend: auto
-    load_one_model_at_a_time: true
-    max_loaded_models: 1
+    strict_vram: true
+    vram_safety_margin_bytes: 536870912
+    kv_reserve_tokens: 4096
+    load_one_model_at_a_time: false
+    max_loaded_models: 4
     max_batch_size: 1
-    max_concurrent_runs: 1
+    max_concurrent_runs: 2
     queue_limit: 32
   inference:
     conservative_context_limit: 4096
