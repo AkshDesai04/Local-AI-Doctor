@@ -37,6 +37,13 @@ def write_safetensors(path: Path, tensors: dict[str, tuple[str, list[int]]]) -> 
 
 
 @pytest.fixture
+def safetensors_writer() -> Any:
+    """``write_safetensors`` for test modules, which cannot import this conftest by name."""
+
+    return write_safetensors
+
+
+@pytest.fixture
 def causal_model_dir(tmp_path: Path) -> Path:
     root = tmp_path / "Dense-Reasoner"
     root.mkdir()

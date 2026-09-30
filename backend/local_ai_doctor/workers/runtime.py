@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import importlib
 import json
 import math
 import os
@@ -18,11 +19,22 @@ from multiprocessing.queues import Queue
 from pathlib import Path
 from typing import Any
 
+import psutil
+
 from ..reasoning import (
     SegmentClass,
     SegmentedToken,
     TagReasoningSegmenter,
     UnknownReasoningSegmenter,
+)
+from .memory import (
+    available_ram,
+    available_vram,
+    checkpoint_tensor_shapes,
+    device_map_kwargs,
+    estimate_load_bytes,
+    placement_of,
+    vram_cap_fraction,
 )
 
 # This must be set before the worker imports torch or initializes CUDA.  It is
@@ -207,6 +219,28 @@ class WorkerReportedError(RuntimeError):
     def __init__(self, error: Mapping[str, Any]) -> None:
         self.error = dict(error)
         super().__init__(str(self.error.get("code")))
+
+
+def _insufficient_memory(
+    memory_kind: str, required: int, available: int, estimate: Mapping[str, int]
+) -> WorkerReportedError:
+    where = "GPU" if memory_kind == "vram" else "system"
+    return WorkerReportedError(
+        {
+            "code": "insufficient_memory",
+            "message": f"the model does not fit the available {where} memory",
+            "hint": (
+                "Quantize the model, unload another model, or turn off Strict VRAM to allow "
+                "system-RAM offload."
+                if memory_kind == "vram"
+                else "Unload another model or choose a smaller model."
+            ),
+            "memory_kind": memory_kind,
+            "required_bytes": int(required),
+            "available_bytes": int(available),
+            "estimate": dict(estimate),
+        }
+    )
 
 
 def _rope_state_owner(model: Any) -> Any:
@@ -744,6 +778,7 @@ class WorkerRuntime:
         self.max_concurrent_runs = 1
         self._deterministic_state: bool | None = None
         self._vram_cap_fraction = 1.0
+        self._safety_margin_bytes = 0
 
     def _select_resident(self, model_key: Any) -> ResidentModel | None:
         """Make the named resident active; no key means the active resident."""
@@ -807,7 +842,10 @@ class WorkerRuntime:
             if operation == "load":
                 payload = self._load(command)
             elif operation == "unload":
-                payload = self._unload()
+                model_key = command.get("model_key")
+                payload = self._unload(str(model_key) if model_key else None)
+            elif operation == "memory_status":
+                payload = {"ledger": self._ledger()}
             elif operation == "embed":
                 payload = self._embed(command)
             elif operation == "score_prompt":
@@ -849,6 +887,7 @@ class WorkerRuntime:
                     "max_concurrent_runs": self.max_concurrent_runs,
                 }
             )
+        self._apply_vram_cap()
         session = GenerationSession(self, command)
         session.prefill()
         if session.step():
@@ -918,7 +957,6 @@ class WorkerRuntime:
                 torch.cuda.empty_cache()
 
     def _load(self, command: Mapping[str, Any]) -> dict[str, Any]:
-        self._unload()
         import torch
 
         model = dict(command["model"])
@@ -929,12 +967,168 @@ class WorkerRuntime:
                 f"configured model directory {model_path.name!r} is unavailable"
             )
         key = str(command.get("model_key") or "default")
+        if key in self.residents:
+            # Loading an existing key replaces it, e.g. to re-place an offloaded model.
+            self._unload(key)
         self.max_concurrent_runs = max(1, int(runtime.get("max_concurrent_runs", 1)))
-        self._active = self.residents[key] = ResidentModel(key=key)
-        self.device = str(runtime.get("device", "cpu"))
-        self.dtype = str(runtime.get("dtype", "float32"))
+        device = str(runtime.get("device", "cpu"))
+        dtype_name = str(runtime.get("dtype", "float32"))
+        cuda_device = device.startswith("cuda")
+        placement = str(runtime.get("placement") or ("gpu_only" if cuda_device else "cpu"))
+        if placement not in {"gpu_only", "offload", "cpu"}:
+            raise ValueError(f"unknown model placement: {placement!r}")
+        if placement != "cpu" and not cuda_device:
+            raise ValueError("GPU placement requires a CUDA device")
+        quantization = str(runtime.get("quantization") or "none")
+        if quantization != "none":
+            raise ValueError("model-weight quantization has no installed adapter")
+        task = str(model["task"])
+        generation = task in {"text_generation", "encoder_decoder_generation"}
+        if not generation and task not in {"embedding", "multimodal_embedding"}:
+            raise ValueError(f"no runtime adapter supports task {task!r}")
+        if placement == "offload" and not generation:
+            raise ValueError("layer offload is available only for generation models")
+        self._safety_margin_bytes = margin = int(runtime.get("safety_margin_bytes", 0))
         torch.set_num_threads(int(runtime.get("cpu_threads", max(1, os.cpu_count() or 1))))
-        dtype = _torch_dtype(torch, self.dtype)
+
+        try:
+            config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            config = {}
+        estimate = estimate_load_bytes(
+            checkpoint_tensor_shapes(model_path),
+            config if isinstance(config, dict) else {},
+            quantization=quantization,
+            compute_dtype=dtype_name,
+            kv_reserve_tokens=int(runtime.get("kv_reserve_tokens", 0)) if generation else 0,
+        )
+        estimate_report = {
+            "weights": estimate["weights"],
+            "kv_reserve": estimate["kv_reserve"],
+            "margin": margin,
+        }
+        ram_available = available_ram(
+            system_available=int(psutil.virtual_memory().available),
+            process_rss=int(psutil.Process().memory_info().rss),
+            margin=margin,
+            budget=runtime.get("ram_budget_bytes"),
+        )
+        cuda: Any = torch.cuda
+        gpu_index = int(device.split(":", 1)[1]) if cuda_device and ":" in device else 0
+        vram_available = 0
+        if cuda_device:
+            free, _total = cuda.mem_get_info(gpu_index)
+            vram_available = available_vram(
+                free=int(free),
+                reserved=int(cuda.memory_reserved(gpu_index)),
+                allocated=int(cuda.memory_allocated(gpu_index)),
+                margin=margin,
+                budget=runtime.get("vram_budget_bytes"),
+            )
+        # Preflight before from_pretrained: a load that cannot fit fails with numbers
+        # instead of filling memory first.
+        if placement == "gpu_only" and estimate["total"] > vram_available:
+            raise _insufficient_memory("vram", estimate["total"], vram_available, estimate_report)
+        if placement == "cpu" and estimate["total"] > ram_available:
+            raise _insufficient_memory("ram", estimate["total"], ram_available, estimate_report)
+        gpu_weight_budget = max(0, vram_available - estimate["kv_reserve"])
+        if placement == "offload" and estimate["weights"] > gpu_weight_budget + ram_available:
+            raise _insufficient_memory(
+                "ram", estimate["total"], vram_available + ram_available, estimate_report
+            )
+
+        resident = ResidentModel(
+            key=key,
+            device=device,
+            input_device=device if placement != "cpu" else "cpu",
+            dtype=dtype_name,
+            quantization=quantization,
+            strict_vram=bool(runtime.get("strict_vram", True)),
+            placement={"gpu_only": "gpu", "offload": "offload", "cpu": "cpu"}[placement],
+            kv_reserve_bytes=estimate["kv_reserve"],
+        )
+        # Registered before loading so a strict load already runs under the cap.
+        self._active = self.residents[key] = resident
+        self._apply_vram_cap()
+        allocated_before = int(cuda.memory_allocated(gpu_index)) if cuda_device else 0
+        rss_before = int(psutil.Process().memory_info().rss)
+        started = time.monotonic()
+        out_of_memory = False
+        try:
+            self._load_resident(
+                resident,
+                model,
+                model_path,
+                runtime,
+                device_map_kwargs(
+                    placement, device, gpu_bytes=gpu_weight_budget, cpu_bytes=ram_available
+                ),
+            )
+        except (torch.OutOfMemoryError, MemoryError):
+            out_of_memory = True
+        except BaseException:
+            self._discard(key)
+            raise
+        if out_of_memory:
+            # Outside the except block, so the traceback no longer pins partial weights.
+            self._discard(key)
+            free_after = int(cuda.mem_get_info(gpu_index)[0]) if cuda_device else 0
+            raise _insufficient_memory(
+                "vram" if cuda_device and placement == "gpu_only" else "ram",
+                estimate["total"],
+                free_after if cuda_device else ram_available,
+                estimate_report,
+            )
+        resident.load_seconds = time.monotonic() - started
+        resident.gpu_bytes = (
+            max(0, int(cuda.memory_allocated(gpu_index)) - allocated_before) if cuda_device else 0
+        )
+        resident.cpu_bytes = max(0, int(psutil.Process().memory_info().rss) - rss_before)
+        device_map = getattr(resident.model, "hf_device_map", None)
+        if isinstance(device_map, Mapping):
+            resident.placement = placement_of(device_map, resident.placement)
+            if resident.placement == "cpu":
+                resident.input_device = "cpu"
+        self._apply_vram_cap()
+        summary = Counter(
+            str(value)
+            for value in (device_map if isinstance(device_map, Mapping) else {"": device}).values()
+        )
+        return {
+            "model_id": model["id"],
+            "task": task,
+            "device": device,
+            "dtype": dtype_name,
+            "load_seconds": resident.load_seconds,
+            "memory": self._memory_snapshot(torch),
+            "trust_remote_code": bool(model.get("trust_remote_code", False)),
+            "local_files_only": True,
+            "decoder_start_token_id": resident.decoder_start_token_id,
+            "decoder_start_token_source": resident.decoder_start_token_source,
+            "warnings": [resident.decoder_start_warning] if resident.decoder_start_warning else [],
+            "model_key": key,
+            "placement": resident.placement,
+            "quantization": quantization,
+            "strict_vram": resident.strict_vram,
+            "gpu_bytes": resident.gpu_bytes,
+            "cpu_bytes": resident.cpu_bytes,
+            "kv_reserve_bytes": resident.kv_reserve_bytes,
+            "device_map_summary": dict(summary),
+            "estimate": estimate_report,
+            "ledger": self._ledger(),
+        }
+
+    def _load_resident(
+        self,
+        resident: ResidentModel,
+        model: Mapping[str, Any],
+        model_path: Path,
+        runtime: Mapping[str, Any],
+        placement_kwargs: Mapping[str, Any],
+    ) -> None:
+        import torch
+
+        dtype = _torch_dtype(torch, resident.dtype)
         attention = runtime.get("attention_backend")
         attention = (
             None
@@ -954,48 +1148,45 @@ class WorkerRuntime:
         if attention is not None:
             model_kwargs["attn_implementation"] = attention
         task = str(model["task"])
-        started = time.monotonic()
         if task in {"text_generation", "encoder_decoder_generation"}:
             from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
             tokenizer_loader: Any = AutoTokenizer
-            self.tokenizer = tokenizer_loader.from_pretrained(model_path, **common)
+            resident.tokenizer = tokenizer_loader.from_pretrained(model_path, **common)
             if model.get("media_modalities"):
                 from transformers import AutoProcessor
 
                 processor_loader: Any = AutoProcessor
-                self.processor = processor_loader.from_pretrained(model_path, **common)
+                resident.processor = processor_loader.from_pretrained(model_path, **common)
             loader: Any = (
                 AutoModelForSeq2SeqLM
                 if task == "encoder_decoder_generation"
                 else _generation_loader(model_path, common)
             )
-            self.model = loader.from_pretrained(
+            # Always a device map, never `.to(device)`: accelerate-dispatched (offloaded)
+            # models reject `.to()`.
+            resident.model = loader.from_pretrained(
                 model_path,
                 low_cpu_mem_usage=bool(runtime.get("low_memory_loading", True)),
                 **model_kwargs,
+                **placement_kwargs,
             )
-            self.model.eval()
-            self.model.to(self.device)
-            configured_attention = getattr(self.model.config, "_attn_implementation", None)
-            self.loaded_attention_implementation = (
+            resident.model.eval()
+            configured_attention = getattr(resident.model.config, "_attn_implementation", None)
+            resident.loaded_attention_implementation = (
                 str(configured_attention) if configured_attention is not None else None
             )
             if task == "encoder_decoder_generation":
-                try:
-                    (
-                        self.decoder_start_token_id,
-                        self.decoder_start_token_source,
-                        self.decoder_start_warning,
-                    ) = _decoder_start_token(self.model, self.tokenizer)
-                except ValueError:
-                    self._unload()
-                    raise
-        elif task in {"embedding", "multimodal_embedding"}:
+                (
+                    resident.decoder_start_token_id,
+                    resident.decoder_start_token_source,
+                    resident.decoder_start_warning,
+                ) = _decoder_start_token(resident.model, resident.tokenizer)
+        else:
             from sentence_transformers import SentenceTransformer
 
             sentence_kwargs: dict[str, Any] = {
-                "device": self.device,
+                "device": resident.device,
                 "local_files_only": True,
                 "trust_remote_code": trust_remote_code,
             }
@@ -1008,40 +1199,93 @@ class WorkerRuntime:
                 sentence_kwargs["model_kwargs"] = _embedding_model_kwargs(
                     model_path, embedding_model_kwargs
                 )
-            self.sentence_model = SentenceTransformer(str(model_path), **sentence_kwargs)
-        else:
-            raise ValueError(f"no runtime adapter supports task {task!r}")
+            resident.sentence_model = SentenceTransformer(str(model_path), **sentence_kwargs)
+        resident.model_info = dict(model)
 
-        self.model_info = model
-        memory = self._memory_snapshot(torch)
-        return {
-            "model_id": model["id"],
-            "task": task,
-            "device": self.device,
-            "dtype": self.dtype,
-            "load_seconds": time.monotonic() - started,
-            "memory": memory,
-            "trust_remote_code": trust_remote_code,
-            "local_files_only": True,
-            "decoder_start_token_id": self.decoder_start_token_id,
-            "decoder_start_token_source": self.decoder_start_token_source,
-            "warnings": [self.decoder_start_warning] if self.decoder_start_warning else [],
-        }
+    def _discard(self, key: str) -> None:
+        """Forget a resident that failed to load and give its memory back."""
 
-    def _unload(self) -> dict[str, Any]:
-        unloaded = self.model_info["id"] if self.model_info else None
+        resident = self.residents.pop(key, None)
+        if resident is not None and self._active is resident:
+            self._active = None
+        del resident
+        gc.collect()
+        self._empty_cache()
+        self._apply_vram_cap()
+
+    def _apply_vram_cap(self) -> None:
+        """Cap the allocator while any strict CUDA resident exists, so nothing spills.
+
+        Some drivers silently page device allocations into system RAM once VRAM is
+        full; the cap turns that into an out-of-memory error instead.
+        """
+
+        import torch
+
+        cuda: Any = torch.cuda
+        if not cuda.is_available() or not cuda.is_initialized():
+            return
+        # ponytail: process-wide cap; a non-strict resident next to a strict one is also capped
+        strict = any(
+            resident.strict_vram and resident.placement != "cpu"
+            for resident in self.residents.values()
+        )
+        fraction = 1.0
+        if strict:
+            free, total = cuda.mem_get_info(0)
+            fraction = vram_cap_fraction(
+                reserved=int(cuda.memory_reserved(0)),
+                free=int(free),
+                total=int(total),
+                margin=self._safety_margin_bytes,
+            )
+        if fraction != self._vram_cap_fraction:
+            cuda.set_per_process_memory_fraction(fraction, 0)
+            self._vram_cap_fraction = fraction
+
+    def _unload(self, model_key: str | None = None) -> dict[str, Any]:
+        """Unload one resident (or all) and report the device memory actually returned."""
+
+        if model_key is not None and model_key not in self.residents:
+            raise WorkerReportedError(
+                {
+                    "code": "model_not_resident",
+                    "message": "the requested model is not resident in the worker",
+                    "hint": "Refresh the resident model list.",
+                }
+            )
+        keys = [model_key] if model_key is not None else list(self.residents)
         memory_before: dict[str, Any] = {}
         torch_module: Any | None = None
-        if self.residents:
+        allocated_before = 0
+        if keys:
             try:
                 import torch
 
                 torch_module = torch
                 memory_before = self._memory_snapshot(torch)
+                allocated_before = self._allocated_bytes(torch)
             except ImportError:
                 pass
-        self.residents.clear()
-        self._active = None
+        # A session still using a resident is cancelled first; it keeps its terminal event.
+        self._end_sessions([session for session in self.sessions if session.resident.key in keys])
+        expected_gpu_bytes = 0
+        unloaded_ids: list[str] = []
+        for key in keys:
+            resident = self.residents.pop(key)
+            expected_gpu_bytes += resident.gpu_bytes
+            if resident.model_info and resident.model_info.get("id"):
+                unloaded_ids.append(str(resident.model_info["id"]))
+            if resident.model is not None and getattr(resident.model, "hf_device_map", None):
+                with contextlib.suppress(Exception):
+                    hooks: Any = importlib.import_module("accelerate.hooks")
+                    hooks.remove_hook_from_module(resident.model, recurse=True)
+            if self._active is resident:
+                self._active = None
+            # Memory returns only once every reference (model, caches, outputs) is gone.
+            del resident
+        if self._active is None and self.residents:
+            self._active = next(reversed(self.residents.values()))
         gc.collect()
         try:
             if torch_module is not None and torch_module.cuda.is_available():
@@ -1050,22 +1294,36 @@ class WorkerRuntime:
         except RuntimeError:
             pass
         memory_after = self._memory_snapshot(torch_module) if torch_module is not None else {}
+        freed_bytes = 0
+        if torch_module is not None:
+            freed_bytes = max(0, allocated_before - self._allocated_bytes(torch_module))
+            self._apply_vram_cap()
         return {
-            "unloaded_model_id": unloaded,
+            "unloaded_model_id": unloaded_ids[-1] if unloaded_ids else None,
+            "unloaded_model_ids": unloaded_ids,
+            "unloaded_model_keys": keys,
+            "freed_bytes": freed_bytes,
+            "leaked_bytes": max(0, expected_gpu_bytes - freed_bytes),
             "memory_before": memory_before,
             "memory_after": memory_after,
+            "ledger": self._ledger() if torch_module is not None else None,
         }
+
+    @staticmethod
+    def _allocated_bytes(torch: Any) -> int:
+        cuda: Any = torch.cuda
+        if cuda.is_available() and cuda.is_initialized():
+            return int(cuda.memory_allocated(0))
+        return 0
 
     @staticmethod
     def _memory_snapshot(torch: Any) -> dict[str, Any]:
         result: dict[str, Any] = {}
         try:
-            psutil: Any = __import__("psutil")
-
             process = psutil.Process()
             result["process_rss_bytes"] = int(process.memory_info().rss)
             result["system_available_bytes"] = int(psutil.virtual_memory().available)
-        except (ImportError, OSError):
+        except (psutil.Error, OSError):
             pass
         if torch.cuda.is_available():
             result.update(
@@ -1094,14 +1352,12 @@ class WorkerRuntime:
             "residents": [resident.summary() for resident in self.residents.values()],
         }
         try:
-            psutil: Any = __import__("psutil")
-
             memory = psutil.virtual_memory()
             ledger["process_rss_bytes"] = int(psutil.Process().memory_info().rss)
             ledger["system_available_bytes"] = int(memory.available)
             ledger["total_bytes"] = int(memory.total)
             ledger["free_bytes"] = int(memory.available)
-        except (ImportError, OSError):
+        except (psutil.Error, OSError):
             pass
         cuda: Any = torch.cuda
         if cuda.is_available():

@@ -1822,3 +1822,224 @@ def test_unknown_model_key_is_reported_as_not_resident(monkeypatch: pytest.Monke
         "message": "the requested model is not resident in the worker",
         "hint": "Load the model before running it.",
     }
+
+
+class FakeCudaMemory:
+    """Device-memory counters the loader and allocator cap read."""
+
+    def __init__(self, *, free: int, total: int, reserved: int = 0, allocated: int = 0) -> None:
+        self.free = free
+        self.total = total
+        self.reserved = reserved
+        self.allocated = allocated
+        self.fractions: list[float] = []
+
+    @staticmethod
+    def is_available() -> bool:
+        return True
+
+    @staticmethod
+    def is_initialized() -> bool:
+        return True
+
+    def mem_get_info(self, _index: int = 0) -> tuple[int, int]:
+        return self.free, self.total
+
+    def memory_reserved(self, _index: int = 0) -> int:
+        return self.reserved
+
+    def memory_allocated(self, _index: int = 0) -> int:
+        return self.allocated
+
+    def max_memory_allocated(self, _index: int = 0) -> int:
+        return self.allocated
+
+    def set_per_process_memory_fraction(self, fraction: float, _index: int = 0) -> None:
+        self.fractions.append(fraction)
+
+    @staticmethod
+    def empty_cache() -> None:
+        return None
+
+    @staticmethod
+    def ipc_collect() -> None:
+        return None
+
+
+class FakeCudaTorch(FakeTorch):
+    def __init__(self, cuda: FakeCudaMemory) -> None:
+        super().__init__()
+        self.cuda = cast(Any, cuda)
+        self.OutOfMemoryError = type("OutOfMemoryError", (RuntimeError,), {})
+
+    @staticmethod
+    def set_num_threads(_threads: int) -> None:
+        return None
+
+
+def _checkpoint(tmp_path: Path, writer: Any) -> dict[str, Any]:
+    """A 1 MiB float32 checkpoint (0.5 MiB at bfloat16) with a tiny KV geometry."""
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 8,
+            }
+        ),
+        encoding="utf-8",
+    )
+    writer(tmp_path / "model.safetensors", {"model.layers.0.weight": ("F32", [512, 512])})
+    return {"id": "fixture", "task": "text_generation", "path": str(tmp_path)}
+
+
+def _load_command(model: dict[str, Any], **runtime: Any) -> dict[str, Any]:
+    return {
+        "op": "load",
+        "model_key": "key-1",
+        "model": model,
+        "runtime": {
+            "device": "cuda:0",
+            "dtype": "bfloat16",
+            "safety_margin_bytes": 1024,
+            "kv_reserve_tokens": 16,
+            **runtime,
+        },
+    }
+
+
+def test_strict_preflight_refuses_before_from_pretrained(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, safetensors_writer: Any
+) -> None:
+    from local_ai_doctor.workers.runtime import WorkerReportedError
+
+    cuda = FakeCudaMemory(free=256 * 1024, total=8 * 1024**3)
+    monkeypatch.setitem(sys.modules, "torch", FakeCudaTorch(cuda))
+    runtime = WorkerRuntime(cast(Any, FakeQueue()), cast(Any, FakeQueue()), FakeCancelEvent())
+    loads: list[Any] = []
+    monkeypatch.setattr(runtime, "_load_resident", lambda *args: loads.append(args))
+
+    with pytest.raises(WorkerReportedError) as caught:
+        runtime._load(_load_command(_checkpoint(tmp_path, safetensors_writer)))
+
+    assert loads == []
+    assert runtime.residents == {}
+    kv = 2 * 1 * 1 * 8 * 2 * 16
+    assert caught.value.error == {
+        "code": "insufficient_memory",
+        "message": "the model does not fit the available GPU memory",
+        "hint": (
+            "Quantize the model, unload another model, or turn off Strict VRAM to allow "
+            "system-RAM offload."
+        ),
+        "memory_kind": "vram",
+        "required_bytes": 512 * 1024 + kv,
+        "available_bytes": 256 * 1024 - 1024,
+        "estimate": {"weights": 512 * 1024, "kv_reserve": kv, "margin": 1024},
+    }
+
+
+@pytest.mark.parametrize(
+    ("placement", "produced_map", "placed", "input_device"),
+    [
+        ("gpu_only", {"": "cuda:0"}, "gpu", "cuda:0"),
+        ("cpu", {"": "cpu"}, "cpu", "cpu"),
+        ("offload", {"layer": 0, "tail": "cpu"}, "offload", "cuda:0"),
+    ],
+)
+def test_loads_always_pass_a_device_map_for_the_placement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    safetensors_writer: Any,
+    placement: str,
+    produced_map: dict[str, Any],
+    placed: str,
+    input_device: str,
+) -> None:
+    free = 100_000 if placement == "offload" else 8 * 1024**3
+    cuda = FakeCudaMemory(free=free, total=16 * 1024**3)
+    monkeypatch.setitem(sys.modules, "torch", FakeCudaTorch(cuda))
+    runtime = WorkerRuntime(cast(Any, FakeQueue()), cast(Any, FakeQueue()), FakeCancelEvent())
+    seen: list[dict[str, Any]] = []
+
+    def fake_load(resident: Any, model: Any, *args: Any) -> None:
+        seen.append(dict(args[-1]))
+        cuda.allocated += 4096
+        resident.model = SimpleNamespace(hf_device_map=produced_map)
+        resident.model_info = dict(model)
+
+    monkeypatch.setattr(runtime, "_load_resident", fake_load)
+    command = _load_command(_checkpoint(tmp_path, safetensors_writer), placement=placement)
+    command["runtime"]["kv_reserve_tokens"] = 1
+
+    payload = runtime._load(command)
+
+    kwargs = seen[0]
+    if placement == "offload":
+        kv = 2 * 1 * 1 * 8 * 2 * 1
+        assert kwargs["device_map"] == "auto"
+        assert kwargs["max_memory"][0] == free - 1024 - kv
+        assert kwargs["max_memory"]["cpu"] > 0
+    else:
+        assert kwargs == {"device_map": dict(produced_map)}
+    assert payload["model_key"] == "key-1"
+    assert payload["gpu_bytes"] == 4096
+    assert payload["placement"] == placed
+    assert sum(payload["device_map_summary"].values()) == len(produced_map)
+    assert payload["ledger"]["residents"][0]["model_key"] == "key-1"
+    assert runtime.residents["key-1"].input_device == input_device
+
+
+def test_vram_cap_applies_only_while_a_strict_cuda_resident_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_ai_doctor.workers.runtime import ResidentModel
+
+    cuda = FakeCudaMemory(free=4000, total=10000, reserved=2000)
+    monkeypatch.setitem(sys.modules, "torch", FakeCudaTorch(cuda))
+    runtime = WorkerRuntime(cast(Any, FakeQueue()), cast(Any, FakeQueue()), FakeCancelEvent())
+    runtime._safety_margin_bytes = 512
+    resident = ResidentModel(key="a", device="cuda:0", placement="gpu", strict_vram=True)
+    runtime.residents["a"] = resident
+
+    runtime._apply_vram_cap()
+    runtime._apply_vram_cap()
+    resident.strict_vram = False
+    runtime._apply_vram_cap()
+
+    assert cuda.fractions == [pytest.approx((2000 + 4000 - 512) / 10000), 1.0]
+    assert runtime._ledger()["cap_bytes"] is None
+
+
+def test_unload_reports_freed_and_leaked_device_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from local_ai_doctor.workers.runtime import ResidentModel
+
+    cuda = FakeCudaMemory(free=1000, total=10000, allocated=5000)
+    monkeypatch.setitem(sys.modules, "torch", FakeCudaTorch(cuda))
+
+    class Weights:
+        def __del__(self) -> None:
+            cuda.allocated -= 600
+
+    runtime = WorkerRuntime(cast(Any, FakeQueue()), cast(Any, FakeQueue()), FakeCancelEvent())
+    runtime.residents["a"] = ResidentModel(
+        key="a", model=Weights(), model_info={"id": "model-a"}, gpu_bytes=1000
+    )
+    runtime.residents["b"] = ResidentModel(key="b", model_info={"id": "model-b"}, gpu_bytes=10)
+    runtime._active = runtime.residents["a"]
+
+    payload = runtime._unload("a")
+
+    assert payload["unloaded_model_keys"] == ["a"]
+    assert payload["unloaded_model_id"] == "model-a"
+    assert (payload["freed_bytes"], payload["leaked_bytes"]) == (600, 400)
+    assert list(runtime.residents) == ["b"]
+    assert runtime.model_info == {"id": "model-b"}
+    from local_ai_doctor.workers.runtime import WorkerReportedError
+
+    with pytest.raises(WorkerReportedError, match="model_not_resident"):
+        runtime._unload("a")
+    assert runtime._unload()["unloaded_model_keys"] == ["b"]
+    assert runtime._unload()["unloaded_model_id"] is None
