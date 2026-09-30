@@ -29,12 +29,12 @@ try {
   await page.getByRole("button", { name: "Embeddings", exact: true }).click();
   await page.getByRole("textbox", { name: "Text for Item 1" }).fill("Local model observability and reproducible inference");
   await page.getByRole("textbox", { name: "Text for Item 2" }).fill("Inspect reproducible local inference metrics");
-  await page.getByRole("button", { name: "64", exact: true }).click();
+  await page.getByRole("radio", { name: "64", exact: true }).click();
   await page.getByRole("button", { name: "Embed 2 items", exact: true }).click();
   await page.getByText("No embedding run yet", { exact: true }).waitFor({ state: "hidden", timeout: 120_000 });
   await page.screenshot({ path: resolve(outputDirectory, "embeddings-workspace.png") });
 
-  await page.getByRole("button", { name: "Model registry", exact: true }).click();
+  await page.getByRole("button", { name: "Models", exact: true }).click();
   await page.waitForTimeout(250);
   await page.screenshot({ path: resolve(outputDirectory, "model-registry.png") });
 

@@ -165,6 +165,7 @@ function normalizeModel(value: unknown, fallback?: ModelSummary, lifecycleOverri
     task: task === "unknown" ? fallback?.task ?? task : task,
     fingerprint: typeof raw.fingerprint === "string" ? raw.fingerprint : typeof fingerprint.value === "string" ? fingerprint.value : fallback?.fingerprint ?? null,
     parameterCount: asNullableNumber(raw.parameterCount ?? raw.parameter_count) ?? fallback?.parameterCount,
+    weightBytes: asNullableNumber(raw.weightBytes ?? raw.weight_bytes ?? fingerprint.total_weight_bytes) ?? fallback?.weightBytes,
     dtype: typeof raw.dtype === "string" ? raw.dtype : fallback?.dtype ?? null,
     lifecycle,
     loadedDevice: typeof raw.loadedDevice === "string" ? raw.loadedDevice : typeof raw.loaded_device === "string" ? raw.loaded_device : typeof raw.device === "string" ? raw.device : fallback?.loadedDevice ?? null,

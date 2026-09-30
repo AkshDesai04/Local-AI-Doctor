@@ -74,6 +74,10 @@ const runTones: Record<RunDetails["status"], BadgeTone> = {
   failed: "danger",
 };
 
+function sentenceCase(value: string): string {
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
 function tabDisabled(tab: TabDefinition, model: ModelSummary | null): { disabled: boolean; reason?: string } {
   if (tab.id === "timing") return { disabled: !supportsGeneration(model), reason: "Timing traces need a text-generation model." };
   if (!tab.capability) return { disabled: false };
@@ -199,7 +203,7 @@ function OverviewPanel({ run, model }: { run: RunDetails | null; model: ModelSum
   const timing = run.metrics?.timing;
   return (
     <div className="inspector-stack">
-      <div className="run-status-row"><Badge tone={runTones[run.status]}>{run.status}</Badge><span>{run.metrics?.finishReason ? `finish: ${run.metrics.finishReason}` : "No finish reason yet"}</span></div>
+      <p className="run-status-row">{run.metrics?.finishReason ? <>Finish reason <code>{run.metrics.finishReason}</code></> : "No finish reason yet"}</p>
       {run.warnings?.map((warning, index) => <Callout key={index} tone="warning">{warning}</Callout>)}
       <StatGrid>
         <Stat caption="request → first server token" label="Server TTFT" value={formatDuration(timing?.serverTtftMs)} />
@@ -453,7 +457,7 @@ export function Inspector({ open, model, run, health, configuration, activeTab, 
   return (
     <aside className={`inspector ${open ? "open" : ""}`} aria-label="Run inspector">
       <header className="inspector-header">
-        <div className="inspector-title"><h2>Run inspector</h2>{run ? <Badge tone={runTones[run.status]}>{run.status}</Badge> : <Badge>no run</Badge>}</div>
+        <div className="inspector-title"><h2>Run inspector</h2>{run ? <Badge tone={runTones[run.status]}>{sentenceCase(run.status)}</Badge> : <Badge>No run</Badge>}</div>
         <IconButton icon={<X size={16} />} label="Close inspector" onClick={onClose} />
       </header>
       <div className="inspector-nav">

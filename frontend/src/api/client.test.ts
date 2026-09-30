@@ -15,7 +15,7 @@ describe("API boundary normalization", () => {
         display_name: "Local model",
         architectures: ["FixtureForCausalLM"],
         task: "text_generation",
-        fingerprint: { value: "abcdef" },
+        fingerprint: { value: "abcdef", total_weight_bytes: 3_000_000_000 },
         parameter_count: 1_500_000_000,
         effective_context_limit: 4096,
         context_values: [{ source: "config.max_position_embeddings", value: 4096 }],
@@ -37,6 +37,7 @@ describe("API boundary normalization", () => {
       architecture: "FixtureForCausalLM",
       task: "text_generation",
       parameterCount: 1_500_000_000,
+      weightBytes: 3_000_000_000,
       effectiveContextLimit: 4096,
     });
     expect(model?.capabilities.reasoning_segments).toEqual({

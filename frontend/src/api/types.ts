@@ -46,6 +46,8 @@ export interface ModelSummary {
   task: ModelTask;
   fingerprint: string | null;
   parameterCount?: number | null;
+  /** Total SafeTensors weight bytes recorded by the discovery fingerprint. */
+  weightBytes?: number | null;
   dtype?: string | null;
   lifecycle: ModelLifecycle;
   loadedDevice?: string | null;

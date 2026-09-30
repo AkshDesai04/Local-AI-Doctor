@@ -1,9 +1,10 @@
-import { FolderCog, LoaderCircle, Save } from "lucide-react";
+import { FolderCog, Save } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 import {
   getModelRootSettings,
   updateModelRootSettings,
 } from "../api/modelRoots";
+import { Button, Callout, Card, Field, Textarea } from "./ui";
 
 interface ModelRootSettingsProps {
   connected: boolean;
@@ -74,40 +75,45 @@ export function ModelRootSettings({ connected, modelLoaded = false, onRefresh }:
   };
 
   return (
-    <section aria-labelledby="model-root-settings-title" className="model-root-settings">
-      <div className="model-root-settings-copy">
-        <FolderCog size={18} />
-        <div>
-          <h2 id="model-root-settings-title">Local model directories</h2>
-          <p>Saved in the existing user-local configuration file. Model files stay read-only.</p>
-        </div>
-      </div>
-      <form onSubmit={(event) => void save(event)}>
-        <label htmlFor="model-root-paths" title="Directories are scanned for compatible local model checkpoints.">Backend-visible absolute paths, one per line</label>
-        <textarea
-          disabled={!connected || loading || !writable || modelLoaded}
+    <Card
+      aria-label="Local model directories"
+      className="model-root-settings"
+      description="Saved in the existing user-local configuration file. Model files stay read-only."
+      icon={FolderCog}
+      title="Local model directories"
+      titleAs="h2"
+    >
+      <form className="model-root-form" onSubmit={(event) => void save(event)}>
+        <Field
+          hint={containerized
+            ? "Docker users must enter the mounted container path, normally /models—not a Windows host path."
+            : "The path must exist and be readable by the backend process."}
           id="model-root-paths"
-          onChange={(event) => setPaths(event.target.value)}
-          placeholder={containerized ? "/models" : "C:/models"}
-          rows={Math.max(1, Math.min(4, paths.split(/\r?\n/u).length))}
-          spellCheck={false}
-          title={containerized ? "Use a path mounted inside the backend container, normally /models." : "Use an absolute directory path readable by the backend process."}
-          value={paths}
-        />
-        <button className="button primary" disabled={!connected || loading || saving || !writable || modelLoaded} title={modelLoaded ? "Unload the active model before changing model directories" : "Persist these paths in the user-local config file and rescan models"} type="submit">
-          {saving ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}
+          label="Backend-visible absolute paths, one per line"
+        >
+          <Textarea
+            className="mono"
+            disabled={!connected || loading || !writable || modelLoaded}
+            onChange={(event) => setPaths(event.target.value)}
+            placeholder={containerized ? "/models" : "C:/models"}
+            rows={Math.max(1, Math.min(4, paths.split(/\r?\n/u).length))}
+            spellCheck={false}
+            title={containerized ? "Use a path mounted inside the backend container, normally /models." : "Use an absolute directory path readable by the backend process."}
+            value={paths}
+          />
+        </Field>
+        <Button disabled={!connected || loading || !writable || modelLoaded} icon={<Save size={14} />} loading={saving} title={modelLoaded ? "Unload the active model before changing model directories" : "Persist these paths in the user-local config file and rescan models"} type="submit" variant="primary">
           {saving ? "Saving…" : "Save & rescan"}
-        </button>
+        </Button>
       </form>
-      <p className="model-root-hint">
-        {containerized
-          ? "Docker users must enter the mounted container path, normally /models—not a Windows host path."
-          : "The path must exist and be readable by the backend process."}
-      </p>
-      {reason && <p className="model-root-warning" role="status">{reason}</p>}
-      {modelLoaded && <p className="model-root-warning" role="status">Unload the active model before changing model directories.</p>}
-      {error && <p className="model-root-error" role="alert">{error}</p>}
-      {message && !error && <p className="model-root-success" role="status">{message}</p>}
-    </section>
+      {(reason || modelLoaded || error || (message && !error)) && (
+        <div className="model-root-messages">
+          {reason && <Callout role="status" tone="warning">{reason}</Callout>}
+          {modelLoaded && <Callout role="status" tone="warning">Unload the active model before changing model directories.</Callout>}
+          {error && <Callout tone="danger">{error}</Callout>}
+          {message && !error && <Callout role="status">{message}</Callout>}
+        </div>
+      )}
+    </Card>
   );
 }
