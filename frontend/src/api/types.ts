@@ -77,6 +77,21 @@ export interface HealthStatus {
   reason?: string;
 }
 
+export interface AcceleratorSummary {
+  backend: string;
+  name: string;
+  runtimeAvailable: boolean;
+  runtimeReason?: string;
+}
+
+/** The subset of GET /hardware the interface uses. */
+export interface HardwareSummary {
+  /** Device mode the backend was configured with: auto, cpu, or cuda. */
+  requestedDevice?: string;
+  selectedBackend?: string;
+  accelerators: AcceleratorSummary[];
+}
+
 export interface ConfigurationSnapshot {
   effective: Record<string, unknown>;
   precedence: string[];

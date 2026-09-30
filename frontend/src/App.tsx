@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { ChatView, type NerdMetric } from "./components/ChatView";
 import { Composer } from "./components/Composer";
 import { ContextMeter } from "./components/ContextMeter";
+import { CudaRuntimeNotice } from "./components/CudaRuntimeNotice";
 import { EmbeddingsWorkspace } from "./components/EmbeddingsWorkspace";
 import { GenerationControls } from "./components/GenerationControls";
 import { Inspector, type InspectorTab } from "./components/Inspector";
@@ -115,6 +116,7 @@ export default function App(): React.ReactNode {
         />
         <div className="workbench-body">
           <div className="main-pane">
+            <CudaRuntimeNotice connected={workbench.connected} />
             {view === "chat" && (
               <>
                 <ChatView

@@ -13,6 +13,7 @@ import type {
   EmbeddingRun,
   GenerateRequest,
   GenerateResponse,
+  HardwareSummary,
   HealthStatus,
   Message,
   ModelInspection,
@@ -702,6 +703,24 @@ export const api = {
     return {
       effective: asRecord(raw.effective),
       precedence: Array.isArray(raw.precedence) ? raw.precedence.filter((item): item is string => typeof item === "string") : [],
+    };
+  },
+  async hardware(): Promise<HardwareSummary> {
+    const raw = asRecord(await request<unknown>("/hardware"));
+    const inventory = asRecord(raw.inventory);
+    const selection = asRecord(raw.selection);
+    return {
+      requestedDevice: typeof selection.requested === "string" ? selection.requested : undefined,
+      selectedBackend: typeof selection.selected_backend === "string" ? selection.selected_backend : undefined,
+      accelerators: (Array.isArray(inventory.accelerators) ? inventory.accelerators : []).map((value) => {
+        const device = asRecord(value);
+        return {
+          backend: asString(device.backend, "unknown"),
+          name: asString(device.name, "Unknown accelerator"),
+          runtimeAvailable: device.runtime_available === true,
+          runtimeReason: typeof device.runtime_reason === "string" ? device.runtime_reason : undefined,
+        };
+      }),
     };
   },
   async models(): Promise<ModelSummary[]> {
