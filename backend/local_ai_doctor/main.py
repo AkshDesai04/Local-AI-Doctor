@@ -56,6 +56,7 @@ from .api.schemas import (
     ModelRootsUpdate,
     PromptScoreRequest,
     TokenBranchCreate,
+    TokenInfluenceRequest,
 )
 from .config import AppSettings, ProfileName, SettingsLoader, persist_user_model_roots
 from .errors import (
@@ -74,6 +75,7 @@ from .errors import (
 from .persistence import Database, TelemetryWriter, WorkspaceRepository
 from .persistence.repository import UNSET
 from .services.events import EventBroker
+from .services.influence import InfluenceService
 from .services.models import ModelRegistry
 from .services.runs import RunManager
 from .services.uploads import UploadStore
@@ -94,6 +96,7 @@ class ApplicationServices:
     worker: ModelWorkerSupervisor
     registry: ModelRegistry
     runs: RunManager
+    influence: InfluenceService
     uploads: UploadStore
     workspace: WorkspaceService
 
@@ -466,6 +469,7 @@ def create_app(
             worker=worker,
             registry=registry,
             runs=runs,
+            influence=InfluenceService(effective_settings, repository, registry, worker, runs),
             uploads=uploads,
             workspace=workspace,
         )
@@ -982,6 +986,12 @@ def create_app(
             "websocketUrl": f"/ws/v1/runs/{created['run']['id']}",
             **created,
         }
+
+    @api.post("/runs/{run_id}/tokens/{token_index}/influence")
+    async def token_influence(
+        request: Request, run_id: str, token_index: int, body: TokenInfluenceRequest
+    ) -> dict[str, Any]:
+        return await _services(request).influence.analyze(run_id, token_index, body)
 
     @api.get("/runs/{run_id}/export")
     async def export_run(
