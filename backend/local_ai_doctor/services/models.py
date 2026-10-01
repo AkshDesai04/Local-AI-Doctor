@@ -13,6 +13,10 @@ from ..config import AppSettings, DeviceMode, DType, Quantization
 from ..discovery.scanner import ModelScanner, ModelScanReport
 from ..domain.capabilities import Capability, CapabilityState
 from ..domain.models import ModelDescriptor
+from ..domain.quantization import (
+    bitsandbytes_available,
+    quantization_rejection,
+)
 from ..errors import (
     CapabilityUnavailableError,
     ModelInvalidError,
@@ -254,13 +258,7 @@ class ModelRegistry:
                 },
             )
         selection = self.choose_hardware(device=device, dtype=dtype)
-        quantization_value = (quantization or self.settings.runtime.quantization).value
-        if quantization_value != "none":
-            raise CapabilityUnavailableError(
-                "the requested model-weight quantization has no installed compatible adapter",
-                hint="Use quantization none or install and register a reviewed quantization adapter.",
-                details={"quantization": quantization_value},
-            )
+        quantization_value = self.check_quantization(descriptor, selection, quantization)
         strict = self.settings.runtime.strict_vram if strict_vram is None else strict_vram
         cuda = selection.selected_backend is BackendKind.CUDA
         key = model_key(descriptor, selection, quantization_value)
@@ -358,6 +356,34 @@ class ModelRegistry:
                 },
             )
         return self._loaded_view(descriptor, selection, loaded, evicted=evicted)
+
+    def check_quantization(
+        self,
+        descriptor: ModelDescriptor,
+        selection: HardwareSelection,
+        quantization: Quantization | None,
+    ) -> str:
+        """The effective quantization value, or a 409 naming why it cannot load."""
+
+        value = (quantization or self.settings.runtime.quantization).value
+        stored = descriptor.metadata.get("weight_quantization") or {}
+        reason = quantization_rejection(
+            value,
+            task=descriptor.task.value,
+            cuda=selection.selected_backend is BackendKind.CUDA,
+            prequantized=stored.get("method") == "bitsandbytes",
+            backend_available=bitsandbytes_available(),
+        )
+        if reason:
+            raise CapabilityUnavailableError(
+                reason,
+                hint=(
+                    "Choose quantization None, or a CUDA device and a decoder-only text "
+                    "generation model."
+                ),
+                details={"quantization": value, "model_id": descriptor.id},
+            )
+        return value
 
     @staticmethod
     def _loaded_view(

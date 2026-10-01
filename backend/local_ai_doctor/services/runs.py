@@ -273,13 +273,12 @@ class RunManager:
                 "attachment count exceeds the configured per-request limit",
                 details={"limit": self.settings.limits.attachment_count},
             )
-        quantization = request.quantization or self.settings.runtime.quantization
-        if quantization is not Quantization.NONE:
-            raise CapabilityUnavailableError(
-                "the requested model-weight quantization has no installed compatible adapter",
-                hint="Use quantization none.",
-                details={"quantization": quantization.value},
-            )
+        # Rejected before any chat or run row is written.
+        self.registry.check_quantization(
+            descriptor,
+            self.registry.choose_hardware(device=request.device, dtype=request.dtype),
+            request.quantization,
+        )
         new_media = await self._chat_media(descriptor, request.attachment_ids)
         chat = await self.repository.get_chat(request.chat_id)
         if chat is None:

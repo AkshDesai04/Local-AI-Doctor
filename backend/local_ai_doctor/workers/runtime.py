@@ -21,6 +21,12 @@ from typing import Any
 
 import psutil
 
+from ..domain.quantization import (
+    bitsandbytes_available,
+    bitsandbytes_config,
+    is_bitsandbytes_checkpoint,
+    quantization_rejection,
+)
 from ..reasoning import (
     SegmentClass,
     SegmentedToken,
@@ -30,6 +36,7 @@ from ..reasoning import (
 from .memory import (
     available_ram,
     available_vram,
+    checkpoint_stored_bytes,
     checkpoint_tensor_shapes,
     device_map_kwargs,
     estimate_load_bytes,
@@ -719,6 +726,8 @@ class ResidentModel:
     cpu_bytes: int = 0
     kv_reserve_bytes: int = 0
     load_seconds: float = 0.0
+    # BitsAndBytesConfig arguments of a load-time quantized model; recorded on flush.
+    quantization_config: dict[str, Any] | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -979,28 +988,39 @@ class WorkerRuntime:
             raise ValueError(f"unknown model placement: {placement!r}")
         if placement != "cpu" and not cuda_device:
             raise ValueError("GPU placement requires a CUDA device")
-        quantization = str(runtime.get("quantization") or "none")
-        if quantization != "none":
-            raise ValueError("model-weight quantization has no installed adapter")
         task = str(model["task"])
         generation = task in {"text_generation", "encoder_decoder_generation"}
         if not generation and task not in {"embedding", "multimodal_embedding"}:
             raise ValueError(f"no runtime adapter supports task {task!r}")
         if placement == "offload" and not generation:
             raise ValueError("layer offload is available only for generation models")
-        self._safety_margin_bytes = margin = int(runtime.get("safety_margin_bytes", 0))
-        torch.set_num_threads(int(runtime.get("cpu_threads", max(1, os.cpu_count() or 1))))
-
         try:
             config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             config = {}
+        config = config if isinstance(config, dict) else {}
+        # The registry validates first; this guards direct worker callers.
+        quantization = str(runtime.get("quantization") or "none")
+        prequantized = is_bitsandbytes_checkpoint(config)
+        rejection = quantization_rejection(
+            quantization,
+            task=task,
+            cuda=cuda_device,
+            prequantized=prequantized,
+            backend_available=bitsandbytes_available(),
+        )
+        if rejection:
+            raise ValueError(rejection)
+        self._safety_margin_bytes = margin = int(runtime.get("safety_margin_bytes", 0))
+        torch.set_num_threads(int(runtime.get("cpu_threads", max(1, os.cpu_count() or 1))))
+
         estimate = estimate_load_bytes(
             checkpoint_tensor_shapes(model_path),
-            config if isinstance(config, dict) else {},
+            config,
             quantization=quantization,
             compute_dtype=dtype_name,
             kv_reserve_tokens=int(runtime.get("kv_reserve_tokens", 0)) if generation else 0,
+            stored_weight_bytes=checkpoint_stored_bytes(model_path) if prequantized else None,
         )
         estimate_report = {
             "weights": estimate["weights"],
@@ -1046,6 +1066,13 @@ class WorkerRuntime:
             strict_vram=bool(runtime.get("strict_vram", True)),
             placement={"gpu_only": "gpu", "offload": "offload", "cpu": "cpu"}[placement],
             kv_reserve_bytes=estimate["kv_reserve"],
+            quantization_config=bitsandbytes_config(
+                quantization,
+                compute_dtype=dtype_name,
+                placement=placement,
+                media=bool(model.get("media_modalities")),
+            )
+            or None,
         )
         # Registered before loading so a strict load already runs under the cap.
         self._active = self.residents[key] = resident
@@ -1147,6 +1174,11 @@ class WorkerRuntime:
             model_kwargs["dtype"] = dtype
         if attention is not None:
             model_kwargs["attn_implementation"] = attention
+        if resident.quantization_config:
+            from transformers import BitsAndBytesConfig
+
+            config_class: Any = BitsAndBytesConfig
+            model_kwargs["quantization_config"] = config_class(**resident.quantization_config)
         task = str(model["task"])
         if task in {"text_generation", "encoder_decoder_generation"}:
             from transformers import AutoModelForSeq2SeqLM, AutoTokenizer

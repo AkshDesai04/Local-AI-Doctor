@@ -11,6 +11,7 @@ import pytest
 
 from local_ai_doctor.config import AppSettings, DType
 from local_ai_doctor.domain.capabilities import Capability, CapabilityState
+from local_ai_doctor.domain.models import ModelTask
 from local_ai_doctor.errors import ModelNotResidentError, OutOfMemoryError, WorkerBusyError
 from local_ai_doctor.hardware.models import (
     AcceleratorDevice,
@@ -104,6 +105,8 @@ def _descriptor(model_id: str, *, offload: bool = True) -> Any:
         display_name=model_id.title(),
         loadable=True,
         diagnostics=[],
+        task=ModelTask.TEXT_GENERATION,
+        metadata={},
         fingerprint=SimpleNamespace(value=model_id * 8),
         capabilities=SimpleNamespace(
             support=lambda capability: (

@@ -9,6 +9,7 @@ from typing import Any
 
 from ..discovery.fingerprint import _loader_weight_files
 from ..discovery.safetensors import read_safetensors_header
+from ..domain.quantization import VISION_MODULES
 
 DTYPE_BYTES = {"float32": 4, "float16": 2, "bfloat16": 2}
 # Bytes per parameter of 2-D Linear weights once quantized; embeddings and the LM
@@ -19,19 +20,29 @@ _QUANTIZED_BYTES = {
     "bitsandbytes-8bit": 1.0,
     "int8": 1.0,
 }
-_UNQUANTIZED_PARTS = ("embed", "lm_head", "wte", "wpe", "shared")
+_UNQUANTIZED_PARTS = ("embed", "lm_head", "wte", "wpe", "shared", *VISION_MODULES)
 
 
-def checkpoint_tensor_shapes(model_dir: Path) -> dict[str, list[int]]:
-    """Tensor shapes from the SafeTensors headers ``from_pretrained`` reads; no weights."""
-
+def _loader_files(model_dir: Path) -> list[Path]:
     candidates = sorted(
         path
         for path in model_dir.iterdir()
         if path.suffix.lower() == ".safetensors" and path.is_file() and not path.is_symlink()
     )
+    return _loader_weight_files(model_dir, candidates)
+
+
+def checkpoint_stored_bytes(model_dir: Path) -> int:
+    """Size of the SafeTensors files ``from_pretrained`` reads."""
+
+    return sum(path.stat().st_size for path in _loader_files(model_dir))
+
+
+def checkpoint_tensor_shapes(model_dir: Path) -> dict[str, list[int]]:
+    """Tensor shapes from the SafeTensors headers ``from_pretrained`` reads; no weights."""
+
     shapes: dict[str, list[int]] = {}
-    for path in _loader_weight_files(model_dir, candidates):
+    for path in _loader_files(model_dir):
         for name, record in read_safetensors_header(path).items():
             if name != "__metadata__":
                 shapes[name] = list(record["shape"])
@@ -70,8 +81,13 @@ def estimate_load_bytes(
     quantization: str = "none",
     compute_dtype: str = "float32",
     kv_reserve_tokens: int = 0,
+    stored_weight_bytes: int | None = None,
 ) -> dict[str, int]:
-    """Resident bytes of a checkpoint: weights at the compute dtype plus a KV reserve."""
+    """Resident bytes of a checkpoint: weights at the compute dtype plus a KV reserve.
+
+    ``stored_weight_bytes`` is set for a pre-quantized checkpoint, whose packed
+    tensors load exactly as stored, so the file bytes are the weight estimate.
+    """
 
     size = DTYPE_BYTES.get(compute_dtype, 4)
     quantized = _QUANTIZED_BYTES.get(quantization)
@@ -87,7 +103,7 @@ def estimate_load_bytes(
             weights += parameters * quantized
         else:
             weights += parameters * size
-    weight_bytes = math.ceil(weights)
+    weight_bytes = math.ceil(weights) if stored_weight_bytes is None else stored_weight_bytes
     kv = kv_reserve_bytes(config, dtype_bytes=size, tokens=kv_reserve_tokens)
     return {"weights": weight_bytes, "kv_reserve": kv, "total": weight_bytes + kv}
 
