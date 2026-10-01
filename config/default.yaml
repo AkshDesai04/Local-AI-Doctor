@@ -39,6 +39,7 @@ defaults:
     conservative_context_limit: 4096
     reserved_output_tokens: 512
     max_prompt_tokens: 32768
+    influence_max_gradient_tokens: 2048
     local_files_only: true
     trust_remote_code: false
     deterministic_reference_mode: false

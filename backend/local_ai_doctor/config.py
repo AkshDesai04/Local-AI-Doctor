@@ -250,6 +250,8 @@ class InferenceSettings(BaseModel):
     conservative_context_limit: int = Field(default=4096, ge=128, le=10_000_000)
     reserved_output_tokens: int = Field(default=512, ge=1, le=1_000_000)
     max_prompt_tokens: int = Field(default=32_768, ge=1, le=10_000_000)
+    # Gradient x input keeps the whole prefix's activations for one backward pass.
+    influence_max_gradient_tokens: int = Field(default=2048, ge=16, le=1_000_000)
     defaults: SamplingDefaults = Field(default_factory=SamplingDefaults)
     deterministic_reference_mode: bool = False
     instrumentation: InstrumentationLevel = InstrumentationLevel.TOKEN

@@ -30,6 +30,7 @@ class Capability(StrEnum):
     TOP_K_ALTERNATIVES = "top_k_alternatives"
     PROMPT_SCORING = "prompt_scoring"
     ATTENTION_CAPTURE = "attention_capture"
+    TOKEN_INFLUENCE = "token_influence"
     HIDDEN_STATE_CAPTURE = "hidden_state_capture"
     STREAMING = "streaming"
     BATCHING = "batching"

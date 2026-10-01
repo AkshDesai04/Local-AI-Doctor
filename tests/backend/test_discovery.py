@@ -247,6 +247,36 @@ def test_cpu_offload_is_partial_only_for_generators_on_cuda(
     assert support.reason
 
 
+@pytest.mark.parametrize(
+    ("task", "state"),
+    [
+        (ModelTask.TEXT_GENERATION, CapabilityState.PARTIAL),
+        (ModelTask.ENCODER_DECODER_GENERATION, CapabilityState.UNSUPPORTED),
+        (ModelTask.EMBEDDING, CapabilityState.UNSUPPORTED),
+    ],
+)
+def test_token_influence_is_partial_only_for_decoder_only_generation(
+    task: ModelTask, state: CapabilityState
+) -> None:
+    matrix = build_capability_matrix(
+        ModelEvidence(
+            task=task,
+            modalities=frozenset({"text"}),
+            has_tokenizer=True,
+            has_processor=False,
+            has_reasoning_delimiters=False,
+            is_moe=False,
+            architecture_known=True,
+        )
+    )
+
+    support = matrix.support(Capability.TOKEN_INFLUENCE)
+    assert support.state is state
+    assert support.reason
+    if state is CapabilityState.PARTIAL:
+        assert "not causal attribution" in support.reason
+
+
 def test_moe_checkpoint_does_not_claim_routing_without_an_instrumentation_adapter() -> None:
     matrix = build_capability_matrix(
         ModelEvidence(

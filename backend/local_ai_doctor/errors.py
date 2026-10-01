@@ -38,6 +38,9 @@ class ErrorCode(StrEnum):
     TARGET_EXISTS = "target_exists"
     FLUSH_REQUIRES_QUANTIZED_RESIDENT = "flush_requires_quantized_resident"
     MODEL_ROOT_READ_ONLY = "model_root_read_only"
+    MODEL_FINGERPRINT_CHANGED = "model_fingerprint_changed"
+    INFLUENCE_UNAVAILABLE = "influence_unavailable"
+    INFLUENCE_SEQUENCE_TOO_LONG = "influence_sequence_too_long"
     OUT_OF_MEMORY = "out_of_memory"
     INVALID_SAMPLING_SETTINGS = "invalid_sampling_settings"
     INVALID_LOGITS = "invalid_logits"
@@ -263,6 +266,23 @@ class ModelRootReadOnlyError(WorkbenchError):
     http_status = 409
 
 
+class ModelFingerprintChangedError(WorkbenchError):
+    """The checkpoint a run used is no longer registered under the same fingerprint."""
+
+    code = ErrorCode.MODEL_FINGERPRINT_CHANGED
+    http_status = 409
+
+
+class InfluenceUnavailableError(WorkbenchError):
+    code = ErrorCode.INFLUENCE_UNAVAILABLE
+    http_status = 409
+
+
+class InfluenceSequenceTooLongError(WorkbenchError):
+    code = ErrorCode.INFLUENCE_SEQUENCE_TOO_LONG
+    http_status = 409
+
+
 class RunNotCancellableError(WorkbenchError):
     code = ErrorCode.RUN_NOT_CANCELLABLE
     http_status = 409
@@ -288,6 +308,11 @@ _WORKER_CODE_STATUS = {
     "model_not_resident": 409,
     "worker_busy": 409,
     "flush_requires_quantized_resident": 409,
+    "influence_unavailable": 409,
+    "influence_prompt_mismatch": 409,
+    "influence_sequence_too_long": 409,
+    "influence_offload_unsupported": 409,
+    "invalid_request": 422,
 }
 # Codes-and-numbers fields the worker reports next to its code (never paths or text).
 _WORKER_DETAIL_FIELDS = (
@@ -296,6 +321,12 @@ _WORKER_DETAIL_FIELDS = (
     "available_bytes",
     "estimate",
     "max_concurrent_runs",
+    "expected_prompt_tokens",
+    "actual_prompt_tokens",
+    "sequence_tokens",
+    "max_sequence_tokens",
+    "layer_count",
+    "vocabulary_size",
 )
 
 

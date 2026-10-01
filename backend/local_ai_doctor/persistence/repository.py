@@ -1071,6 +1071,7 @@ class WorkspaceRepository:
             "embedding_runs": "id",
             "embedding_inputs": "run_id",
             "raw_events": "run_id",
+            "token_influence": "run_id",
         }
         async with self.database.transaction() as connection:
             for table, run_column in joined_tables.items():
@@ -1283,6 +1284,68 @@ class WorkspaceRepository:
         for row in rows:
             row["alternatives"] = alternatives_by_token.get(int(row["token_index"]), [])
         return rows
+
+    async def list_run_token_prefix(self, run_id: str, through_index: int) -> list[dict[str, Any]]:
+        """Token identity columns up to ``through_index``, without metrics or alternatives."""
+
+        return await self.database.fetch_all(
+            """
+            SELECT token_index, token_id, piece, display_text FROM token_events
+            WHERE run_id = ? AND token_index <= ? ORDER BY token_index
+            """,
+            (run_id, through_index),
+        )
+
+    async def get_token_influence(
+        self,
+        run_id: str,
+        token_index: int,
+        method: str,
+        parameters: Mapping[str, Any],
+        model_fingerprint: str,
+    ) -> dict[str, Any] | None:
+        row = await self.database.fetch_one(
+            """
+            SELECT result_json, duration_ms FROM token_influence
+            WHERE run_id = ? AND token_index = ? AND method = ? AND parameters_key = ?
+              AND model_fingerprint = ?
+            """,
+            (run_id, token_index, method, _json(dict(parameters)), model_fingerprint),
+        )
+        if row is None:
+            return None
+        decoded = _decode_json_columns(row)
+        result = decoded.get("result")
+        return dict(result) if isinstance(result, dict) else None
+
+    async def save_token_influence(
+        self,
+        run_id: str,
+        token_index: int,
+        method: str,
+        parameters: Mapping[str, Any],
+        model_fingerprint: str,
+        result: Mapping[str, Any],
+        duration_ms: float | None,
+    ) -> None:
+        await self.database.execute(
+            """
+            INSERT OR REPLACE INTO token_influence(
+                run_id, token_index, method, parameters_key, model_fingerprint,
+                result_json, duration_ms, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                token_index,
+                method,
+                _json(dict(parameters)),
+                model_fingerprint,
+                _json(dict(result)),
+                duration_ms,
+                utc_now(),
+            ),
+        )
 
     async def append_raw_event(self, event: Mapping[str, Any]) -> None:
         await self.database.execute(

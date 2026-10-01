@@ -215,6 +215,21 @@ def build_capability_matrix(evidence: ModelEvidence) -> CapabilityMatrix:
             "causal self-attention capture is available only for decoder-only text generation"
         )
     )
+    entries[Capability.TOKEN_INFLUENCE] = (
+        _partial(
+            "attention allocation and gradient x input saliency; not causal attribution",
+            "recomputed on demand from the persisted prefix of a completed or cancelled run",
+            "gradient x input needs the model on GPU or CPU (not layer offload) and a prefix "
+            "within inference.influence_max_gradient_tokens",
+        )
+        if evidence.task is ModelTask.TEXT_GENERATION
+        else _unsupported(
+            "token influence re-runs a decoder-only prefix; encoder-decoder cross-attention "
+            "and embedding models are not analyzed"
+            if generation
+            else "token influence applies only to decoder-only text generation"
+        )
+    )
     entries[Capability.HIDDEN_STATE_CAPTURE] = _unsupported(
         "the reference adapter does not currently capture hidden-state traces"
     )

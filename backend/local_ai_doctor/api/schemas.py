@@ -207,6 +207,34 @@ class TokenBranchCreate(StrictRequest):
     token_id: int = Field(alias="tokenId", ge=0)
 
 
+class TokenInfluenceRequest(StrictRequest):
+    """Which earlier positions one generated token depended on, by one stated method."""
+
+    method: Literal["attention", "gradient_x_input"]
+    # Attention only: the mean over captured layers, every layer, or chosen layer indices.
+    layers: Literal["mean", "all"] | list[int] | None = None
+    # Gradient only: explain logit(target) - logit(alternative) instead of log p(target).
+    alternative_token_id: int | None = Field(default=None, alias="alternativeTokenId", ge=0)
+    source_limit: int = Field(default=128, alias="sourceLimit", ge=8, le=512)
+
+    @model_validator(mode="after")
+    def fields_match_the_method(self) -> TokenInfluenceRequest:
+        if self.method == "attention":
+            if self.alternative_token_id is not None:
+                raise ValueError("alternativeTokenId applies only to method gradient_x_input")
+            if self.layers is None:
+                self.layers = "mean"
+            elif isinstance(self.layers, list):
+                if not self.layers or len(self.layers) > 1024:
+                    raise ValueError("layers must list between 1 and 1024 layer indices")
+                if any(layer < 0 for layer in self.layers):
+                    raise ValueError("layer indices must be non-negative")
+                self.layers = sorted(set(self.layers))
+        elif self.layers is not None:
+            raise ValueError("layers applies only to method attention")
+        return self
+
+
 class EmbeddingItemRequest(StrictRequest):
     id: str | None = Field(default=None, max_length=200)
     modality: Literal["text", "image", "video", "audio", "mixed"]

@@ -657,6 +657,8 @@ class RunManager:
                         "attention_capture_method": payload.get("attention_capture_method"),
                         "attention_source_limit": payload.get("attention_source_limit"),
                         "attention_implementation": payload.get("attention_implementation"),
+                        # Influence analysis re-tokenizes the rendered prompt the same way.
+                        "prompt_renderer": payload.get("prompt_renderer"),
                     },
                 )
             elif event_type == "metric" and payload.get("prefill_ms") is not None:
