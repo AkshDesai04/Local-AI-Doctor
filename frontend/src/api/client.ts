@@ -11,6 +11,7 @@ import type {
   ConfigurationSnapshot,
   EmbeddingInput,
   EmbeddingRun,
+  FlushResult,
   GenerateRequest,
   GenerateResponse,
   HardwareSummary,
@@ -19,6 +20,7 @@ import type {
   LoadResult,
   MemoryLedger,
   Message,
+  ModelDerivation,
   ModelInspection,
   ModelSummary,
   ReasoningSlice,
@@ -143,7 +145,30 @@ const capabilityAliases: Record<string, CapabilityKey> = {
   cpu: "cpu",
   cuda: "cuda",
   cpu_offload: "cpu_offload",
+  weight_quantization: "weight_quantization",
 };
+
+function normalizeDerivation(value: unknown): ModelDerivation | null {
+  const raw = asRecord(value);
+  if (!Object.keys(raw).length) return null;
+  const text = (item: unknown): string | null => typeof item === "string" && item ? item : null;
+  return {
+    sourceModelId: text(raw.source_model_id),
+    sourceDisplayName: text(raw.source_display_name),
+    quantization: text(raw.quantization),
+    createdAt: text(raw.created_at),
+  };
+}
+
+function normalizeWeightQuantization(value: unknown): ModelSummary["weightQuantization"] {
+  const raw = asRecord(value);
+  if (typeof raw.method !== "string") return null;
+  return {
+    method: raw.method,
+    bits: typeof raw.bits === "number" ? raw.bits : null,
+    quantType: typeof raw.quant_type === "string" ? raw.quant_type : null,
+  };
+}
 
 function normalizeCapabilities(value: unknown): ModelSummary["capabilities"] {
   const outer = asRecord(value);
@@ -185,6 +210,7 @@ function normalizeModel(value: unknown, fallback?: ModelSummary, lifecycleOverri
       note: typeof candidate.note === "string" ? candidate.note : undefined,
     };
   }) : undefined;
+  const metadata = asRecord(raw.metadata);
   const lifecycleValue = lifecycleOverride ?? raw.lifecycle ?? raw.load_state ?? raw.status ?? fallback?.lifecycle ?? "unloaded";
   const lifecycle: ModelSummary["lifecycle"] = lifecycleValue === "loading" || lifecycleValue === "loaded" || lifecycleValue === "unloading" || lifecycleValue === "error" ? lifecycleValue : "unloaded";
   return {
@@ -203,6 +229,10 @@ function normalizeModel(value: unknown, fallback?: ModelSummary, lifecycleOverri
     contextLimits: Array.isArray(raw.contextLimits) ? raw.contextLimits as ModelSummary["contextLimits"] : contextValues ?? fallback?.contextLimits,
     diagnostics: diagnostics ?? fallback?.diagnostics,
     trustRemoteCode: raw.trustRemoteCode === true || raw.trust_decision === "reviewed_bundled_code" || fallback?.trustRemoteCode === true,
+    weightQuantization: "weight_quantization" in metadata ? normalizeWeightQuantization(metadata.weight_quantization) : fallback?.weightQuantization ?? null,
+    parameterCountNote: typeof metadata.parameter_count_note === "string" ? metadata.parameter_count_note : fallback?.parameterCountNote ?? null,
+    derivation: "derivation" in raw ? normalizeDerivation(raw.derivation) : fallback?.derivation ?? null,
+    rootIndex: typeof raw.root_index === "number" ? raw.root_index : fallback?.rootIndex ?? null,
   };
 }
 
@@ -854,6 +884,16 @@ export const api = {
   async unloadModel(id: string): Promise<UnloadResult> {
     return normalizeUnload(await request(`/models/${encodeURIComponent(id)}/unload`, { method: "POST" }));
   },
+  /** Writes a quantized resident, exactly as held in VRAM, to a new folder in a model root. */
+  async flushResident(modelKey: string, target: { targetRootIndex: number; folderName: string }): Promise<FlushResult> {
+    const raw = asRecord(await request(`/models/resident/${encodeURIComponent(modelKey)}/flush`, { method: "POST", body: JSON.stringify(target) }));
+    return {
+      model: raw.model ? normalizeModel(raw.model) : null,
+      folder: asString(raw.folder, target.folderName),
+      bytesWritten: asNullableNumber(raw.bytes_written) ?? 0,
+      derivation: normalizeDerivation(raw.derivation),
+    };
+  },
   async unloadResident(modelKey: string): Promise<UnloadResult> {
     return normalizeUnload(await request(`/models/resident/${encodeURIComponent(modelKey)}/unload`, { method: "POST" }));
   },
@@ -917,6 +957,7 @@ export const api = {
         reasoning: body.settings.reasoning,
         deterministic_reference_mode: body.settings.deterministic,
         strict_vram: body.settings.strictVram,
+        quantization: body.settings.quantization,
         sampling: {
           max_output_tokens: body.settings.maxOutputTokens,
           temperature: body.settings.temperature,

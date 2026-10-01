@@ -22,7 +22,8 @@ export type CapabilityKey =
   | "deterministic_seed"
   | "cpu"
   | "cuda"
-  | "cpu_offload";
+  | "cpu_offload"
+  | "weight_quantization";
 
 export interface Capability {
   state: CapabilityState;
@@ -57,6 +58,35 @@ export interface ModelSummary {
   contextLimits?: ContextLimitCandidate[];
   diagnostics?: string[];
   trustRemoteCode?: boolean;
+  /** Set when the checkpoint itself stores quantized weights (`config.quantization_config`). */
+  weightQuantization?: WeightQuantization | null;
+  /** Why the parameter count is unknown, such as packed quantized tensors. */
+  parameterCountNote?: string | null;
+  /** Provenance of a folder written by Flush to storage. */
+  derivation?: ModelDerivation | null;
+  /** Index of the configured model root the folder was found under. */
+  rootIndex?: number | null;
+}
+
+export interface WeightQuantization {
+  method: string;
+  bits: number | null;
+  quantType: string | null;
+}
+
+export interface ModelDerivation {
+  sourceModelId: string | null;
+  sourceDisplayName: string | null;
+  quantization: string | null;
+  createdAt: string | null;
+}
+
+export interface FlushResult {
+  model: ModelSummary | null;
+  /** Path-free location, `<model-root:N>/<folder>`. */
+  folder: string;
+  bytesWritten: number;
+  derivation: ModelDerivation | null;
 }
 
 export interface ModelInspection {
@@ -123,12 +153,16 @@ export interface ResidentStatus {
   maxLoadedModels: number | null;
 }
 
+export type QuantizationMode = "none" | "bitsandbytes-4bit" | "bitsandbytes-8bit";
+
 /** Per-model placement chosen at load time, kept separate from next-response settings. */
 export interface LoadOptions {
   device: "auto" | "cpu" | "cuda";
   dtype: "auto" | "float32" | "float16" | "bfloat16";
   /** Fail instead of spilling layers into system RAM when the model does not fit in VRAM. */
   strictVram: boolean;
+  /** Load-time weight quantization; absent means the backend's configured default. */
+  quantization?: QuantizationMode;
 }
 
 export interface LoadResult {
@@ -392,6 +426,7 @@ export interface GenerationSettings {
   device: LoadOptions["device"];
   dtype: LoadOptions["dtype"];
   strictVram?: boolean;
+  quantization?: QuantizationMode;
   instrumentation: "off" | "basic" | "token" | "full" | "expert";
   seed: string;
   maxOutputTokens: number;

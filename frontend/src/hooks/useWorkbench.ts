@@ -6,6 +6,7 @@ import type {
   Attachment,
   ChatSummary,
   ConfigurationSnapshot,
+  FlushResult,
   GenerateRequest,
   GenerationSettings,
   HealthStatus,
@@ -21,7 +22,7 @@ import type {
   TokenAlternative,
   UnloadResult,
 } from "../api/types";
-import { isUsable } from "../domain/capabilities";
+import { isUsable, sendableLoadOptions } from "../domain/capabilities";
 import {
   defaultLoadOptions,
   evictionNotice,
@@ -36,6 +37,7 @@ import {
   unloadNotice,
   withResidency,
 } from "../domain/residency";
+import { formatBytes } from "../utils/format";
 import { cleanAssistantOutput } from "../utils/markdown";
 
 export const defaultGenerationSettings: GenerationSettings = {
@@ -315,6 +317,8 @@ export interface WorkbenchState {
   unloadModel: (model: ModelSummary) => Promise<void>;
   unloadResident: (resident: ResidentModel) => Promise<void>;
   unloadAll: () => Promise<void>;
+  /** Writes a quantized resident to a new model folder; rejects with the backend's reason. */
+  flushResident: (resident: ResidentModel, target: { targetRootIndex: number; folderName: string }) => Promise<FlushResult>;
   submit: (content: string, parentMessageId?: string | null) => Promise<void>;
   stop: () => Promise<void>;
   inspectRun: (id: string) => Promise<void>;
@@ -700,7 +704,7 @@ export function useWorkbench(): WorkbenchState {
   }, [storedLoadOptions]);
 
   const loadModel = useCallback(async (model: ModelSummary, options?: LoadOptions): Promise<void> => {
-    const placement = options ?? loadOptionsFor(model.id);
+    const placement = sendableLoadOptions(model, options ?? loadOptionsFor(model.id));
     const before = runtimeRef.current;
     setTransition([model.id], "loading");
     try {
@@ -750,6 +754,13 @@ export function useWorkbench(): WorkbenchState {
     () => api.unloadAll(),
   ), [runUnload]);
 
+  const flushResident = useCallback(async (resident: ResidentModel, target: { targetRootIndex: number; folderName: string }): Promise<FlushResult> => {
+    const result = await api.flushResident(resident.modelKey, target);
+    await synchronizeRuntimeState();
+    setNotice(`Saved ${residentName(resident, runtimeRef.current.models)} to ${result.folder} (${formatBytes(result.bytesWritten)}). It is now in the registry as a pre-quantized model.`);
+    return result;
+  }, [synchronizeRuntimeState]);
+
   const toggleModelLoaded = useCallback(
     (model: ModelSummary): Promise<void> => model.lifecycle === "loaded" ? unloadModel(model) : loadModel(model),
     [loadModel, unloadModel],
@@ -758,7 +769,8 @@ export function useWorkbench(): WorkbenchState {
   /** Reuses the model's most recent resident copy, otherwise its saved load options. */
   const requestPlacement = useCallback((modelId: string): LoadOptions => {
     const resident = mostRecent(residentsOf(runtimeRef.current.residents, modelId));
-    return resident ? residentPlacement(resident) : loadOptionsFor(modelId);
+    if (resident) return residentPlacement(resident);
+    return sendableLoadOptions(runtimeRef.current.models.find((model) => model.id === modelId), loadOptionsFor(modelId));
   }, [loadOptionsFor]);
 
   const handleStreamEvent = useCallback((event: RunStreamEvent, runId: string, assistantId: string, chatId: string, modelId: string): void => {
@@ -930,6 +942,7 @@ export function useWorkbench(): WorkbenchState {
           device: placement.device,
           dtype: placement.dtype,
           strictVram: residencySupported ? placement.strictVram : undefined,
+          quantization: residencySupported ? placement.quantization : undefined,
         },
         parentMessageId: resolvedParentMessageId,
       };
@@ -1239,6 +1252,7 @@ export function useWorkbench(): WorkbenchState {
     unloadModel,
     unloadResident,
     unloadAll,
+    flushResident,
     submit,
     stop,
     inspectRun,

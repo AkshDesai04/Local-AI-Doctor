@@ -4,6 +4,7 @@ import type {
   LoadOptions,
   MemoryLedger,
   ModelSummary,
+  QuantizationMode,
   ResidentModel,
   ResidentStatus,
   UnloadResult,
@@ -26,6 +27,38 @@ function isDtype(value: unknown): value is LoadOptions["dtype"] {
   return value === "auto" || value === "float32" || value === "float16" || value === "bfloat16";
 }
 
+export function isQuantization(value: unknown): value is QuantizationMode {
+  return value === "none" || value === "bitsandbytes-4bit" || value === "bitsandbytes-8bit";
+}
+
+const quantizationLabels: Record<Exclude<QuantizationMode, "none">, string> = {
+  "bitsandbytes-4bit": "4-bit NF4",
+  "bitsandbytes-8bit": "8-bit LLM.int8",
+};
+
+/** "4-bit NF4" for a load-time quantized resident; null when it holds the checkpoint's own weights. */
+export function quantizationLabel(quantization: string | null | undefined): string | null {
+  return quantization && quantization in quantizationLabels ? quantizationLabels[quantization as keyof typeof quantizationLabels] : null;
+}
+
+const FOLDER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+const RESERVED_NAMES = new Set(["CON", "PRN", "AUX", "NUL", ...[1, 2, 3, 4, 5, 6, 7, 8, 9].flatMap((index) => [`COM${String(index)}`, `LPT${String(index)}`])]);
+
+/** The backend's folder-name rules for Flush to storage; null when the name is acceptable. */
+export function flushFolderNameError(name: string): string | null {
+  if (!FOLDER_NAME.test(name)) return "Use 1–100 letters, digits, dots, underscores, or hyphens, starting with a letter or digit.";
+  if (name.endsWith(".")) return "The folder name must not end with a dot.";
+  if (RESERVED_NAMES.has((name.split(".")[0] ?? "").toUpperCase())) return "That folder name is reserved on Windows.";
+  return null;
+}
+
+/** `<source>-bnb-nf4` or `<source>-bnb-int8`, with characters the backend rejects replaced. */
+export function defaultFlushFolderName(sourceName: string, quantization: string | null): string {
+  const suffix = quantization === "bitsandbytes-8bit" ? "-bnb-int8" : "-bnb-nf4";
+  const base = sourceName.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[^A-Za-z0-9]+/, "").replace(/\.+$/, "") || "model";
+  return `${base.slice(0, 100 - suffix.length)}${suffix}`;
+}
+
 /** Load defaults from the effective configuration: the runtime device and dtype (auto unless configured) and runtime.strict_vram. */
 export function defaultLoadOptions(configuration: ConfigurationSnapshot | null): LoadOptions {
   const runtime = asRecord(configuration?.effective.runtime);
@@ -33,6 +66,7 @@ export function defaultLoadOptions(configuration: ConfigurationSnapshot | null):
     device: isDevice(runtime.device) ? runtime.device : "auto",
     dtype: isDtype(runtime.dtype) ? runtime.dtype : "auto",
     strictVram: runtime.strict_vram !== false,
+    ...(isQuantization(runtime.quantization) && runtime.quantization !== "none" ? { quantization: runtime.quantization } : {}),
   };
 }
 
@@ -46,6 +80,7 @@ export function readStoredLoadOptions(): Record<string, Partial<LoadOptions>> {
         ...(isDevice(raw.device) ? { device: raw.device } : {}),
         ...(isDtype(raw.dtype) ? { dtype: raw.dtype } : {}),
         ...(typeof raw.strictVram === "boolean" ? { strictVram: raw.strictVram } : {}),
+        ...(isQuantization(raw.quantization) ? { quantization: raw.quantization } : {}),
       }];
     }));
   } catch {
@@ -115,6 +150,7 @@ export function residentPlacement(resident: ResidentModel): LoadOptions {
     device: resident.device.startsWith("cuda") ? "cuda" : resident.device === "cpu" ? "cpu" : "auto",
     dtype: isDtype(resident.dtype) ? resident.dtype : "auto",
     strictVram: resident.strictVram ?? resident.placement !== "offload",
+    ...(isQuantization(resident.quantization) ? { quantization: resident.quantization } : {}),
   };
 }
 

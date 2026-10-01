@@ -1,4 +1,5 @@
-import type { LoadOptions, ModelSummary } from "../api/types";
+import type { LoadOptions, ModelSummary, QuantizationMode } from "../api/types";
+import { quantizationBlockedReason } from "../domain/capabilities";
 import { Badge, Field, Select, Switch } from "./ui";
 
 interface LoadOptionsFieldsProps {
@@ -9,12 +10,14 @@ interface LoadOptionsFieldsProps {
   disabled?: boolean;
 }
 
-/** Device, dtype, and Strict VRAM for one model's loads. Renders a fragment so the parent owns the layout. */
+/** Device, dtype, quantization, and Strict VRAM for one model's loads. Renders a fragment so the parent owns the layout. */
 export function LoadOptionsFields({ model, value, onChange, size = "md", disabled = false }: LoadOptionsFieldsProps): React.ReactNode {
   const cuda = model?.capabilities.cuda;
   const cudaBlocked = cuda !== undefined && cuda.state !== "full" && cuda.state !== "partial";
   const cudaReason = cuda?.reason ?? "No usable CUDA runtime was discovered on this backend.";
   const onCpu = value.device === "cpu";
+  const quantizationBlocked = quantizationBlockedReason(model, value.device);
+  const prequantized = model?.weightQuantization;
   return (
     <>
       <Field addon={cudaBlocked ? <Badge tone="warning">CUDA unavailable</Badge> : undefined} className="load-device" hint={cudaBlocked ? cudaReason : undefined} label="Device">
@@ -30,6 +33,24 @@ export function LoadOptionsFields({ model, value, onChange, size = "md", disable
           <option value="bfloat16">bfloat16</option>
           <option value="float16">float16</option>
           <option value="float32">float32</option>
+        </Select>
+      </Field>
+      <Field
+        addon={prequantized ? <Badge tone="info">Pre-quantized</Badge> : undefined}
+        className="load-quantization"
+        hint={quantizationBlocked ?? undefined}
+        label="Quantization"
+      >
+        <Select
+          controlSize={size}
+          disabled={disabled || quantizationBlocked !== null}
+          onChange={(event) => onChange({ ...value, quantization: event.target.value as QuantizationMode })}
+          title={quantizationBlocked ?? "Quantized in GPU memory at load time; nothing is written to disk until you flush it"}
+          value={quantizationBlocked === null ? value.quantization ?? "none" : "none"}
+        >
+          <option value="none">None</option>
+          <option value="bitsandbytes-4bit">4-bit (NF4)</option>
+          <option value="bitsandbytes-8bit">8-bit (LLM.int8)</option>
         </Select>
       </Field>
       <Switch

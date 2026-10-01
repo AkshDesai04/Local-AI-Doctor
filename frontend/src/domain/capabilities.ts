@@ -1,4 +1,4 @@
-import type { Capability, CapabilityKey, ModelSummary } from "../api/types";
+import type { Capability, CapabilityKey, LoadOptions, ModelSummary } from "../api/types";
 
 const labels: Record<CapabilityKey, string> = {
   text_generation: "Text generation",
@@ -23,6 +23,7 @@ const labels: Record<CapabilityKey, string> = {
   cpu: "CPU",
   cuda: "CUDA",
   cpu_offload: "CPU offload",
+  weight_quantization: "Weight quantization",
 };
 
 export function capabilityLabel(key: CapabilityKey): string {
@@ -56,3 +57,18 @@ export function capabilityReason(model: ModelSummary | null | undefined, key: Ca
 }
 
 export const capabilityKeys = Object.keys(labels) as CapabilityKey[];
+
+/** Why load-time quantization cannot be chosen for this model and device, or null when it can. */
+export function quantizationBlockedReason(model: ModelSummary | null | undefined, device: LoadOptions["device"]): string | null {
+  if (model?.weightQuantization) return capabilityReason(model, "weight_quantization");
+  if (!isUsable(model, "weight_quantization")) return capabilityReason(model, "weight_quantization");
+  if (device === "cpu") return "bitsandbytes quantization runs on CUDA only.";
+  return null;
+}
+
+/** Load options as sent: a stored quantization the model or device cannot use becomes None, as the select shows. */
+export function sendableLoadOptions(model: ModelSummary | null | undefined, options: LoadOptions): LoadOptions {
+  return options.quantization && options.quantization !== "none" && quantizationBlockedReason(model, options.device) !== null
+    ? { ...options, quantization: "none" }
+    : options;
+}
