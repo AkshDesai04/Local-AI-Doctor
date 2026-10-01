@@ -167,10 +167,87 @@ async function systemPromptFixtureApi(page: Page): Promise<void> {
   });
 }
 
+const influenceChat = { id: "chat-inf", title: "Influence chat", created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-01T00:00:02Z" };
+const influenceWords = ["<|im_start|>", "user", "Paris", "is", "the", "capital", "?"];
+const influenceSource = (contextIndex: number, weight: number, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+  source_kind: "prompt", context_index: contextIndex, span: null, token_count: 1, token_id: contextIndex, piece: `p${String(contextIndex)}`,
+  display_text: influenceWords[contextIndex] ?? `t${String(contextIndex)}`,
+  generated_token_index: null, media_index: null, is_special: contextIndex === 0, weight, ...extra,
+});
+let influenceRequests: Array<Record<string, unknown>> = [];
+
+async function influenceFixtureApi(page: Page): Promise<void> {
+  influenceRequests = [];
+  await page.route("**/api/v1/**", async (route) => {
+    const url = route.request().url();
+    if (url.endsWith("/health")) {
+      await route.fulfill({ json: { status: "ok", worker: "ready" } });
+    } else if (url.endsWith("/models")) {
+      await route.fulfill({ json: [{ ...model, capabilities: { ...model.capabilities, attention_capture: { state: "partial", reason: "Full instrumentation only." }, token_influence: { state: "partial", reason: "attention allocation and gradient×input saliency; not causal attribution" } } }] });
+    } else if (url.includes("/chats?archived=false")) {
+      await route.fulfill({ json: [influenceChat] });
+    } else if (url.includes("/chats?archived=true")) {
+      await route.fulfill({ json: [] });
+    } else if (url.endsWith("/chats/chat-inf/messages")) {
+      await route.fulfill({ json: [
+        { id: "user-1", chat_id: "chat-inf", role: "user", content: "Paris is the capital?", status: "complete", created_at: "2026-10-01T00:00:00Z" },
+        { id: "assistant-1", chat_id: "chat-inf", parent_id: "user-1", run_id: "run-inf", role: "assistant", content: "Yes it is", status: "complete", created_at: "2026-10-01T00:00:02Z" },
+      ] });
+    } else if (url.endsWith("/runs/run-inf")) {
+      await route.fulfill({ json: {
+        id: "run-inf", message_id: "assistant-1", model_id: model.id, status: "complete", created_at: "2026-10-01T00:00:00Z",
+        prompt_token_count: 7, branchable_through_token_index: 2, generated_token_count: 3,
+        reproducibility: { effective_seed: "1" },
+        tokens: [
+          { token_index: 0, token_id: 50, piece: "Yes", display_text: "Yes" },
+          { token_index: 1, token_id: 51, piece: "Ġit", display_text: " it" },
+          {
+            token_index: 2, token_id: 52, piece: "Ġis", display_text: " is",
+            alternatives: [
+              { distribution: "raw", rank: 1, token_id: 52, piece: "Ġis", probability: 0.7, log_probability: -0.36, logit: 4 },
+              { distribution: "raw", rank: 2, token_id: 53, piece: "Ġwas", probability: 0.2, log_probability: -1.6, logit: 3 },
+            ],
+            attention_attribution: {
+              method: "mean_causal_self_attention", aggregation: "arithmetic_mean_over_layers_and_heads", semantics: "attention_weights_not_causal_contributions",
+              captured_layers: [0, 1], captured_heads: 4, normalized: true, total_source_count: 9, retained_source_count: 3, retained_weight: 0.9, omitted_weight: 0.1,
+              source_tokens: [
+                { context_index: 0, token_id: 0, piece: "<|im_start|>", display_text: "<|im_start|>", source_kind: "prompt", weight: 0.55 },
+                { context_index: 2, token_id: 2, piece: "Paris", display_text: "Paris", source_kind: "prompt", weight: 0.25 },
+                { context_index: 8, token_id: 51, piece: "Ġit", display_text: " it", source_kind: "generated", generated_token_index: 1, weight: 0.1 },
+              ],
+            },
+          },
+        ],
+      } });
+    } else if (url.endsWith("/runs/run-inf/tokens/2/influence") && route.request().method() === "POST") {
+      const body = route.request().postDataJSON() as Record<string, unknown>;
+      influenceRequests.push(body);
+      const gradient = body.method === "gradient_x_input";
+      const sources = gradient
+        ? [influenceSource(0, 0.05), influenceSource(2, 0.4), influenceSource(5, 0.3), influenceSource(8, 0.25, { source_kind: "generated", generated_token_index: 1, display_text: " it" })]
+        : [influenceSource(0, 0.55), influenceSource(2, 0.25), influenceSource(3, 0.12), influenceSource(8, 0.08, { source_kind: "generated", generated_token_index: 1, display_text: " it" })];
+      await route.fulfill({ json: {
+        run_id: "run-inf", token_index: 2, method: body.method, cached: false,
+        target: { token_id: 52, piece: "Ġis", display_text: " is", alternative_token_id: body.alternativeTokenId ?? null, alternative_piece: null },
+        context_token_count: 9, prompt_token_count: 7, sources, retained_weight: 1, omitted_weight: 0,
+        layers: gradient ? null : [{ layer: 0, sources, retained_weight: 1, omitted_weight: 0 }, { layer: 1, sources, retained_weight: 1, omitted_weight: 0 }],
+        captured_layers: gradient ? [] : [0, 1], heads_per_layer: gradient ? null : 4,
+        objective: gradient ? "log_probability" : null, objective_value: gradient ? -0.36 : null,
+        semantics: "", normalization: "sum_to_one", model_fingerprint: "fixture-only", duration_ms: 18.5,
+      } });
+    } else if (url.endsWith("/configuration")) {
+      await route.fulfill({ json: { effective: {}, precedence: [] } });
+    } else {
+      await route.fulfill({ status: 404, json: { message: "Not part of this UI fixture." } });
+    }
+  });
+}
+
 test.beforeEach(async ({ page }, testInfo) => {
   if (testInfo.title.includes("mobile chat cleans")) await conversationFixtureApi(page);
   else if (testInfo.title.includes("system prompt")) await systemPromptFixtureApi(page);
   else if (testInfo.title.includes("GPU memory ledger")) await residencyFixtureApi(page);
+  else if (testInfo.title.includes("influence web")) await influenceFixtureApi(page);
   else await fixtureApi(page);
   await page.goto("/");
 });
@@ -311,4 +388,39 @@ test("model registry shows the GPU memory ledger, load options, and every reside
   const viewport = page.viewportSize();
   if (!bounds || !viewport) throw new Error("Expected a measurable memory ledger.");
   expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.width + 0.5);
+});
+
+test("influence web draws weighted edges, expands, and switches method", async ({ page }) => {
+  await expect(page.getByText("Yes it is")).toBeVisible();
+  await page.getByRole("switch", { name: "Nerd Mode" }).click();
+  await page.locator(".nerd-token").filter({ hasText: /^is/ }).click();
+
+  const section = page.getByRole("region", { name: "Influence for token 2" });
+  await expect(section.getByRole("radio", { name: "Live attention" })).toHaveAttribute("aria-checked", "true");
+  await expect(section.locator("[data-edge-label] text")).toHaveText(["0.55", "0.25", "0.10"]);
+  await expect(section.getByRole("note", { name: "Influence caveat" })).toContainText("allocation, not causation");
+
+  await section.getByRole("button", { name: "Expand influence web" }).click();
+  const dialog = page.getByRole("dialog", { name: "Expanded influence web" });
+  await expect(dialog.getByRole("group", { name: /Influence web for token #2/ })).toBeVisible();
+  await dialog.getByRole("radio", { name: "Gradient × input" }).click();
+  await dialog.getByRole("button", { name: /Compute gradient/ }).click();
+  await expect(dialog.locator("[data-edge-label] text").filter({ hasText: "0.40" })).toBeVisible();
+  await expect(dialog.getByText("log p -0.36")).toBeVisible();
+  await expect(dialog.getByRole("note", { name: "Influence caveat" })).toContainText("not causal attribution");
+
+  await dialog.getByRole("radio", { name: "Attention", exact: true }).click();
+  await expect(dialog.locator("[data-edge-label] text").filter({ hasText: "0.55" })).toBeVisible();
+  await expect(dialog.getByRole("combobox", { name: "Attention layer" })).toContainText("Layer 1");
+  expect(influenceRequests).toEqual([
+    { method: "gradient_x_input", sourceLimit: 128 },
+    { method: "attention", layers: "all", sourceLimit: 128 },
+  ]);
+
+  const bounds = await dialog.boundingBox();
+  const viewport = page.viewportSize();
+  if (!bounds || !viewport) throw new Error("Expected a measurable influence dialog.");
+  expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.width + 0.5);
+  await dialog.getByRole("button", { name: "Close influence web" }).click();
+  await expect(dialog).toHaveCount(0);
 });
