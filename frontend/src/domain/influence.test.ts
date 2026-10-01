@@ -143,6 +143,16 @@ describe("edge labels", () => {
     expect(separated[2]?.y).toBe(49);
   });
 
+  it("move a pill wedged between two others past both instead of bouncing", () => {
+    const pill = (key: number, y: number): LabelBox => ({ key, text: "0.01", x: 0, y, width: 38, height: 16, nx: 0, ny: 1 });
+    const wedged = [pill(0, 0), pill(1, 20), pill(2, 10)];
+
+    const separated = separateLabels(wedged);
+
+    expect(labelsOverlap(separated)).toBe(false);
+    expect(separated[2]?.y).toBeGreaterThan(20);
+  });
+
   it("use the sequential ramp, widening and brightening with weight", () => {
     expect(edgeStyle(0)).toMatchObject({ color: "var(--seq-2)" });
     expect(edgeStyle(1)).toMatchObject({ color: "var(--seq-5)" });

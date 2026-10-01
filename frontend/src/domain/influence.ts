@@ -174,9 +174,10 @@ export const LABEL_HEIGHT = 16;
 
 /**
  * One weight pill per edge, alternating 45% and 60% of the way from the source
- * node toward the centre so neighbouring labels start out staggered.
+ * node toward the centre so neighbouring labels start out staggered. `textScale`
+ * grows the pills with the text when the web is drawn smaller than its viewBox.
  */
-export function edgeLabels(nodes: RingNode[], center: { x: number; y: number }, text: (node: RingNode) => string): LabelBox[] {
+export function edgeLabels(nodes: RingNode[], center: { x: number; y: number }, text: (node: RingNode) => string, textScale = 1): LabelBox[] {
   return nodes.map((node, index) => {
     const t = index % 2 === 0 ? 0.45 : 0.6;
     const dx = center.x - node.x;
@@ -188,8 +189,8 @@ export function edgeLabels(nodes: RingNode[], center: { x: number; y: number }, 
       text: label,
       x: node.x + dx * t,
       y: node.y + dy * t,
-      width: label.length * CHARACTER_WIDTH + 10,
-      height: LABEL_HEIGHT,
+      width: (label.length * CHARACTER_WIDTH + 10) * textScale,
+      height: LABEL_HEIGHT * textScale,
       nx: -dy / length,
       ny: dx / length,
     };
@@ -211,8 +212,11 @@ export function labelsOverlap(labels: LabelBox[], padding = 1): boolean {
  * Push overlapping pills apart along their edge normals, so a label stays on (or
  * beside) its own line.
  */
-export function separateLabels(labels: LabelBox[], padding = 2, iterations = 24): LabelBox[] {
+export function separateLabels(labels: LabelBox[], padding = 2, iterations = 64): LabelBox[] {
   const placed = labels.map((label) => ({ ...label }));
+  // A pill keeps the direction it first moved in, so one wedged between two others
+  // escapes past both instead of bouncing between them.
+  const directions = new Map<number, number>();
   // ponytail: O(n²) pairwise pass over at most 64 pills; a spatial grid if far more labels are ever drawn
   for (let pass = 0; pass < iterations; pass += 1) {
     let moved = false;
@@ -227,7 +231,8 @@ export function separateLabels(labels: LabelBox[], padding = 2, iterations = 24)
         const dominant = Math.max(Math.abs(right.nx), Math.abs(right.ny), 1e-6);
         const distance = (Math.abs(right.nx) >= Math.abs(right.ny) ? amount.x : amount.y) / dominant + 0.5;
         const side = (right.x - left.x) * right.nx + (right.y - left.y) * right.ny;
-        const direction = side === 0 ? (j % 2 === 0 ? 1 : -1) : Math.sign(side);
+        const direction = directions.get(j) ?? (side === 0 ? (j % 2 === 0 ? 1 : -1) : Math.sign(side));
+        directions.set(j, direction);
         right.x += right.nx * distance * direction;
         right.y += right.ny * distance * direction;
         moved = true;

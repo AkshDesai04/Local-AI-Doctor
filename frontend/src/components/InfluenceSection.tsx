@@ -27,7 +27,6 @@ type FetchState =
   | { status: "error"; message: string; hint?: string };
 
 const SOURCE_LIMIT = 128;
-const COMPACT_LABELS = 12;
 
 const methodLabels: Record<MethodKey, string> = {
   live: "Live attention",
@@ -221,7 +220,7 @@ export function InfluenceSection({ run, token, contextTokens, model, onSelectTok
       {method === "gradient_x_input" ? (
         <Select aria-label="Gradient target" controlSize="sm" onChange={(event) => setAlternative(event.target.value === "" ? null : Number(event.target.value))} title="Explain log p(chosen token), or the logit difference to an alternative." value={alternative === null ? "" : String(alternative)}>
           <option value="">Chosen token “{targetLabel}”</option>
-          {alternatives.map((item) => <option key={item.tokenId} value={item.tokenId}>vs “{displayTokenText(item.piece) || "∅"}” · {item.distribution} #{item.rank} · {formatPercent(item.probability, 1)}</option>)}
+          {alternatives.map((item) => <option key={item.tokenId} value={item.tokenId}>vs “{displayTokenText(item.piece) || "∅"}” · {item.distribution} #{item.rank} · {item.probability > 0 && item.probability < 0.001 ? "<0.1%" : formatPercent(item.probability, 1)}</option>)}
         </Select>
       ) : (
         <Select aria-label="Attention layer" controlSize="sm" disabled={method === "live" || capturedLayers.length === 0} onChange={(event) => setLayer(event.target.value === "mean" ? "mean" : Number(event.target.value))} title={method === "live" ? "Live capture stores only the mean over layers." : "The mean over all captured layers, or one layer."} value={String(effectiveLayer)}>
@@ -241,7 +240,7 @@ export function InfluenceSection({ run, token, contextTokens, model, onSelectTok
       <span>other {web.otherCount} · <strong>{formatInfluenceWeight(web.otherShare)}</strong></span>
       {influence.objective && influence.objectiveValue !== null && (
         <span title={influence.objective === "log_probability" ? "The recomputed log probability of this token." : "The recomputed logit difference to the alternative."}>
-          {influence.objective === "log_probability" ? "log p" : "Δ logit"} {formatNumber(influence.objectiveValue, 3)}
+          {influence.objective === "log_probability" ? "log p" : "Δ logit"} {Math.abs(influence.objectiveValue) < 0.001 && influence.objectiveValue !== 0 ? influence.objectiveValue.toExponential(2) : formatNumber(influence.objectiveValue, 3)}
         </span>
       )}
       {influence.method !== "live_attention" && <Badge tone={influence.cached ? "neutral" : "info"}>{influence.cached ? "cached" : formatDuration(influence.durationMs)}</Badge>}
@@ -272,7 +271,7 @@ export function InfluenceSection({ run, token, contextTokens, model, onSelectTok
     return (
       <>
         <InfluenceWeb
-          labelLimit={variant === "expanded" ? 64 : COMPACT_LABELS}
+          labelLimit={64}
           onSelectGeneratedToken={onSelectToken}
           scale={scale}
           svgRef={variant === "expanded" ? expandedSvg : compactSvg}
@@ -281,7 +280,6 @@ export function InfluenceSection({ run, token, contextTokens, model, onSelectTok
           variant={variant}
           web={web}
         />
-        {variant === "compact" && web.shown.length > COMPACT_LABELS && <p className="influence-hint">Weights are written on the {COMPACT_LABELS} strongest edges; expand to label all {web.shown.length}.</p>}
       </>
     );
   };

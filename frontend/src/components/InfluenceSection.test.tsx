@@ -3,7 +3,14 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError, api } from "../api/client";
 import type { InfluenceSource, ModelSummary, RunDetails, TokenEvent, TokenInfluence } from "../api/types";
+import type * as format from "../utils/format";
+import { downloadBlob } from "../utils/format";
 import { InfluenceSection } from "./InfluenceSection";
+
+vi.mock("../utils/format", async (importOriginal) => ({
+  ...await importOriginal<typeof format>(),
+  downloadBlob: vi.fn(),
+}));
 
 const model: ModelSummary = {
   id: "model-1",
@@ -144,6 +151,30 @@ describe("InfluenceSection", () => {
     expect(alert).toHaveTextContent("fingerprint no longer matches");
     expect(alert).toHaveTextContent("Restore the original checkpoint");
     expect(within(alert).getByRole("button", { name: "Retry" })).toBeEnabled();
+  });
+
+  it("exports a self-contained SVG and the analysis as JSON", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api, "tokenInfluence").mockResolvedValue(influence("gradient_x_input"));
+    document.documentElement.style.setProperty("--seq-5", "#60a5fa");
+    render(<InfluenceSection model={model} onSelectToken={vi.fn()} run={run} token={token} />);
+    await user.click(screen.getByRole("radio", { name: "Gradient × input" }));
+    await user.click(screen.getByRole("button", { name: /Compute gradient/ }));
+    await waitFor(() => expect(edgeLabels()).toHaveLength(3));
+
+    await user.click(screen.getByRole("button", { name: "SVG" }));
+    await user.click(screen.getByRole("button", { name: "JSON" }));
+
+    const calls = vi.mocked(downloadBlob).mock.calls;
+    const [svgName, svg, svgType] = calls.at(-2) ?? [];
+    expect(svgName).toBe("influence-run-1-token-2-gradient_x_input.svg");
+    expect(svgType).toBe("image/svg+xml");
+    expect(svg).toContain('xmlns="http://www.w3.org/2000/svg"');
+    expect(svg).toContain("#60a5fa");
+    expect(svg).not.toContain("var(--");
+    const [jsonName, json] = calls.at(-1) ?? [];
+    expect(jsonName).toBe("influence-run-1-token-2-gradient_x_input.json");
+    expect(JSON.parse(json as string)).toMatchObject({ view: { topN: 24, hideSpecial: false, scale: "share" }, influence: { method: "gradient_x_input", objective: "log_probability" } });
   });
 
   it("explains why computing is unavailable instead of offering it", () => {
