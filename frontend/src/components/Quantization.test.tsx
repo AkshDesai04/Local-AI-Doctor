@@ -188,4 +188,16 @@ describe("load-time quantization in the registry", () => {
     expect(await within(dialog).findByRole("alert")).toHaveTextContent("the model root is not writable");
     expect(within(dialog).getByRole("button", { name: "Flush to storage" })).toBeEnabled();
   });
+
+  it("warns before flushing when the backend's model roots are container mounts", async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockImplementation(() => Promise.resolve(
+      new Response(JSON.stringify({ model_roots: ["/models"], writable: true, containerized: true }), { status: 200, headers: { "Content-Type": "application/json" } }),
+    )));
+    render(<Registry residents={[nf4Resident]} />);
+    await user.click(screen.getByRole("button", { name: "Flush Model A 4-bit NF4 to storage" }));
+    const dialog = screen.getByRole("dialog", { name: "Flush to storage" });
+    expect(await within(dialog).findByText(/mounts model roots read-only/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("combobox", { name: "Model root" })).toHaveValue("0");
+  });
 });

@@ -17,6 +17,7 @@ interface FlushDialogProps {
 /** Chooses where Flush to storage writes a quantized resident: a configured root and a new folder name. */
 export function FlushDialog({ resident, model, onClose, onFlush }: FlushDialogProps): React.ReactNode {
   const [roots, setRoots] = useState<string[] | null>(null);
+  const [containerized, setContainerized] = useState(false);
   const [rootIndex, setRootIndex] = useState(model.rootIndex ?? 0);
   const [folderName, setFolderName] = useState(() => defaultFlushFolderName(model.name, resident.quantization));
   const [writing, setWriting] = useState(false);
@@ -28,7 +29,12 @@ export function FlushDialog({ resident, model, onClose, onFlush }: FlushDialogPr
   useEffect(() => {
     let active = true;
     void getModelRootSettings()
-      .then((settings) => { if (active) setRoots(settings.modelRoots); })
+      .then((settings) => {
+        if (!active) return;
+        setRoots(settings.modelRoots);
+        setRootIndex((current) => current < settings.modelRoots.length ? current : 0);
+        setContainerized(settings.containerized);
+      })
       .catch((cause: unknown) => { if (active) setError(cause instanceof Error ? cause.message : "Could not read the configured model roots."); });
     return () => {
       active = false;
@@ -82,6 +88,7 @@ export function FlushDialog({ resident, model, onClose, onFlush }: FlushDialogPr
           <div><dt>Format</dt><dd>{label} · SafeTensors</dd></div>
           <div><dt>Estimated size</dt><dd title="The measured GPU memory of this copy; the files are about the same size">{resident.gpuBytes ? `About ${formatBytes(resident.gpuBytes)}` : "Unknown"}</dd></div>
         </dl>
+        {containerized && <Callout tone="warning">This backend runs in a container that mounts model roots read-only, so the flush will be refused. Flush from the native app to keep a copy.</Callout>}
         {writing && <p className="muted" role="status">Writing {label} weights to disk. Large models take a minute.</p>}
         {error && <Callout title="Nothing was saved" tone="danger">{error}</Callout>}
       </form>
