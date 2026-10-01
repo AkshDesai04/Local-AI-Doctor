@@ -35,6 +35,7 @@ class Capability(StrEnum):
     BATCHING = "batching"
     DETERMINISTIC_SEEDING = "deterministic_seeding"
     CPU_OFFLOAD = "cpu_offload"
+    WEIGHT_QUANTIZATION = "weight_quantization"
     CPU = "cpu"
     CUDA = "cuda"
     ROCM = "rocm"

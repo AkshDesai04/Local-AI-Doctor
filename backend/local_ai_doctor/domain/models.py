@@ -108,6 +108,10 @@ class ModelDescriptor(BaseModel):
     trust_decision: TrustDecision = TrustDecision.BUILTIN_ONLY
     diagnostics: tuple[Diagnostic, ...] = ()
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Index of the configured model root the folder was found under.
+    root_index: int | None = Field(default=None, ge=0)
+    # Path-free provenance of a folder written by Flush to storage.
+    derivation: dict[str, Any] | None = None
 
     @property
     def loadable(self) -> bool:

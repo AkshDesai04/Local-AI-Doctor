@@ -24,6 +24,10 @@ class ModelEvidence:
     is_moe: bool
     architecture_known: bool
     available_backends: frozenset[BackendKind] = frozenset({BackendKind.CPU})
+    # `quantization_config.quant_method` of a checkpoint that stores quantized weights.
+    weight_quantization: str | None = None
+    # Whether the bitsandbytes package is installed on this host.
+    quantization_backend: bool = False
     # Codes of error-severity discovery diagnostics. Any one of them means the
     # checkpoint cannot be loaded, so no capability may be advertised.
     blocking_diagnostics: tuple[str, ...] = ()
@@ -56,6 +60,42 @@ def _backend(evidence: ModelEvidence, backend: BackendKind) -> CapabilitySupport
     return CapabilitySupport(
         state=CapabilityState.UNAVAILABLE_ON_BACKEND,
         reason=f"no usable {backend.value} runtime was discovered on this host",
+    )
+
+
+def _weight_quantization(evidence: ModelEvidence) -> CapabilitySupport:
+    cuda = BackendKind.CUDA in evidence.available_backends
+    if evidence.weight_quantization == "bitsandbytes":
+        return (
+            _partial("pre-quantized bitsandbytes checkpoint; loads as-is; cannot be re-quantized")
+            if cuda
+            else CapabilitySupport(
+                state=CapabilityState.UNAVAILABLE_ON_BACKEND,
+                reason="pre-quantized bitsandbytes checkpoints need a usable CUDA runtime",
+            )
+        )
+    if evidence.weight_quantization is not None:
+        return _unsupported(
+            f"the checkpoint is pre-quantized with {evidence.weight_quantization}; "
+            "only bitsandbytes is recognized"
+        )
+    if evidence.task is not ModelTask.TEXT_GENERATION:
+        return _unsupported(
+            "load-time weight quantization is implemented only for decoder-only text generation"
+        )
+    if not cuda or not evidence.quantization_backend:
+        return CapabilitySupport(
+            state=CapabilityState.UNAVAILABLE_ON_BACKEND,
+            reason=(
+                "bitsandbytes quantization needs a usable CUDA runtime"
+                if not cuda
+                else "the bitsandbytes package is not installed (install the CUDA extra)"
+            ),
+        )
+    return _partial(
+        "bitsandbytes NF4 4-bit / LLM.int8 8-bit at load time; CUDA only; outputs differ "
+        "from the checkpoint dtype",
+        "the quantized copy lives only in GPU memory until Flush to storage writes it",
     )
 
 
@@ -196,8 +236,14 @@ def build_capability_matrix(evidence: ModelEvidence) -> CapabilityMatrix:
             else "layer offload applies only to generation models"
         )
     )
+    entries[Capability.WEIGHT_QUANTIZATION] = _weight_quantization(evidence)
     entries[Capability.CPU] = _backend(evidence, BackendKind.CPU)
     entries[Capability.CUDA] = _backend(evidence, BackendKind.CUDA)
+    if evidence.weight_quantization == "bitsandbytes":
+        entries[Capability.CPU] = _unsupported("bitsandbytes-quantized weights run on CUDA only")
+        entries[Capability.CPU_OFFLOAD] = _unsupported(
+            "a pre-quantized bitsandbytes checkpoint cannot be offloaded to system RAM"
+        )
     entries[Capability.ROCM] = _backend(evidence, BackendKind.ROCM)
     entries[Capability.MPS] = _backend(evidence, BackendKind.MPS)
     return CapabilityMatrix(entries=entries)

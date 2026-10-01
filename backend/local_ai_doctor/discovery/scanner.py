@@ -20,6 +20,11 @@ from ..domain.models import (
     ModelTask,
     TrustDecision,
 )
+from ..domain.quantization import (
+    DERIVATION_FILE,
+    bitsandbytes_available,
+    weight_quantization,
+)
 from ..hardware.models import BackendKind
 from .bundled_imports import check_bundled_imports
 from .capabilities import ModelEvidence, build_capability_matrix
@@ -539,6 +544,31 @@ def _stored_dtype(dtype_parameter_counts: Mapping[str, int]) -> str | None:
     return _SAFETENSORS_DTYPE_NAMES.get(dominant, dominant.lower())
 
 
+_DERIVATION_KEYS: Final[tuple[str, ...]] = (
+    "schema",
+    "schema_version",
+    "source_model_id",
+    "source_fingerprint",
+    "source_display_name",
+    "quantization",
+    "quantization_config",
+    "software",
+    "created_at",
+)
+
+
+def _derivation(directory: Path) -> dict[str, Any] | None:
+    """The path-free provenance a Flush to storage wrote beside the weights, if any."""
+
+    path = directory / DERIVATION_FILE
+    if not _regular_file(path):
+        return None
+    raw, error = _safe_json(path)
+    if error:
+        return None
+    return {key: raw[key] for key in _DERIVATION_KEYS if key in raw}
+
+
 def _safe_identifier(name: str, fingerprint: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-") or "model"
     return f"{slug[:80]}-{fingerprint[:12]}"
@@ -555,6 +585,7 @@ class ModelScanner:
         max_depth: int = 2,
         fingerprint_policy: FingerprintPolicy | None = None,
         available_backends: frozenset[BackendKind] = frozenset({BackendKind.CPU}),
+        quantization_backend: bool | None = None,
     ) -> None:
         if conservative_context_limit <= 0:
             raise ValueError("conservative_context_limit must be positive")
@@ -565,6 +596,9 @@ class ModelScanner:
         self._max_depth = max_depth
         self._fingerprint_policy = fingerprint_policy or FingerprintPolicy()
         self._available_backends = available_backends
+        self._quantization_backend = (
+            bitsandbytes_available() if quantization_backend is None else quantization_backend
+        )
 
     @staticmethod
     def _is_candidate(directory: Path) -> bool:
@@ -625,7 +659,7 @@ class ModelScanner:
         visit(root, 0)
         return candidates, diagnostics
 
-    def _describe(self, directory: Path) -> ModelDescriptor:
+    def _describe(self, directory: Path, root_index: int | None = None) -> ModelDescriptor:
         config, config_error = (
             _safe_json(directory / "config.json")
             if (directory / "config.json").is_file()
@@ -725,6 +759,17 @@ class ModelScanner:
         components = _components(directory, config, tokenizer)
         delimiters = _reasoning_delimiters(tokenizer, directory)
         is_moe = _detect_moe(config, summary.tensor_names)
+        quantized = weight_quantization(config)
+        bitsandbytes = quantized is not None and quantized["method"] == "bitsandbytes"
+        if bitsandbytes and not self._quantization_backend:
+            diagnostics.append(
+                Diagnostic(
+                    code="quantization_backend_missing",
+                    severity=DiagnosticSeverity.ERROR,
+                    message="the checkpoint stores bitsandbytes-quantized weights, but bitsandbytes is not installed",
+                    hint="Install the CUDA extra (bitsandbytes) on a CUDA host to load this checkpoint.",
+                )
+            )
 
         if (
             task in {ModelTask.TEXT_GENERATION, ModelTask.ENCODER_DECODER_GENERATION}
@@ -861,6 +906,8 @@ class ModelScanner:
                 is_moe=is_moe,
                 architecture_known=architecture_known,
                 available_backends=self._available_backends,
+                weight_quantization=quantized["method"] if quantized else None,
+                quantization_backend=self._quantization_backend,
                 blocking_diagnostics=tuple(
                     dict.fromkeys(
                         item.code
@@ -873,7 +920,14 @@ class ModelScanner:
         # Report what the headers store, not what config.json claims: the two disagree
         # in real checkpoints, and pickle-only folders have no verifiable dtype at all.
         declared_dtype = _declared_dtype(config)
-        dtype = _stored_dtype(summary.dtype_parameter_counts)
+        # Packed bitsandbytes tensors (U8/I8) do not describe the compute dtype.
+        dtype = _stored_dtype(
+            {
+                name: count
+                for name, count in summary.dtype_parameter_counts.items()
+                if not (bitsandbytes and name in {"U8", "I8"})
+            }
+        )
         if declared_dtype and dtype and declared_dtype != dtype:
             diagnostics.append(
                 Diagnostic(
@@ -899,7 +953,10 @@ class ModelScanner:
             "supports_dimension_truncation": qwen_vl_embedding,
             "minimum_embedding_dimension": 64 if qwen_vl_embedding else None,
             "joint_embedding_space": qwen_vl_embedding,
+            "weight_quantization": quantized,
         }
+        if bitsandbytes:
+            metadata["parameter_count_note"] = "packed quantized tensors"
         return ModelDescriptor(
             id=_safe_identifier(directory.name, fingerprint.value),
             display_name=directory.name,
@@ -909,7 +966,8 @@ class ModelScanner:
             architectures=architectures,
             model_type=model_type,
             dtype=dtype,
-            parameter_count=summary.parameter_count or None,
+            # Packed quantized tensors hold several parameters per stored element.
+            parameter_count=None if bitsandbytes else summary.parameter_count or None,
             weight_dtypes=summary.dtype_parameter_counts,
             modalities=modalities,
             components=components,
@@ -921,13 +979,15 @@ class ModelScanner:
             trust_decision=trust_decision,
             diagnostics=tuple(diagnostics),
             metadata=metadata,
+            root_index=root_index,
+            derivation=_derivation(directory),
         )
 
     def scan(self) -> ModelScanReport:
         models: list[ModelDescriptor] = []
         root_results: list[RootScanResult] = []
         seen_paths: set[Path] = set()
-        for configured_root in self._roots:
+        for root_index, configured_root in enumerate(self._roots):
             root_diagnostics: list[Diagnostic] = []
             try:
                 root = configured_root.resolve(strict=True)
@@ -975,7 +1035,7 @@ class ModelScanner:
                     continue
                 seen_paths.add(resolved)
                 try:
-                    models.append(self._describe(resolved))
+                    models.append(self._describe(resolved, root_index))
                 except (OSError, ValueError) as exc:
                     root_diagnostics.append(
                         Diagnostic(
