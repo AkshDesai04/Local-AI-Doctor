@@ -115,12 +115,34 @@ def _token_source(
     return source
 
 
+def _top_weighted(weights: Sequence[float], limit: int) -> tuple[list[int], float]:
+    """Indices of the ``limit`` largest weights (ties keep the earlier index), in
+    ascending index order, plus their exact summed mass clipped to [0, 1]."""
+
+    count = min(limit, len(weights))
+    retained = sorted(
+        sorted(range(len(weights)), key=lambda index: (-weights[index], index))[:count]
+    )
+    return retained, min(1.0, max(0.0, math.fsum(weights[index] for index in retained)))
+
+
+def _normalized_host_row(torch: Any, row: Any) -> list[float] | None:
+    """Clamp float underflow, renormalize to unit mass, and copy to the host."""
+
+    row = torch.clamp(row.float(), min=0.0)
+    total = float(row.sum().item())
+    if not math.isfinite(total) or total <= 0.0:
+        return None
+    return [float(value) for value in (row / total).detach().cpu().tolist()]
+
+
 def _mean_causal_self_attention(
     torch: Any,
     attentions: Any,
     context_tokens: Sequence[Mapping[str, Any]],
     *,
     source_limit: int = _ATTENTION_SOURCE_LIMIT,
+    per_layer: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Aggregate the model's exact attention rows for one next-token decision.
 
@@ -128,6 +150,9 @@ def _mean_causal_self_attention(
     query position.  Their arithmetic mean is normalized for floating-point
     drift.  These values are model-internal attention allocations, *not* causal
     effects or probabilities that a source token caused the sampled token.
+
+    ``per_layer`` also returns the full normalized rows: ``mean_row`` (length S)
+    and ``layer_rows`` (one head-mean row per captured layer, shape (L, S)).
     """
 
     if not isinstance(attentions, (list, tuple)) or not attentions:
@@ -137,6 +162,7 @@ def _mean_causal_self_attention(
 
     context_count = len(context_tokens)
     accumulated: Any | None = None
+    layer_sums: list[Any] = []
     captured_layers: list[int] = []
     heads_per_layer: list[int] = []
     for layer_index, layer_attention in enumerate(attentions):
@@ -168,35 +194,30 @@ def _mean_causal_self_attention(
                 dim=0,
             )
         accumulated = layer_sum if accumulated is None else accumulated + layer_sum
+        if per_layer:
+            layer_sums.append(layer_sum / shape[1])
         captured_layers.append(layer_index)
         heads_per_layer.append(shape[1])
 
     total_head_rows = sum(heads_per_layer)
     if accumulated is None or total_head_rows == 0:
         return None, "the model returned no usable causal self-attention rows"
-    weights = accumulated / total_head_rows
     # Attention is non-negative by construction. Clamp only minute numerical
     # underflow before normalizing the arithmetic mean back to unit mass.
-    weights = torch.clamp(weights, min=0.0)
-    total = float(weights.sum().item())
-    if not math.isfinite(total) or total <= 0.0:
+    host_weights = _normalized_host_row(torch, accumulated / total_head_rows)
+    layer_rows = [_normalized_host_row(torch, row) for row in layer_sums]
+    if host_weights is None or any(row is None for row in layer_rows):
         return None, "the model returned non-finite or empty attention weights"
-    weights = weights / total
-    host_weights = [float(value) for value in weights.detach().cpu().tolist()]
-    retained_indices = sorted(
-        sorted(range(context_count), key=lambda index: (-host_weights[index], index))[
-            : min(source_limit, context_count)
-        ]
-    )
-    retained_weight = min(
-        1.0,
-        max(0.0, sum(host_weights[index] for index in retained_indices)),
-    )
+    retained_indices, retained_weight = _top_weighted(host_weights, source_limit)
     sources = [
         {**dict(context_tokens[index]), "weight": host_weights[index]} for index in retained_indices
     ]
+    extra: dict[str, Any] = (
+        {"mean_row": host_weights, "layer_rows": layer_rows} if per_layer else {}
+    )
     return (
         {
+            **extra,
             "method": "mean_causal_self_attention",
             "aggregation": "arithmetic_mean_over_layers_and_heads",
             "semantics": "attention_weights_not_causal_contributions",
@@ -445,6 +466,62 @@ def _default_bos_token_id(tokenizer: Any) -> int | None:
     return bos if probe[:1] == [bos] else None
 
 
+def _encode_prompt(
+    rt: WorkerRuntime,
+    rendered_prompt: str,
+    prompt_renderer: str,
+    media_messages: Sequence[Mapping[str, Any]] | None,
+) -> tuple[Any, Any, dict[str, Any], dict[str, Any] | None]:
+    """Tokenize a rendered prompt the one way generation does.
+
+    Media conversations go through the processor, which expands each placeholder
+    from the decoded attachments; text goes through the tokenizer without added
+    special tokens, except the BOS the plain-text fallback would otherwise lose.
+    Returns input ids, attention mask, processor media tensors, and a media summary.
+    """
+
+    import torch
+
+    media_inputs: dict[str, Any] = {}
+    media_summary: dict[str, Any] | None = None
+    if media_messages is not None:
+        images, videos, video_metadata = _load_media(rt.processor, media_messages)
+        processor_kwargs: dict[str, Any] = {}
+        if images:
+            processor_kwargs["images"] = images
+        if videos:
+            processor_kwargs.update(
+                videos=videos, video_metadata=video_metadata, do_sample_frames=False
+            )
+        encoded = rt.processor(
+            text=[rendered_prompt],
+            return_tensors="pt",
+            add_special_tokens=False,
+            **processor_kwargs,
+        )
+        media_inputs = {
+            key: value
+            for key, value in encoded.items()
+            if key not in {"input_ids", "attention_mask"}
+        }
+        media_summary = {"images": len(images), "videos": len(videos)}
+    else:
+        encoded = rt.tokenizer(rendered_prompt, return_tensors="pt", add_special_tokens=False)
+    input_ids = encoded["input_ids"]
+    attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids))
+    fallback_bos = (
+        _default_bos_token_id(rt.tokenizer) if prompt_renderer == "plain_text_fallback" else None
+    )
+    if fallback_bos is not None and input_ids[0].tolist()[:1] != [fallback_bos]:
+        input_ids = torch.cat(
+            [torch.tensor([[fallback_bos]], dtype=input_ids.dtype), input_ids], dim=-1
+        )
+        attention_mask = torch.cat(
+            [torch.ones((1, 1), dtype=attention_mask.dtype), attention_mask], dim=-1
+        )
+    return input_ids, attention_mask, media_inputs, media_summary
+
+
 def _decoder_start_token(model: Any, tokenizer: Any) -> tuple[int, str, str | None]:
     """Resolve a seq2seq decoder start token using Transformers' safe order."""
 
@@ -633,6 +710,142 @@ def _media_labels(
             label["index"] = next(index for index, end in enumerate(limits) if position < end)
         labels.append(label)
     return labels
+
+
+@dataclass(frozen=True, slots=True)
+class _InfluenceGroup:
+    """One influence source: a single position, or one media item's contiguous placeholders."""
+
+    start: int
+    end: int
+    kind: str
+    media_index: int | None = None
+
+
+def _influence_groups(
+    token_ids: Sequence[int],
+    prompt_token_count: int,
+    media_labels: Sequence[Mapping[str, Any] | None],
+) -> list[_InfluenceGroup]:
+    """Split context positions into sources, grouping each media item's placeholder run.
+
+    A contiguous run of image (or video) placeholder positions that belong to the same
+    attachment becomes one source so its weight is reported as one sum; every other
+    position is its own ``prompt`` or ``generated`` source.
+    """
+
+    groups: list[_InfluenceGroup] = []
+    for position in range(len(token_ids)):
+        label = media_labels[position] if position < len(media_labels) else None
+        if label is not None:
+            kind = str(label["kind"])
+            index = label.get("index")
+            media_index = int(index) if isinstance(index, int) else None
+            previous = groups[-1] if groups else None
+            if (
+                previous is not None
+                and previous.kind == kind
+                and previous.media_index == media_index
+                and previous.end == position
+            ):
+                groups[-1] = _InfluenceGroup(previous.start, position + 1, kind, media_index)
+                continue
+            groups.append(_InfluenceGroup(position, position + 1, kind, media_index))
+        else:
+            kind = "prompt" if position < prompt_token_count else "generated"
+            groups.append(_InfluenceGroup(position, position + 1, kind))
+    return groups
+
+
+def _ranked_influence(
+    weights: Sequence[float],
+    groups: Sequence[_InfluenceGroup],
+    source_limit: int,
+) -> tuple[list[tuple[_InfluenceGroup, float]], float]:
+    """Top ``source_limit`` sources by summed weight, in context order, plus retained mass.
+
+    Grouping happens before the cut, so one image competes as a single source.
+    """
+
+    group_weights = [math.fsum(weights[group.start : group.end]) for group in groups]
+    retained, retained_weight = _top_weighted(group_weights, source_limit)
+    return [(groups[index], group_weights[index]) for index in retained], retained_weight
+
+
+def _influence_source(
+    tokenizer: Any,
+    token_ids: Sequence[int],
+    group: _InfluenceGroup,
+    *,
+    prompt_token_count: int,
+    special_token_ids: frozenset[int],
+) -> dict[str, Any]:
+    """Describe one source (without its weight); media groups carry a span, not a token."""
+
+    if group.kind in _MEDIA_KINDS:
+        label = group.kind if group.media_index is None else f"{group.kind} {group.media_index + 1}"
+        return {
+            "source_kind": group.kind,
+            "context_index": group.start,
+            "span": [group.start, group.end],
+            "token_count": group.end - group.start,
+            "token_id": None,
+            "piece": None,
+            "display_text": label,
+            "generated_token_index": None,
+            "media_index": group.media_index,
+            "is_special": False,
+        }
+    token_id = int(token_ids[group.start])
+    generated = group.kind == "generated"
+    source = _token_source(
+        tokenizer,
+        token_id,
+        group.start,
+        source_kind=group.kind,
+        generated_token_index=group.start - prompt_token_count if generated else None,
+    )
+    return {
+        **source,
+        "span": None,
+        "token_count": 1,
+        "generated_token_index": source.get("generated_token_index"),
+        "media_index": None,
+        "is_special": token_id in special_token_ids,
+    }
+
+
+def _first_decoder_layer(model: Any) -> Any:
+    """The first text-decoder block, whose input is the residual stream at layer 0."""
+
+    import torch
+
+    for path in (
+        "model.layers",
+        "model.language_model.layers",
+        "language_model.model.layers",
+        "language_model.layers",
+        "model.decoder.layers",
+        "transformer.h",
+    ):
+        target = model
+        for name in path.split("."):
+            target = getattr(target, name, None)
+            if target is None:
+                break
+        if isinstance(target, torch.nn.ModuleList) and len(target) > 0:
+            return target[0]
+    return None
+
+
+def _config_token_id(config: Any, name: str) -> int | None:
+    """A special token id from the model config, or its text sub-config for VL models."""
+
+    for candidate in (config, getattr(config, "text_config", None)):
+        value = getattr(candidate, name, None)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
 
 
 def _embedding_model_kwargs(model_path: Path, kwargs: Mapping[str, Any]) -> dict[str, Any]:
@@ -866,6 +1079,8 @@ class WorkerRuntime:
                 payload = self._embed(command)
             elif operation == "score_prompt":
                 payload = self._score_prompt(command)
+            elif operation == "analyze_influence":
+                payload = self._analyze_influence(command)
             else:
                 raise ValueError(f"unknown worker operation: {operation!r}")
             _send(self.output, "reply", request_id=request_id, ok=True, payload=payload)
@@ -1900,6 +2115,397 @@ class WorkerRuntime:
             "definition": "exp(-mean shifted raw full-vocabulary log probability)",
         }
 
+    def _analyze_influence(self, command: Mapping[str, Any]) -> dict[str, Any]:
+        """Re-run a persisted prefix and weigh each earlier position for one generated token.
+
+        ``attention`` reads post-softmax self-attention at the final query position
+        (allocation, not causation). ``gradient_x_input`` is |Σ_d grad · h| at the
+        residual stream entering the first decoder layer for log p(target), or for
+        logit(target) - logit(alternative): a local first-order sensitivity, not
+        causal attribution. Both are normalized to sum to one.
+        """
+
+        resident = self._select_resident(command.get("model_key"))
+        if resident is None or self.model is None or self.tokenizer is None:
+            raise RuntimeError("no generation model is loaded")
+        if (self.model_info or {}).get("task") != "text_generation" or getattr(
+            self.model.config, "is_encoder_decoder", False
+        ):
+            raise _influence_error(
+                "influence_unavailable",
+                "token influence re-runs a decoder-only prefix; this model is not decoder-only",
+            )
+        import torch
+
+        method = str(command["method"])
+        if method not in {"attention", "gradient_x_input"}:
+            raise ValueError(f"unknown influence method: {method!r}")
+        if method == "gradient_x_input" and resident.placement == "offload":
+            raise _influence_error(
+                "influence_offload_unsupported",
+                "gradient x input is not run on a model whose layers are offloaded to system RAM",
+                hint="Load the model fully on the GPU (Strict VRAM on) or on the CPU, then retry.",
+            )
+
+        expected = int(command["expected_prompt_token_count"])
+        renderer = command.get("prompt_renderer")
+        media = list(command.get("media") or ())
+        if media and self.processor is None:
+            raise _influence_error(
+                "influence_unavailable", "the loaded model has no chat media processor"
+            )
+        media_messages = [{"attachments": media}] if media else None
+        rendered = str(command["rendered_prompt"])
+        input_ids, _mask, media_inputs, _summary = _encode_prompt(
+            self, rendered, str(renderer or "chat_template"), media_messages
+        )
+        if renderer is None and int(input_ids.shape[-1]) + 1 == expected:
+            # Runs persisted before the renderer was recorded: the fallback BOS is
+            # the only difference generation could have made.
+            input_ids, _mask, media_inputs, _summary = _encode_prompt(
+                self, rendered, "plain_text_fallback", media_messages
+            )
+        prompt_ids = [int(item) for item in input_ids[0].tolist()]
+        if len(prompt_ids) != expected:
+            raise _influence_error(
+                "influence_prompt_mismatch",
+                "re-tokenizing the persisted prompt did not reproduce the recorded token count",
+                hint="The tokenizer or chat media changed since the run; regenerate the response.",
+                expected_prompt_tokens=expected,
+                actual_prompt_tokens=len(prompt_ids),
+            )
+        generated = [int(item) for item in command.get("generated_token_ids", ())]
+        token_ids = prompt_ids + generated
+        sequence_tokens = len(token_ids)
+        maximum = int(command.get("max_gradient_tokens", 2048))
+        if method == "gradient_x_input" and sequence_tokens > maximum:
+            raise _influence_error(
+                "influence_sequence_too_long",
+                "the prefix is longer than the gradient x input limit",
+                hint="Raise inference.influence_max_gradient_tokens or use the attention method.",
+                sequence_tokens=sequence_tokens,
+                max_sequence_tokens=maximum,
+            )
+
+        config = self.model.config
+        placeholders = {
+            token_id: kind
+            for kind, token_id in (
+                ("image", _config_token_id(config, "image_token_id")),
+                ("video", _config_token_id(config, "video_token_id")),
+            )
+            if token_id is not None
+        }
+        labels = (
+            _media_labels(
+                token_ids, placeholders, _media_token_counts(self.processor, media_inputs)
+            )
+            if media and placeholders
+            else [None] * sequence_tokens
+        )
+        groups = _influence_groups(token_ids, len(prompt_ids), labels)
+        special_ids = frozenset(
+            int(item) for item in getattr(self.tokenizer, "all_special_ids", None) or ()
+        )
+        device = resident.input_device
+        media_inputs = {
+            key: value.to(device) if hasattr(value, "to") else value
+            for key, value in media_inputs.items()
+        }
+        ids = torch.tensor([token_ids], dtype=torch.long, device=device)
+        mask = torch.ones_like(ids)
+        source_limit = int(command.get("source_limit", 128))
+        self._apply_vram_cap()
+        started = time.monotonic_ns()
+        try:
+            if method == "attention":
+                weights, layers, extra = self._attention_influence(
+                    torch, ids, mask, media_inputs, command.get("layers") or "mean"
+                )
+            else:
+                weights, layers, extra = self._gradient_influence(
+                    torch,
+                    ids,
+                    mask,
+                    media_inputs,
+                    int(command["target_token_id"]),
+                    command.get("alternative_token_id"),
+                )
+        finally:
+            media_inputs.clear()
+            del ids, mask
+            self._restore_attention_implementation()
+            gc.collect()
+            self._empty_cache()
+        duration_ms = (time.monotonic_ns() - started) / 1e6
+
+        described: dict[int, dict[str, Any]] = {}
+
+        def source(group: _InfluenceGroup, weight: float) -> dict[str, Any]:
+            if group.start not in described:
+                described[group.start] = _influence_source(
+                    self.tokenizer,
+                    token_ids,
+                    group,
+                    prompt_token_count=len(prompt_ids),
+                    special_token_ids=special_ids,
+                )
+            return {**described[group.start], "weight": weight}
+
+        def describe(row: Sequence[float]) -> dict[str, Any]:
+            ranked, retained = _ranked_influence(row, groups, source_limit)
+            return {
+                "sources": [source(group, weight) for group, weight in ranked],
+                "retained_weight": retained,
+                "omitted_weight": max(0.0, 1.0 - retained),
+            }
+
+        alternative = command.get("alternative_token_id")
+        return {
+            "method": method,
+            "context_token_count": sequence_tokens,
+            "prompt_token_count": len(prompt_ids),
+            "source_limit": source_limit,
+            **describe(weights),
+            "layers": (
+                None
+                if layers is None
+                else [{"layer": layer, **describe(row)} for layer, row in layers]
+            ),
+            **extra,
+            "alternative_piece": (
+                None
+                if alternative is None
+                else str(self.tokenizer.convert_ids_to_tokens(int(alternative)))
+            ),
+            "normalization": "sum_to_one",
+            "special_token_source": "tokenizer.all_special_ids",
+            "placement": resident.placement,
+            "device": resident.device,
+            "dtype": resident.dtype,
+            "duration_ms": duration_ms,
+        }
+
+    def _attention_influence(
+        self,
+        torch: Any,
+        ids: Any,
+        mask: Any,
+        media_inputs: Mapping[str, Any],
+        layers: Any,
+    ) -> tuple[list[float], list[tuple[int, list[float]]] | None, dict[str, Any]]:
+        """The final query row per layer, taken like live capture: an efficient-kernel
+        prefix, then one eager step for the position that predicts the target."""
+
+        attentions: Any = None
+        prefix_past: Any = None
+        with torch.inference_mode():
+            if int(ids.shape[-1]) > 1:
+                self._restore_attention_implementation()
+                _, prefix_past, _ = self._forward_last(
+                    torch, ids[:, :-1], mask[:, :-1], media=media_inputs
+                )
+                media_inputs = {}
+                query = ids[:, -1:]
+            else:
+                query = ids
+            if not self._select_attention_implementation("eager"):
+                raise _influence_error(
+                    "influence_unavailable",
+                    "this model cannot switch to eager attention, so exact attention rows "
+                    "are unavailable",
+                )
+            _, _, attentions = self._forward_last(
+                torch, query, mask, prefix_past, capture_attention=True, media=media_inputs
+            )
+        del prefix_past
+        sequence = [{"context_index": index} for index in range(int(ids.shape[-1]))]
+        aggregate, error = _mean_causal_self_attention(
+            torch, attentions, sequence, source_limit=1, per_layer=True
+        )
+        del attentions
+        if aggregate is None:
+            raise _influence_error("influence_unavailable", error or "attention was unavailable")
+        captured: list[int] = aggregate["captured_layers"]
+        heads: list[int] = aggregate["heads_per_layer"]
+        rows: dict[int, list[float]] = dict(zip(captured, aggregate["layer_rows"], strict=True))
+        if layers == "mean":
+            weights, selected = aggregate["mean_row"], None
+        elif layers == "all":
+            weights, selected = aggregate["mean_row"], captured
+        else:
+            selected = sorted({int(layer) for layer in layers})
+            missing = [layer for layer in selected if layer not in rows]
+            if missing:
+                raise _influence_error(
+                    "invalid_request",
+                    "a requested layer is outside the model's captured attention layers",
+                    layer_count=len(captured),
+                )
+            # Each selected layer counts by its head count, matching the all-layer mean.
+            head_count = dict(zip(captured, heads, strict=True))
+            combined = [
+                math.fsum(head_count[layer] * rows[layer][index] for layer in selected)
+                for index in range(len(aggregate["mean_row"]))
+            ]
+            total = math.fsum(combined)
+            weights = [value / total for value in combined]
+        return (
+            weights,
+            None if selected is None else [(layer, rows[layer]) for layer in selected],
+            {
+                "captured_layers": captured,
+                "heads_per_layer": heads[0] if len(set(heads)) == 1 else None,
+                "attention_implementation": "eager",
+                "objective": None,
+                "objective_value": None,
+                "semantics": (
+                    "Post-softmax self-attention at the final query position (the position "
+                    "that predicts this token), averaged over heads and over the selected "
+                    "layers. It is the same for every candidate token at this step. "
+                    "Allocation, not causal attribution."
+                ),
+            },
+        )
+
+    def _gradient_influence(
+        self,
+        torch: Any,
+        ids: Any,
+        mask: Any,
+        media_inputs: Mapping[str, Any],
+        target_token_id: int,
+        alternative_token_id: Any,
+    ) -> tuple[list[float], None, dict[str, Any]]:
+        """|Σ_d ∂objective/∂h_i,d · h_i,d| at the input of the first decoder layer."""
+
+        model = self.model
+        layer = _first_decoder_layer(model)
+        if layer is None:
+            raise _influence_error(
+                "influence_unavailable", "no text-decoder layer stack was found in this model"
+            )
+        # Eval mode keeps dropout off; frozen weights keep autograd to activations only.
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        captured: list[Any] = []
+
+        def detach_input(_module: Any, args: Any, kwargs: Any) -> Any:
+            if captured:
+                return None
+            positional = bool(args)
+            hidden = args[0] if positional else kwargs.get("hidden_states")
+            if hidden is None:
+                return None
+            # input_ids stay intact, so (m)RoPE positions and media merging are unchanged.
+            leaf = hidden.detach().clone().requires_grad_(True)
+            captured.append(leaf)
+            if positional:
+                return (leaf, *args[1:]), kwargs
+            return args, {**kwargs, "hidden_states": leaf}
+
+        self._restore_attention_implementation()
+        handle = layer.register_forward_pre_hook(detach_input, with_kwargs=True)
+        try:
+            with torch.enable_grad():
+                logits = self._full_last_logits(torch, ids, mask, media_inputs)
+                vocabulary = int(logits.shape[-1])
+                alternative = None if alternative_token_id is None else int(alternative_token_id)
+                for token_id in (target_token_id, alternative):
+                    if token_id is not None and not 0 <= token_id < vocabulary:
+                        raise _influence_error(
+                            "invalid_request",
+                            "a target or alternative token id is outside the vocabulary",
+                            vocabulary_size=vocabulary,
+                        )
+                if not captured:
+                    raise _influence_error(
+                        "influence_unavailable",
+                        "the first decoder layer did not receive the residual stream",
+                    )
+                row = logits[0].float()
+                objective = (
+                    torch.log_softmax(row, dim=-1)[target_token_id]
+                    if alternative is None
+                    else row[target_token_id] - row[alternative]
+                )
+                objective.backward()
+                leaf = captured[0]
+                gradient = leaf.grad
+                if gradient is None:
+                    raise _influence_error(
+                        "influence_unavailable", "no gradient reached the first decoder layer"
+                    )
+                scores = (gradient.float() * leaf.detach().float()).sum(dim=-1)[0].abs()
+                objective_value = float(objective.detach().item())
+        finally:
+            handle.remove()
+            captured.clear()
+        weights = _normalized_host_row(torch, scores)
+        del scores, gradient, leaf, objective, row, logits
+        if weights is None:
+            raise _influence_error(
+                "influence_unavailable",
+                "the gradient x input scores were all zero or not finite",
+            )
+        return (
+            weights,
+            None,
+            {
+                "captured_layers": [],
+                "heads_per_layer": None,
+                "attention_implementation": getattr(model.config, "_attn_implementation", None),
+                "objective": "log_probability" if alternative is None else "logit_difference",
+                "objective_value": objective_value,
+                "semantics": (
+                    "Gradient x input: |Σ_d ∂f/∂h_i,d · h_i,d| for each position i at the "
+                    "residual stream entering the first decoder layer, where f is "
+                    + (
+                        "log p(target)"
+                        if alternative is None
+                        else "logit(target) - logit(alternative)"
+                    )
+                    + " at the final position. A local first-order sensitivity, not causal "
+                    "attribution."
+                ),
+            },
+        )
+
+    def _full_last_logits(
+        self, torch: Any, ids: Any, mask: Any, media_inputs: Mapping[str, Any]
+    ) -> Any:
+        """One cache-free forward over the whole sequence; logits of the final position only."""
+
+        kwargs = {
+            "input_ids": ids,
+            "attention_mask": mask,
+            "use_cache": False,
+            "return_dict": True,
+            **media_inputs,
+        }
+        body = getattr(self.model, "model", None)
+        head = getattr(self.model, "lm_head", None)
+        if body is not None and head is not None:
+            hidden = body(**kwargs).last_hidden_state[:, -1:, :]
+            return head(hidden)[:, -1, :]
+        try:
+            outputs = self.model(**kwargs, logits_to_keep=1)
+        except TypeError:
+            outputs = self.model(**kwargs)
+        return outputs.logits[:, -1, :]
+
+
+def _influence_error(
+    code: str, message: str, *, hint: str | None = None, **numbers: int
+) -> WorkerReportedError:
+    """A structured worker error carrying only a code, canned text, and counts."""
+
+    error: dict[str, Any] = {"code": code, "message": message, **numbers}
+    if hint:
+        error["hint"] = hint
+    return WorkerReportedError(error)
+
 
 class GenerationSession:
     """One generation request, advanced one sampled token per ``step()``.
@@ -2060,49 +2666,9 @@ class GenerationSession:
             )
         self.decoder_start_token_id: int | None = rt.decoder_start_token_id
         tokenization_started = time.monotonic_ns()
-        media_inputs: dict[str, Any] = {}
-        media_summary: dict[str, Any] | None = None
-        if media_requested:
-            images, videos, video_metadata = _load_media(rt.processor, messages)
-            processor_kwargs: dict[str, Any] = {}
-            if images:
-                processor_kwargs["images"] = images
-            if videos:
-                processor_kwargs.update(
-                    videos=videos, video_metadata=video_metadata, do_sample_frames=False
-                )
-            encoded = rt.processor(
-                text=[rendered_prompt],
-                return_tensors="pt",
-                add_special_tokens=False,
-                **processor_kwargs,
-            )
-            media_inputs = {
-                key: value
-                for key, value in encoded.items()
-                if key not in {"input_ids", "attention_mask"}
-            }
-            media_summary = {"images": len(images), "videos": len(videos)}
-        else:
-            encoded = rt.tokenizer(
-                rendered_prompt,
-                return_tensors="pt",
-                add_special_tokens=False,
-            )
-        input_ids = encoded["input_ids"]
-        attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids))
-        fallback_bos = (
-            _default_bos_token_id(rt.tokenizer)
-            if prompt_renderer == "plain_text_fallback"
-            else None
+        input_ids, attention_mask, media_inputs, media_summary = _encode_prompt(
+            rt, rendered_prompt, prompt_renderer, messages if media_requested else None
         )
-        if fallback_bos is not None and input_ids[0].tolist()[:1] != [fallback_bos]:
-            input_ids = torch.cat(
-                [torch.tensor([[fallback_bos]], dtype=input_ids.dtype), input_ids], dim=-1
-            )
-            attention_mask = torch.cat(
-                [torch.ones((1, 1), dtype=attention_mask.dtype), attention_mask], dim=-1
-            )
         self.input_ids = input_ids = input_ids.to(device)
         self.attention_mask = attention_mask.to(device)
         self.media_inputs = media_inputs = {

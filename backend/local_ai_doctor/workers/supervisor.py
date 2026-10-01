@@ -613,6 +613,13 @@ class ModelWorkerSupervisor:
             timeout_seconds,
         )
 
+    async def analyze_influence(
+        self, command: Mapping[str, Any], *, timeout_seconds: float
+    ) -> dict[str, Any]:
+        """Re-run one persisted prefix in the worker and weigh its positions."""
+
+        return await self._request({**command, "op": "analyze_influence"}, timeout_seconds)
+
     def cancel(self, run_id: str | None = None) -> None:
         """Cancel one run without touching any other; no run ID cancels everything."""
 
