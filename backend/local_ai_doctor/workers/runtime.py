@@ -5,16 +5,19 @@ from __future__ import annotations
 import contextlib
 import gc
 import importlib
+import importlib.metadata
 import json
 import math
 import os
 import queue
+import shutil
 import signal
 import time
 import traceback
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from multiprocessing.queues import Queue
 from pathlib import Path
 from typing import Any
@@ -22,6 +25,7 @@ from typing import Any
 import psutil
 
 from ..domain.quantization import (
+    DERIVATION_FILE,
     bitsandbytes_available,
     bitsandbytes_config,
     is_bitsandbytes_checkpoint,
@@ -855,6 +859,8 @@ class WorkerRuntime:
                 payload = self._unload(str(model_key) if model_key else None)
             elif operation == "memory_status":
                 payload = {"ledger": self._ledger()}
+            elif operation == "flush":
+                payload = self._flush(command)
             elif operation == "embed":
                 payload = self._embed(command)
             elif operation == "score_prompt":
@@ -1339,6 +1345,65 @@ class WorkerRuntime:
             "memory_before": memory_before,
             "memory_after": memory_after,
             "ledger": self._ledger() if torch_module is not None else None,
+        }
+
+    def _flush(self, command: Mapping[str, Any]) -> dict[str, Any]:
+        """Save a load-time quantized resident exactly as held in memory into ``staging_dir``.
+
+        The parent created the empty staging folder and renames it into place; the
+        source folder is only read (chat template and licence files).
+        """
+
+        resident = self._select_resident(command.get("model_key"))
+        if (
+            resident is None
+            or resident.model is None
+            or not resident.quantization_config
+            or resident.placement != "gpu"
+        ):
+            raise WorkerReportedError(
+                {
+                    "code": "flush_requires_quantized_resident",
+                    "message": "only a load-time quantized model held entirely in GPU memory can be flushed",
+                    "hint": "Load the model with 4-bit or 8-bit quantization first.",
+                }
+            )
+        import torch
+        import transformers
+
+        staging = Path(command["staging_dir"])
+        source = Path(command["source_dir"])
+        resident.model.save_pretrained(staging, safe_serialization=True, max_shard_size="2GB")
+        (resident.processor or resident.tokenizer).save_pretrained(staging)
+        for path in sorted(source.iterdir()):
+            wanted = path.name in {
+                "chat_template.json",
+                "chat_template.jinja",
+            } or path.name.upper().startswith(("LICENSE", "NOTICE", "USE_POLICY"))
+            target = staging / path.name
+            if wanted and path.is_file() and not path.is_symlink() and not target.exists():
+                shutil.copyfile(path, target)
+        # Identity and software only: no host paths, so the folder can move freely.
+        derivation = {
+            "schema": "local-ai-doctor/derivation",
+            "schema_version": 1,
+            **dict(command.get("derivation") or {}),
+            "quantization": resident.quantization,
+            "quantization_config": resident.quantization_config,
+            "software": {
+                "torch": str(torch.__version__),
+                "transformers": str(transformers.__version__),
+                "bitsandbytes": importlib.metadata.version("bitsandbytes"),
+            },
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        (staging / DERIVATION_FILE).write_text(
+            json.dumps(derivation, indent=2) + "\n", encoding="utf-8"
+        )
+        files = sorted(path for path in staging.rglob("*") if path.is_file())
+        return {
+            "bytes_written": sum(path.stat().st_size for path in files),
+            "files": [path.relative_to(staging).as_posix() for path in files],
         }
 
     @staticmethod

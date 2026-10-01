@@ -8,6 +8,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..config import DeviceMode, DType, InstrumentationLevel, Quantization, SamplingDefaults
+from ..domain.quantization import folder_name_error
 
 _SAMPLING_DEFAULTS = SamplingDefaults()
 
@@ -268,6 +269,19 @@ class ModelLoadRequest(StrictRequest):
     dtype: DType | None = None
     quantization: Quantization | None = None
     strict_vram: bool | None = Field(default=None, alias="strictVram")
+
+
+class ModelFlushRequest(StrictRequest):
+    target_root_index: int = Field(ge=0, alias="targetRootIndex")
+    folder_name: str = Field(alias="folderName")
+
+    @field_validator("folder_name")
+    @classmethod
+    def folder_name_is_safe(cls, value: str) -> str:
+        error = folder_name_error(value)
+        if error:
+            raise ValueError(error)
+        return value
 
 
 class PromptScoreRequest(StrictRequest):

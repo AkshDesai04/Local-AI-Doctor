@@ -35,6 +35,9 @@ class ErrorCode(StrEnum):
     MODEL_NOT_LOADED = "model_not_loaded"
     MODEL_ALREADY_LOADED = "model_already_loaded"
     MODEL_NOT_RESIDENT = "model_not_resident"
+    TARGET_EXISTS = "target_exists"
+    FLUSH_REQUIRES_QUANTIZED_RESIDENT = "flush_requires_quantized_resident"
+    MODEL_ROOT_READ_ONLY = "model_root_read_only"
     OUT_OF_MEMORY = "out_of_memory"
     INVALID_SAMPLING_SETTINGS = "invalid_sampling_settings"
     INVALID_LOGITS = "invalid_logits"
@@ -245,6 +248,21 @@ class ModelNotResidentError(WorkbenchError):
     http_status = 409
 
 
+class TargetExistsError(WorkbenchError):
+    code = ErrorCode.TARGET_EXISTS
+    http_status = 409
+
+
+class FlushRequiresQuantizedResidentError(WorkbenchError):
+    code = ErrorCode.FLUSH_REQUIRES_QUANTIZED_RESIDENT
+    http_status = 409
+
+
+class ModelRootReadOnlyError(WorkbenchError):
+    code = ErrorCode.MODEL_ROOT_READ_ONLY
+    http_status = 409
+
+
 class RunNotCancellableError(WorkbenchError):
     code = ErrorCode.RUN_NOT_CANCELLABLE
     http_status = 409
@@ -269,6 +287,7 @@ _WORKER_CODE_STATUS = {
     "model_worker_state_mismatch": 409,
     "model_not_resident": 409,
     "worker_busy": 409,
+    "flush_requires_quantized_resident": 409,
 }
 # Codes-and-numbers fields the worker reports next to its code (never paths or text).
 _WORKER_DETAIL_FIELDS = (

@@ -446,6 +446,28 @@ class ModelWorkerSupervisor:
         self._resident[model_key] = entry
         return dict(entry)
 
+    async def flush(
+        self,
+        *,
+        model_key: str,
+        staging_dir: str,
+        source_dir: str,
+        derivation: Mapping[str, Any],
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        """Have the worker save one quantized resident into an empty staging folder."""
+
+        return await self._request(
+            {
+                "op": "flush",
+                "model_key": model_key,
+                "staging_dir": staging_dir,
+                "source_dir": source_dir,
+                "derivation": dict(derivation),
+            },
+            timeout_seconds,
+        )
+
     async def unload(
         self, *, model_key: str | None = None, timeout_seconds: float = 30.0
     ) -> dict[str, Any]:

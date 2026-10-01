@@ -51,6 +51,7 @@ from .api.schemas import (
     EmbeddingRunCreate,
     GenerationRunCreate,
     MessageCreate,
+    ModelFlushRequest,
     ModelLoadRequest,
     ModelRootsUpdate,
     PromptScoreRequest,
@@ -747,6 +748,14 @@ def create_app(
     @api.post("/models/resident/{model_key}/unload")
     async def unload_resident(request: Request, model_key: str) -> dict[str, Any]:
         return await _services(request).registry.unload(model_key)
+
+    @api.post("/models/resident/{model_key}/flush", status_code=201)
+    async def flush_resident(
+        request: Request, model_key: str, body: ModelFlushRequest
+    ) -> dict[str, Any]:
+        return await _services(request).registry.flush(
+            model_key, body.target_root_index, body.folder_name
+        )
 
     @api.post("/models/unload")
     async def unload_model(request: Request) -> dict[str, Any]:

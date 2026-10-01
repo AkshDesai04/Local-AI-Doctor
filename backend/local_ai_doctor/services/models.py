@@ -5,8 +5,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import shutil
+import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from ..config import AppSettings, DeviceMode, DType, Quantization
@@ -14,15 +19,20 @@ from ..discovery.scanner import ModelScanner, ModelScanReport
 from ..domain.capabilities import Capability, CapabilityState
 from ..domain.models import ModelDescriptor
 from ..domain.quantization import (
+    BITSANDBYTES_MODES,
     bitsandbytes_available,
     quantization_rejection,
 )
 from ..errors import (
     CapabilityUnavailableError,
+    FlushRequiresQuantizedResidentError,
+    InvalidRequestError,
     ModelInvalidError,
     ModelNotFoundError,
     ModelNotResidentError,
+    ModelRootReadOnlyError,
     OutOfMemoryError,
+    TargetExistsError,
     WorkerBusyError,
 )
 from ..hardware.models import BackendKind, HardwareInventory, HardwareSelection
@@ -419,6 +429,90 @@ class ModelRegistry:
             )
             return await self.worker.unload(model_key=model_key, timeout_seconds=timeout)
 
+    async def flush(self, model_key: str, root_index: int, folder_name: str) -> dict[str, Any]:
+        """Write one load-time quantized resident, as held in VRAM, to a new model folder.
+
+        The only write into a model root: a fresh dot-prefixed staging folder (the
+        scanner skips dot-directories) renamed into place once complete. Existing
+        files are never modified; a failure removes the staging folder only.
+        """
+
+        async with self.admission.lifecycle("flush"):
+            entry = next(
+                (item for item in self.worker.resident if item.get("model_key") == model_key),
+                None,
+            )
+            if entry is None:
+                raise ModelNotResidentError(
+                    "the model is not resident",
+                    hint="Refresh the resident model list; it may already have been unloaded.",
+                    details={"model_key": model_key},
+                )
+            if (
+                entry.get("quantization") not in BITSANDBYTES_MODES
+                or entry.get("placement") != "gpu"
+            ):
+                raise FlushRequiresQuantizedResidentError(
+                    "only a model quantized at load time and held entirely in GPU memory "
+                    "can be flushed",
+                    hint="Load the model with 4-bit or 8-bit quantization, then flush it.",
+                    details={"model_key": model_key, "quantization": entry.get("quantization")},
+                )
+            source = self.get(str(entry.get("model_id")))
+            roots = self.settings.paths.model_roots
+            if not 0 <= root_index < len(roots):
+                raise InvalidRequestError(
+                    "targetRootIndex does not name a configured model root",
+                    details={"target_root_index": root_index, "model_root_count": len(roots)},
+                )
+            root = roots[root_index].resolve()
+            final = root / folder_name
+            folder = f"<model-root:{root_index}>/{folder_name}"
+            if final.parent != root or final.exists() or final.is_symlink():
+                raise TargetExistsError(
+                    "the target folder already exists in that model root",
+                    hint="Choose another folder name; existing folders are never overwritten.",
+                    details={"folder": folder},
+                )
+            staging = root / f".lad-staging-{uuid.uuid4().hex}"
+            try:
+                staging.mkdir()
+            except OSError as exc:
+                raise ModelRootReadOnlyError(
+                    "the model root is not writable",
+                    hint=(
+                        "The model root is read-only (for example Docker mounts /models "
+                        "read-only). Flush from the native app or choose a writable root."
+                    ),
+                    details={"target_root_index": root_index, "reason": type(exc).__name__},
+                ) from exc
+            try:
+                written = await self.worker.flush(
+                    model_key=model_key,
+                    staging_dir=str(staging),
+                    source_dir=str(source.path),
+                    derivation={
+                        "source_model_id": source.id,
+                        "source_fingerprint": source.fingerprint.value,
+                        "source_display_name": source.display_name,
+                    },
+                    timeout_seconds=self.settings.workers.load_timeout_seconds,
+                )
+                await asyncio.to_thread(_rename_into_place, staging, final)
+            except BaseException:
+                await asyncio.to_thread(shutil.rmtree, staging, True)
+                raise
+            await self.refresh()
+        descriptor = next(
+            (item for item in self._models.values() if item.path == final.resolve()), None
+        )
+        return {
+            "model": descriptor.public_dict(reveal_path=False) if descriptor else None,
+            "folder": folder,
+            "bytes_written": int(written.get("bytes_written") or 0),
+            "derivation": descriptor.derivation if descriptor else None,
+        }
+
     async def unload_model(self, model_id: str) -> dict[str, Any]:
         """Unload every resident of one model (each device/dtype selection is its own key)."""
 
@@ -521,6 +615,23 @@ class ModelRegistry:
             "memory": memory,
             "max_loaded_models": self.settings.runtime.max_loaded_models,
         }
+
+
+def _rename_into_place(staging: Path, final: Path) -> None:
+    """Atomically publish a finished staging folder; never replaces an existing path."""
+
+    for attempt in range(3):
+        # POSIX rename replaces an empty directory, so check again right before it.
+        if final.exists():
+            raise FileExistsError(final.name)
+        try:
+            os.rename(staging, final)
+            return
+        except PermissionError:
+            # Antivirus scanners briefly hold freshly written files open on Windows.
+            if attempt == 2:
+                raise
+            time.sleep(1)
 
 
 def model_key(descriptor: ModelDescriptor, selection: HardwareSelection, quantization: str) -> str:
