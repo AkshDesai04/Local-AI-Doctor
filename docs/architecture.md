@@ -141,7 +141,7 @@ Retention is an explicit API operation rather than a background scheduler. After
 
 ## Trust boundaries
 
-- Model roots are read-only inputs. Transformers loads with `local_files_only=true` and `trust_remote_code=false`.
+- Model roots are read-only inputs, except for the explicit, user-initiated Flush to storage, which writes a new sibling folder through a dot-prefixed staging folder renamed into place and never modifies existing files. Transformers loads with `local_files_only=true` and `trust_remote_code=false`.
 - Model configuration, filenames, tokenizer templates, uploads, and generated output are untrusted data.
 - Upload names are reduced to basenames; content signatures determine supported MIME type; stored names are SHA-256 based; resolution rejects traversal and symlinks.
 - Normal API errors redact arbitrary exception detail and local paths. Worker tracebacks stay private to the supervisor.

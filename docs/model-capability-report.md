@@ -18,7 +18,7 @@ The configured root later grew to eleven folders. Every row below is **Metadata/
 | Krutrim-2-instruct | text generation | no | 1,024,000 `config.max_position_embeddings` (tokenizer 4,096) | none | text | 45.63 GiB pickle shards (stored FP32; config claims BF16), does not fit | `pickle_weights_only`: ten `pytorch_model-*.bin` shards and no SafeTensors; convert offline with a trusted tool into a new folder | scan only |
 | Llama-3.2-1B | text generation (base) | yes | 131,072 `config.max_position_embeddings` (RoPE base 8,192 evidence only; tokenizer 131,072) | none | text | 2.30 GiB BF16, fits (the `original/consolidated.00.pth` copy is no longer counted) | — | runtime: pass; plain-text fallback prompt starts with BOS 128000 |
 | Ministral-3-3B-Reasoning-2512-GGUF | — | — | — | — | — | empty folder | root diagnostic `empty_model_directory` | scan only |
-| Phi-3-mini-4k-instruct | text generation | yes | 4,096 `config.max_position_embeddings` (tokenizer 4,096) | none | text | 7.12 GiB BF16; exceeds the ~6.9 GiB free VRAM before activations | — | matrix skipped (does not fit on the GPU); multi-model runtime: Strict VRAM refuses it before loading, and with Strict VRAM off it loads with layer offload to system RAM and generates 8 greedy tokens |
+| Phi-3-mini-4k-instruct | text generation | yes | 4,096 `config.max_position_embeddings` (tokenizer 4,096) | none | text | 7.12 GiB BF16; exceeds the ~6.9 GiB free VRAM before activations | — | matrix skipped (does not fit on the GPU); multi-model runtime: Strict VRAM refuses it before loading, and with Strict VRAM off it loads with layer offload to system RAM and generates 8 greedy tokens; quantized to 4-bit NF4 it fits under Strict VRAM (2.11 GiB) and generates |
 | Qwen3-1.7B | text generation | yes | 40,960 `config.max_position_embeddings` (tokenizer 131,072) | `<think>` (`enable_thinking` template) | text | 3.78 GiB BF16, fits | — | runtime: pass, including reasoning on/off |
 | Qwen3-VL-2B-Thinking | text generation | yes | 262,144 `config.text_config.max_position_embeddings` (tokenizer 262,144) | `<think>` (template-primed) | text, image, video | 3.96 GiB BF16, fits | — | runtime: pass (text, image, and short-video chat input) |
 | Qwen3-VL-Embedding-2B | multimodal embedding | yes | 262,144 `config.text_config.max_position_embeddings` (tokenizer 262,144) | none (no longer inferred from added tokens) | text, image, video | 3.96 GiB BF16, fits | — | runtime: pass, 2,048-wide normalized vectors |
@@ -39,6 +39,29 @@ The Qwen3-VL row records a fixed defect. Before the worker passed `cache_positio
 These are placement and correctness checks, not throughput measurements; offloaded generation is much slower than VRAM-resident generation.
 
 Chat media on Qwen3-VL-2B-Thinking was exercised through the worker with synthetic inputs and reasoning disabled: a 64×48 red PNG became 70 image placeholder tokens (95 prompt tokens) and the greedy answer was "Red"; a 24-frame, 3-second 64×64 clip that brightens from black was sampled by the processor to 6 frames, became 12 video placeholder tokens, and was described as going from black to brighter. The opt-in matrix repeats this with a 96×96 PNG and a 16-frame clip and checks that every media position is labelled in the `full`-tier attention catalogue. These are smoke results for the preprocessing and prefill path, not a visual-quality evaluation.
+
+## Load-time quantization and Flush to storage (2026-10-01)
+
+`tests/integration/test_real_quantization.py` ran on the same RTX 4060 Laptop GPU (8 GiB) with torch 2.8.0+cu128, Transformers 4.57.6, and bitsandbytes 0.50.2, BF16 compute, Strict VRAM on. It passed all five checks:
+
+- Qwen3-1.7B at 4-bit NF4 stays under 1.6 GiB of measured `gpu_bytes`, generates, and answers "Paris" to "What is the capital of France? Answer in one word." with reasoning off.
+- Qwen3-1.7B at 8-bit LLM.int8 loads entirely on the GPU and generates.
+- Phi-3-mini-4k-instruct at 4-bit NF4 fits under Strict VRAM (it does not unquantized) and generates 8 tokens.
+- Qwen3-VL-2B-Thinking at 4-bit keeps every module under `visual` and the LM head unquantized, quantizes the language model, and answers "Paris".
+- Through the real supervisor, spawned worker, and registry, a 4-bit Qwen3-1.7B resident flushed into a temporary model root (never the real one) is rediscovered as a pre-quantized bitsandbytes checkpoint (`parameter_count` null, `weight_quantization` 4-bit nf4, capability `partial`) with a path-free derivation file and the copied `LICENSE`; reloaded without any quantization argument, it produces the same 16 greedy token ids as the in-memory quantized model.
+
+Measured on the same card (one load at a time, `kv_reserve_tokens` 512):
+
+| Checkpoint | Quantization | Measured `gpu_bytes` | Preflight weight estimate | Answer |
+| --- | --- | --- | --- | --- |
+| Qwen3-1.7B | none (BF16) | 3.21 GiB | 3.20 GiB | Paris |
+| Qwen3-1.7B | 4-bit NF4 | 1.26 GiB | 1.26 GiB | Paris |
+| Qwen3-1.7B | 8-bit LLM.int8 | 1.89 GiB | 1.89 GiB | Paris |
+| Phi-3-mini-4k-instruct | 4-bit NF4 | 2.11 GiB | 2.11 GiB | Paris |
+| Phi-3-mini-4k-instruct | 8-bit LLM.int8 | 3.75 GiB | 3.74 GiB | Paris |
+| Qwen3-VL-2B-Thinking | 4-bit NF4 (vision tower BF16) | 2.02 GiB | 2.01 GiB | Paris |
+
+The estimate counts a tied LM head that the checkpoint also stores (Qwen3) once; before that fix the Qwen3-1.7B estimates were about 0.58 GiB too high. These are memory and correctness checks, not quality evaluations: quantized outputs differ from the BF16 checkpoint, and a one-word answer says nothing about longer-form quality.
 
 ## Evidence labels
 

@@ -90,6 +90,7 @@ POST, PUT, and PATCH bodies are bounded before route parsing. Non-multipart bodi
 | `POST` | `/models/{model_id}/load` | Make a checkpoint resident (or reuse its resident) on optional `device`/`dtype`, evicting least-recently-used idle residents only when needed. |
 | `GET` | `/models/resident` | Every resident model plus the worker memory ledger. |
 | `POST` | `/models/resident/{model_key}/unload` | Unload one resident; 409 `model_not_resident` for an unknown key. |
+| `POST` | `/models/resident/{model_key}/flush` | Flush to storage: write a load-time quantized resident, exactly as held in VRAM, to a new folder in a model root. Returns 201. |
 | `POST` | `/models/unload` | Unload every resident. |
 | `POST` | `/models/{model_id}/unload` | Unload every resident of that model; 409 `model_not_resident` when it has none. |
 | `GET` | `/models/{model_id}/inspect` | Redacted descriptor plus bounded tokenizer/generation/special-token metadata, chat template, and sampler order. |
@@ -100,7 +101,15 @@ Load body, all fields optional:
 {"device":"cuda","dtype":"bfloat16","quantization":"none","strictVram":true}
 ```
 
-`device` is `auto`, `cpu`, or `cuda`; dtype is `auto`, `float32`, `float16`, or `bfloat16`. `quantization` accepts only `none` in this release (other values return 409 `capability_unavailable`). `strictVram` (or `strict_vram`) defaults to `runtime.strict_vram`.
+`device` is `auto`, `cpu`, or `cuda`; dtype is `auto`, `float32`, `float16`, or `bfloat16`. `strictVram` (or `strict_vram`) defaults to `runtime.strict_vram`. `quantization` defaults to `runtime.quantization` and is one of:
+
+| Value | Load |
+| --- | --- |
+| `none` | The checkpoint's own weights at the selected dtype. A pre-quantized bitsandbytes checkpoint loads as stored. |
+| `bitsandbytes-4bit` | bitsandbytes NF4 with double quantization, `uint8` storage, and the selected dtype as compute dtype. |
+| `bitsandbytes-8bit` | bitsandbytes LLM.int8 with outlier threshold 6.0. |
+
+Quantization happens in GPU memory while the weights load; nothing is written to disk. The LM head stays at the compute dtype, and multimodal generators also keep their vision tower and projector unquantized. A request returns 409 `capability_unavailable` with the reason in `message` when the model is not a decoder-only text generator, the selected device is not CUDA, bitsandbytes is not installed, the checkpoint is already bitsandbytes-quantized (it cannot be re-quantized), or the value is the legacy `int4`/`int8`. A pre-quantized checkpoint also refuses a CPU device. Quantization is part of the resident key, so the same checkpoint at 4-bit and unquantized are separate residents, and the preflight estimate counts 2-D linear weights at 0.5 × 1.03 bytes per parameter (NF4) or 1 byte (LLM.int8).
 
 #### Resident models
 
@@ -173,6 +182,50 @@ The load response keeps its previous fields (the descriptor, `lifecycle`, `loade
 
 `in_use` marks residents the currently admitted job has loaded. The worker ledger is refreshed only while nothing is admitted or running, because a timed-out worker request recycles the worker; otherwise the last ledger is served with `stale: true`. `cap_bytes` is `null` while no strict CUDA resident exists. Before the worker has used CUDA, the device totals are `null` rather than creating a CUDA context just to report them; on a CPU-only host `device` is `cpu` and the totals describe system RAM.
 
+#### Flush to storage
+
+`POST /models/resident/{model_key}/flush` body (camelCase; `target_root_index`/`folder_name` also accepted):
+
+```json
+{"targetRootIndex": 0, "folderName": "Qwen3-1.7B-bnb-nf4"}
+```
+
+`targetRootIndex` indexes `paths.model_roots` (the order of `GET /configuration/model-roots`). `folderName` must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`, must not end with a dot, and must not be a Windows reserved name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, any case, with or without an extension); otherwise 422 `invalid_request`. An index outside the configured roots is also 422.
+
+The route runs as a lifecycle operation, so it returns 409 `worker_busy` while a run is admitted. It then requires:
+
+| Condition | Error |
+| --- | --- |
+| The key names a resident. | 409 `model_not_resident` |
+| The resident was quantized at load time (`bitsandbytes-4bit` or `bitsandbytes-8bit`) and its placement is `gpu`. | 409 `flush_requires_quantized_resident` |
+| `<root>/<folderName>` does not exist yet. | 409 `target_exists` |
+| A staging folder can be created in the root. | 409 `model_root_read_only`, hint "The model root is read-only (for example Docker mounts /models read-only). Flush from the native app or choose a writable root." |
+
+The backend creates `<root>/.lad-staging-<uuid>`; the worker writes `model.save_pretrained(safe_serialization=True, max_shard_size="2GB")`, the processor or tokenizer, any source `chat_template.json`/`chat_template.jinja` the save did not write, the source `LICENSE*`, `NOTICE*`, and `USE_POLICY*` files, and `local_ai_doctor_derivation.json`. The staging folder is then renamed to its final name (retried up to three times on `PermissionError`, never replacing an existing path) and the roots are rescanned; the scanner skips dot-directories, so a staging folder is never listed. On any failure only the staging folder is removed. Existing files are never modified.
+
+Response (201):
+
+```json
+{
+  "model": {"id": "qwen3-1-7b-bnb-nf4-1a2b3c4d5e6f", "display_name": "Qwen3-1.7B-bnb-nf4", "path": "<model-root>/Qwen3-1.7B-bnb-nf4", "root_index": 0, "derivation": {}},
+  "folder": "<model-root:0>/Qwen3-1.7B-bnb-nf4",
+  "bytes_written": 1363148800,
+  "derivation": {
+    "schema": "local-ai-doctor/derivation",
+    "schema_version": 1,
+    "source_model_id": "qwen3-1-7b-0123456789ab",
+    "source_fingerprint": "SHA256",
+    "source_display_name": "Qwen3-1.7B",
+    "quantization": "bitsandbytes-4bit",
+    "quantization_config": {"load_in_4bit": true, "bnb_4bit_quant_type": "nf4", "bnb_4bit_use_double_quant": true, "bnb_4bit_compute_dtype": "bfloat16", "bnb_4bit_quant_storage": "uint8", "llm_int8_enable_fp32_cpu_offload": false},
+    "software": {"torch": "2.8.0+cu128", "transformers": "4.57.6", "bitsandbytes": "0.50.2"},
+    "created_at": "2026-10-01T12:00:00+00:00"
+  }
+}
+```
+
+`model` is the rescanned public descriptor of the new folder (abbreviated above). It is discovered as a pre-quantized checkpoint: `metadata.weight_quantization` is `{"method": "bitsandbytes", "bits": 4, "quant_type": "nf4"}`, `parameter_count` is `null` with `metadata.parameter_count_note: "packed quantized tensors"`, and loading it needs no quantization argument. The derivation file holds identity and software versions only, never host paths.
+
 `POST /models/{model_id}/unload` returns the descriptor with `lifecycle: "unloaded"`, `loaded_device: null`, and `unload: {unloaded_model_id, unloaded_model_keys, freed_bytes, leaked_bytes, ledger}`. The key and unload-all routes return the worker payload: `unloaded_model_id`, `unloaded_model_ids`, `unloaded_model_keys`, `freed_bytes` (allocator bytes actually returned), `leaked_bytes` (measured load bytes that were not returned), `memory_before`, `memory_after`, and `ledger`.
 
 `GET /health` keeps `status`, `database`, `worker`, `loaded_model` (the most recently used resident, or `null`), and `protocol_version: 1`, and adds `loaded_models`, ordered least recently used first:
@@ -197,6 +250,8 @@ The load response keeps its previous fields (the descriptor, `lifecycle`, `loade
   "protocol_version": 1
 }
 ```
+
+Every descriptor also carries `root_index` (the configured model root it was found under) and `derivation` (the path-free contents of `local_ai_doctor_derivation.json` for a folder written by Flush to storage, else `null`). A checkpoint whose `config.json` has a `quantization_config` reports it as `metadata.weight_quantization` (`method`, `bits`, `quant_type`); a bitsandbytes checkpoint additionally gets `parameter_count: null` (packed tensors hold several parameters per stored byte), a dtype read from its unpacked tensors, and an `error` diagnostic `quantization_backend_missing` when bitsandbytes is not installed.
 
 In the scan report, each descriptor's `dtype` is the SafeTensors header dtype that stores the most parameters (`null` when no header exists, for example pickle-only folders); the configuration's claim is `metadata.declared_dtype`. `fingerprint.total_weight_bytes` counts only the files a Transformers load reads. A descriptor with any `error` diagnostic has `loadable: false` and every capability `unsupported`. Each `roots[]` entry carries root-level diagnostics, including `empty_model_directory` and `gguf_only_directory` for folders that cannot be candidates, with root-relative names only.
 

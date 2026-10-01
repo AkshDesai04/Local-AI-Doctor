@@ -15,6 +15,7 @@ Despite the name, this is a model-diagnostics tool. It is not a medical product 
 - SentenceTransformers text, image, video, and mixed-input embeddings where the selected checkpoint exposes those modalities, with truncation and re-normalization only for reviewed model-specific dimension contracts.
 - Persistent chats, runs, partial output, telemetry, attachments, portable chat-workspace import/export, branch-aware run replay, and confirmed terminal-run retention in SQLite and content-addressed storage.
 - Per-chat system prompts, set from the composer's prompt controls, stored with the chat, snapshotted on every run, and reused unchanged by replay and token branching.
+- Live quantization: load a decoder-only text generator as bitsandbytes 4-bit NF4 or 8-bit LLM.int8 straight into GPU memory, run it, and press **Flush to storage** to save that exact quantized model to a new folder in a model root. Nothing is written before you flush, and the source folder is never modified.
 - CPU and CUDA selection, one-model-at-a-time lifecycle management, bounded single-worker admission, a responsive React workbench, and hardened CPU/NVIDIA container definitions.
 
 Support remains capability-gated. Discovery does not imply that every Transformers architecture or modality can run. Unknown or incomplete model folders remain visible with diagnostics instead of being guessed into a working state. See [Known limitations](docs/limitations.md) and the [supplied-model capability report](docs/model-capability-report.md).
@@ -64,7 +65,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --no-deps --editable .
 ```
 
-For an NVIDIA system, replace the PyTorch wheel selected above with the pinned CUDA build:
+For an NVIDIA system, replace the PyTorch wheel selected above with the pinned CUDA build. The same lock installs `bitsandbytes==0.50.2` (also the `cuda` extra in `pyproject.toml`), which load-time quantization needs; without it, quantization is reported unavailable and pre-quantized checkpoints are blocked:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps -r requirements-cuda.lock
@@ -206,6 +207,8 @@ Configuration also supports `LAD_` environment variables with `__` between neste
 - Each loadable model card in the registry has its own load options: **Device** (Auto, CUDA, or CPU), **Data type** (Auto, bfloat16, float16, or float32), and **Strict VRAM**. They are saved per model in the browser and also appear under Generation controls › Model loading for the selected model. A chat message sent to a model that is not resident loads it with these options; a resident copy is reused as it is.
 - **Strict VRAM** is on by default (`runtime.strict_vram`). It keeps the whole model in GPU memory and fails with a readable "Not enough GPU memory" message instead of spilling into system RAM. Turn it off for a load to let layers that do not fit run from system RAM, which is much slower; such a copy shows an "Offloaded to system RAM" badge. The switch is disabled for CPU loads.
 - Every resident copy is listed on its model card with its device, dtype, placement, measured GPU, RAM, and KV-reserve usage, and its own **Unload**. **Unload all** sits on the memory card at the top of the registry, which splits GPU memory into resident models, other use, PyTorch's reserved cache, the safety margin, and free memory, and shows how many models are resident out of `runtime.max_loaded_models`.
+- **Quantization** (None, 4-bit NF4, 8-bit LLM.int8) is another per-model load option, enabled only for decoder-only text generators on CUDA with bitsandbytes installed; otherwise it is disabled with the reason. A quantized copy is a separate resident with a "4-bit NF4 · VRAM only" badge: it exists only in GPU memory. Its outputs differ from the checkpoint dtype. On Qwen3-1.7B, 4-bit uses about 1.3 GiB of VRAM against 3.2 GiB for BF16.
+- **Flush to storage** on a quantized copy opens a dialog: pick a configured model root (the source model's root by default) and a new folder name (prefilled `<model>-bnb-nf4` or `-bnb-int8`, checked against the same rules as the backend). The backend writes the model exactly as held in VRAM into a hidden staging folder, renames it into place, and rescans; the new card shows "Derived from …" and loads as a pre-quantized checkpoint without re-quantizing. A read-only root (Docker mounts `/models` read-only) is refused with a clear reason.
 - When a load needs room, the least recently used idle model is unloaded first and a notice names it. The header shows the selected model's resident copy (for example `cuda:0 · bf16`) and a compact used/total VRAM meter when the backend reports a CUDA device.
 
 The REST API is rooted at `/api/v1`; live runs use the `lad.events.v1` WebSocket subprotocol. See [API and WebSocket reference](docs/api.md) and [metric definitions](docs/metrics.md).

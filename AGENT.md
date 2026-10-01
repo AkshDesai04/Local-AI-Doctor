@@ -58,7 +58,8 @@ The following requirements came directly from the project conversation and are b
 
 ### 3.2 Local models, configuration, and hardware
 
-- Model roots are user-configured, external, and read-only. Never modify, relocate, delete, or copy model weights into this repository, a release, or a container image.
+- Model roots are user-configured and external. Model roots are read-only except for the explicit, user-initiated Flush-to-storage action, which writes a new sibling folder atomically and never modifies existing files. Never modify, relocate, delete, or copy model weights into this repository, a release, or a container image.
+- Load-time quantization (bitsandbytes NF4 or LLM.int8) happens in GPU memory only; nothing is written to disk until the user presses Flush to storage. Docker keeps `/models` read-only, so flushing there fails with `model_root_read_only`.
 - The current workstation has a separate host model directory, but its absolute Windows path, WSL path, user name, and WSL distribution are machine-local facts. Keep them only in ignored local configuration. Portable code may use the container-internal `/models` path.
 - The Model registry settings UI is the user-facing wrapper for model-root configuration. It must persist backend-visible absolute paths into the writable user-local config and rescan.
 - Choosing CUDA must result in actual CUDA execution or a clear failure. The CPU Docker profile must never accept an explicit CUDA request and silently run it on CPU.
@@ -149,7 +150,8 @@ Do not overstate these boundaries:
 - Discovery is not proof that a checkpoint can execute.
 - The adapter registry contracts exist, but the running worker still owns explicit built-in Transformers/SentenceTransformers paths.
 - Only one worker process and one active/runnable job are supported; the worker holds up to `max_loaded_models` residents and interleaves up to `max_concurrent_runs` generation sessions inside that job. `queue_limit` controls additional waiters.
-- ROCm, Metal, general multi-GPU placement, and non-`none` model-weight quantization are not implemented runtime paths. Layer offload to system RAM exists only for generation models on CUDA with Strict VRAM off.
+- ROCm, Metal, and general multi-GPU placement are not implemented runtime paths. Layer offload to system RAM exists only for generation models on CUDA with Strict VRAM off.
+- Weight quantization is bitsandbytes only (`bitsandbytes-4bit` NF4, `bitsandbytes-8bit` LLM.int8), at load time, for decoder-only text generators on CUDA with the CUDA extra installed. Quantized outputs differ from the checkpoint dtype. Pre-quantized bitsandbytes checkpoints load as stored and cannot be re-quantized; the legacy `int4`/`int8` values are rejected.
 - MoE schemas/interfaces exist, but no production router hook is currently composed. The supplied checkpoints are dense.
 - Hidden-state probes, activation probes, logit lens, KV-cache inspection, and continuous hardware sampling are not implemented production telemetry.
 - Attention capture is partial, bounded, decoder-only, and unavailable when the model cannot return alignable eager attention tensors.
@@ -304,7 +306,7 @@ Configuration schema version is 1. Unknown fields fail. Future schema versions f
 - `features`: experimental attention/hidden-state/activation/logit-lens/router/multi-GPU flags.
 - `platform`: portable container paths/profile hints.
 
-Only claim a typed option works when the runtime path supports it. For example, non-`none` quantization is typed but rejected by the current reference loader, and `runtime.cpu_offload: true` is rejected as superseded by `runtime.strict_vram: false`.
+Only claim a typed option works when the runtime path supports it. For example, `runtime.quantization` supports `none`, `bitsandbytes-4bit`, and `bitsandbytes-8bit` (CUDA text generators only) while the legacy `int4`/`int8` values are rejected at load, and `runtime.cpu_offload: true` is rejected as superseded by `runtime.strict_vram: false`.
 
 Several fields are forward-looking or only partially honored today, including general backend selection, device placement, multi-worker/multi-model concurrency, scheduled retention, router controls, periodic utilization sampling, and most experimental probes. `features.attention_probe` is not the current capture gate: choosing `full` or `expert` instrumentation requests compatible causal attention capture.
 
@@ -385,6 +387,8 @@ The last recorded real-model workstation evidence used an RTX 4060 Laptop GPU wi
 - Docker CPU and NVIDIA profiles both disable CPU fallback; an unavailable explicit CUDA request must fail clearly.
 - The worker loads local files only, calls evaluation mode, and always places the model through a device map (never `.to()`): the exact selected device, CPU, or accelerate layer offload when Strict VRAM is off.
 - A resident is reused only when its key matches: model ID, fingerprint, device, effective dtype, and quantization. A Strict VRAM request re-places an offloaded resident on the GPU.
+- A non-`none` quantization passes a `BitsAndBytesConfig` (NF4 with double quantization and the selected compute dtype, or LLM.int8 with threshold 6.0) through the same device map; the LM head, and a multimodal model's vision tower, stay at the compute dtype. A checkpoint whose `config.quantization_config` is bitsandbytes loads with no quantization argument.
+- Flush to storage (`POST /models/resident/{modelKey}/flush`, a lifecycle operation) saves a load-time quantized GPU resident with `save_pretrained` into `<root>/.lad-staging-<uuid>`, adds the tokenizer or processor, licence files, and a path-free `local_ai_doctor_derivation.json`, renames the staging folder to the new name, and rescans. A failure removes only the staging folder.
 - A worker timeout poisons IPC state. The supervisor retires/replaces the worker and queues atomically; if the old process cannot be terminated, fail closed.
 
 ## 9. Backend lifecycle and execution
