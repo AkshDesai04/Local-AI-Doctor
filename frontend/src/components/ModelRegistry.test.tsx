@@ -74,6 +74,7 @@ function Registry({ residents = [], onLoad = vi.fn(), onUnloadResident = vi.fn()
       onRefresh={vi.fn()}
       onSelectModel={vi.fn()}
       onSynchronize={vi.fn()}
+      onFlushResident={vi.fn()}
       onUnloadAll={vi.fn()}
       onUnloadResident={onUnloadResident}
       residents={residents}

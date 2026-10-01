@@ -503,13 +503,16 @@ button.attention-source-token:hover { border-color: var(--accent-text); }
 .model-card-title { align-items: center; display: flex; gap: var(--space-2); min-width: 0; }
 .model-card-title h3 { font-size: var(--fs-14); font-weight: var(--weight-semibold); line-height: var(--lh-14); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-card-arch { color: var(--text-tertiary); font-family: var(--font-mono); font-size: var(--fs-11); line-height: var(--lh-11); }
+.model-card-derivation { align-items: center; color: var(--text-secondary); display: inline-flex; font-size: var(--fs-12); gap: 6px; line-height: var(--lh-12); }
+.model-card-derivation svg { color: var(--text-tertiary); flex: none; }
+.flush-form { display: flex; flex-direction: column; gap: var(--space-4); }
 .model-facts { display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-6); margin: 6px 0 0; }
 .model-facts > div { display: flex; flex-direction: column; min-width: 0; }
 .model-facts dt { color: var(--text-tertiary); font-size: var(--fs-11); line-height: var(--lh-11); }
 .model-facts dd { color: var(--text-primary); font-size: var(--fs-12); font-variant-numeric: tabular-nums; line-height: 18px; margin: 0; }
 .model-facts dd.conflict { cursor: help; text-decoration: underline dotted var(--text-tertiary); text-underline-offset: 3px; }
 .model-card-actions { align-items: center; display: flex; flex: 0 0 auto; gap: var(--space-1); }
-.model-load-panel { align-items: start; border-top: 1px solid var(--border-subtle); display: grid; gap: var(--space-2) var(--space-4); grid-template-columns: minmax(120px, 168px) minmax(120px, 168px) minmax(0, 1fr) auto; padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4); }
+.model-load-panel { align-items: start; border-top: 1px solid var(--border-subtle); display: grid; gap: var(--space-2) var(--space-4); grid-template-columns: minmax(112px, 160px) minmax(112px, 160px) minmax(128px, 176px) minmax(0, 1fr) auto; padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4); }
 .model-load-panel > .load-strict, .model-load-panel > .btn { margin-top: 22px; }
 .model-load-panel > .load-strict .switch-label { font-size: var(--fs-12); line-height: var(--lh-12); }
 .model-load-panel > .load-strict .switch-description { font-size: var(--fs-11); line-height: var(--lh-11); }

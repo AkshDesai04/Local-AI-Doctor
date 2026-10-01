@@ -189,6 +189,7 @@ export default function App(): React.ReactNode {
                 onRefresh={() => void workbench.refreshModels()}
                 onSelectModel={workbench.setSelectedModelId}
                 onSynchronize={() => void workbench.synchronizeRuntimeState()}
+                onFlushResident={workbench.flushResident}
                 onUnloadAll={() => void workbench.unloadAll()}
                 onUnloadResident={(resident) => void workbench.unloadResident(resident)}
                 residents={workbench.residents}

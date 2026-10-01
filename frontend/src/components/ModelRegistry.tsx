@@ -9,6 +9,8 @@ import {
   Cpu,
   Database,
   Fingerprint,
+  GitBranch,
+  HardDriveDownload,
   Play,
   RefreshCw,
   ShieldCheck,
@@ -16,10 +18,11 @@ import {
 } from "lucide-react";
 import { Fragment, useState } from "react";
 import { api } from "../api/client";
-import type { CapabilityKey, CapabilityState, LoadOptions, MemoryLedger, ModelInspection, ModelSummary, ResidentModel } from "../api/types";
+import type { CapabilityKey, CapabilityState, FlushResult, LoadOptions, MemoryLedger, ModelInspection, ModelSummary, ResidentModel } from "../api/types";
 import { capabilityKeys, capabilityLabel, capabilityOf } from "../domain/capabilities";
-import { residentColor, residentsOf, residentSummary } from "../domain/residency";
+import { quantizationLabel, residentColor, residentsOf, residentSummary } from "../domain/residency";
 import { formatBytes, formatNumber, shortFingerprint } from "../utils/format";
+import { FlushDialog } from "./FlushDialog";
 import { LoadOptionsFields } from "./LoadOptionsFields";
 import { MemoryLedgerCard } from "./MemoryLedger";
 import { ModelRootSettings } from "./ModelRootSettings";
@@ -36,12 +39,13 @@ interface ModelRegistryProps {
   onLoad: (model: ModelSummary, options: LoadOptions) => void;
   onUnloadResident: (resident: ResidentModel) => void;
   onUnloadAll: () => void;
+  onFlushResident: (resident: ResidentModel, target: { targetRootIndex: number; folderName: string }) => Promise<FlushResult>;
   onRefresh: () => void;
   onSynchronize: () => void;
   onSelectModel: (id: string) => void;
 }
 
-const matrixKeys: CapabilityKey[] = ["text_generation", "embeddings", "vision", "audio", "video", "reasoning_segments", "moe_routing", "raw_logits", "prompt_scoring", "streaming", "cpu", "cuda", "cpu_offload"];
+const matrixKeys: CapabilityKey[] = ["text_generation", "embeddings", "vision", "audio", "video", "reasoning_segments", "moe_routing", "raw_logits", "prompt_scoring", "streaming", "cpu", "cuda", "cpu_offload", "weight_quantization"];
 
 const stateLabels: Record<CapabilityState, string> = {
   full: "Full",
@@ -87,9 +91,27 @@ function contextSummary(model: ModelSummary): { text: string; conflict: boolean 
     : { text: formatNumber(limit, 0), conflict: false };
 }
 
+/** "Pre-quantized 4-bit nf4" for a checkpoint that stores quantized weights. */
+function prequantizedLabel(model: ModelSummary): string {
+  const stored = model.weightQuantization;
+  if (!stored) return "";
+  const bits = stored.bits ? `${String(stored.bits)}-bit ` : "";
+  return `Pre-quantized ${bits}${stored.quantType ?? stored.method}`;
+}
+
+/** "Derived from Qwen3-1.7B · 4-bit NF4". */
+function derivationLabel(model: ModelSummary): string {
+  const quantization = quantizationLabel(model.derivation?.quantization);
+  return `Derived from ${model.derivation?.sourceDisplayName ?? "another model"}${quantization ? ` · ${quantization}` : ""}`;
+}
+
 const placementLabels: Record<NonNullable<ResidentModel["placement"]>, string | null> = { gpu: "GPU", cpu: "CPU", offload: null };
 
-function ResidentRow({ model, resident, color, busy, onUnload }: { model: ModelSummary; resident: ResidentModel; color: number | null; busy: boolean; onUnload: (resident: ResidentModel) => void }): React.ReactNode {
+function ResidentRow({ model, resident, color, busy, onUnload, onFlush }: { model: ModelSummary; resident: ResidentModel; color: number | null; busy: boolean; onUnload: (resident: ResidentModel) => void; onFlush: (resident: ResidentModel) => void }): React.ReactNode {
+  const quantized = quantizationLabel(resident.quantization);
+  const flushBlocked = resident.inUse
+    ? "In use by a running job; flush it when the job finishes"
+    : resident.placement !== "gpu" ? "Only a copy held entirely in GPU memory can be flushed" : null;
   const summary = [residentSummary(resident), resident.placement ? placementLabels[resident.placement] : null].filter(Boolean).join(" · ");
   const usage: Array<[string, string]> = [
     ...(resident.gpuBytes !== null ? [["GPU", formatBytes(resident.gpuBytes)] as [string, string]] : []),
@@ -104,10 +126,20 @@ function ResidentRow({ model, resident, color, busy, onUnload }: { model: ModelS
         <Badge tone="accent">{summary}</Badge>
         {resident.placement === "offload" && <Badge icon={<AlertTriangle aria-hidden="true" size={11} />} title="Layers that did not fit in VRAM run from system RAM, which is much slower." tone="warning">Offloaded to system RAM</Badge>}
         {resident.strictVram && resident.placement === "gpu" && <Badge title="Loaded with Strict VRAM: this copy never spills into system RAM.">Strict VRAM</Badge>}
-        {resident.quantization && resident.quantization !== "none" && <Badge>{resident.quantization}</Badge>}
+        {quantized && <Badge title="Quantized at load time and held only in GPU memory; nothing is on disk until you flush it." tone="info">{quantized} · VRAM only</Badge>}
         {resident.inUse && <Badge tone="info">In use</Badge>}
       </div>
       {usage.length > 0 && <dl className="resident-usage">{usage.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>}
+      {quantized && (
+        <Button
+          aria-label={`Flush ${model.name} ${quantized} to storage`}
+          disabled={flushBlocked !== null || busy}
+          icon={<HardDriveDownload size={11} />}
+          onClick={() => onFlush(resident)}
+          size="sm"
+          title={flushBlocked ?? "Save this quantized copy, exactly as held in GPU memory, to a new folder in a model root"}
+        >Flush to storage</Button>
+      )}
       <Button
         aria-label={`Unload ${model.name} on ${summary}`}
         disabled={resident.inUse}
@@ -130,11 +162,13 @@ interface ModelCardProps {
   onLoadOptionsChange: (modelId: string, options: LoadOptions) => void;
   onLoad: (model: ModelSummary, options: LoadOptions) => void;
   onUnloadResident: (resident: ResidentModel) => void;
+  onFlushResident: ModelRegistryProps["onFlushResident"];
   onSelectModel: (id: string) => void;
 }
 
-function ModelCard({ model, residents, colorOf, connected, loadOptions, onLoadOptionsChange, onLoad, onUnloadResident, onSelectModel }: ModelCardProps): React.ReactNode {
+function ModelCard({ model, residents, colorOf, connected, loadOptions, onLoadOptionsChange, onLoad, onUnloadResident, onFlushResident, onSelectModel }: ModelCardProps): React.ReactNode {
   const [expanded, setExpanded] = useState(false);
+  const [flushing, setFlushing] = useState<ResidentModel | null>(null);
   const [inspection, setInspection] = useState<ModelInspection | null>(null);
   const [inspectionOpen, setInspectionOpen] = useState(false);
   const [inspectionLoading, setInspectionLoading] = useState(false);
@@ -170,10 +204,16 @@ function ModelCard({ model, residents, colorOf, connected, loadOptions, onLoadOp
             <Badge tone={taskTones[model.task]}>{taskLabel(model.task)}</Badge>
             {residents.length > 0 && <Badge tone="accent">{residents.length === 1 ? "Resident" : `${String(residents.length)} resident copies`}</Badge>}
             {model.lifecycle === "error" && <Badge tone="danger">Load error</Badge>}
+            {model.weightQuantization && <Badge title={`Stored quantized (${model.weightQuantization.method}); loads as-is and cannot be re-quantized`} tone="info">{prequantizedLabel(model)}</Badge>}
           </div>
           <p className="model-card-arch">{model.architecture ?? "Architecture not identified"}</p>
+          {model.derivation?.sourceDisplayName && (
+            <p className="model-card-derivation" title={model.derivation.createdAt ? `Flushed to storage at ${model.derivation.createdAt}` : undefined}>
+              <GitBranch aria-hidden="true" size={12} />{derivationLabel(model)}
+            </p>
+          )}
           <dl className="model-facts">
-            <div><dt>Parameters</dt><dd>{model.parameterCount ? `${formatNumber(model.parameterCount / 1_000_000_000, 2)}B` : "Unknown"}</dd></div>
+            <div><dt>Parameters</dt><dd title={model.parameterCount ? undefined : model.parameterCountNote ?? undefined}>{model.parameterCount ? `${formatNumber(model.parameterCount / 1_000_000_000, 2)}B` : "Unknown"}</dd></div>
             <div><dt>Context</dt><dd className={context.conflict ? "conflict" : ""} title={context.conflict ? "The architecture declares a different length than the tokenizer's model_max_length; the declared value is used." : undefined}>{context.text}</dd></div>
             <div><dt>Weights dtype</dt><dd>{model.dtype ?? "Unknown"}</dd></div>
             <div><dt>Weight size</dt><dd>{formatBytes(model.weightBytes)}</dd></div>
@@ -200,9 +240,10 @@ function ModelCard({ model, residents, colorOf, connected, loadOptions, onLoadOp
       )}
       {residents.length > 0 && (
         <ul aria-label={`Resident copies of ${model.name}`} className="resident-list">
-          {residents.map((resident) => <ResidentRow busy={model.lifecycle === "unloading"} color={colorOf(resident.modelKey)} key={resident.modelKey} model={model} onUnload={onUnloadResident} resident={resident} />)}
+          {residents.map((resident) => <ResidentRow busy={model.lifecycle === "unloading"} color={colorOf(resident.modelKey)} key={resident.modelKey} model={model} onFlush={setFlushing} onUnload={onUnloadResident} resident={resident} />)}
         </ul>
       )}
+      {flushing && <FlushDialog model={model} onClose={() => setFlushing(null)} onFlush={onFlushResident} resident={flushing} />}
       {expanded && (
         <div className="model-card-detail" id={detailId}>
           <dl className="kv-grid">
@@ -290,7 +331,7 @@ function CapabilityMatrix({ models }: { models: ModelSummary[] }): React.ReactNo
   );
 }
 
-export function ModelRegistry({ models, residents, memory, maxLoadedModels, connected, loadOptionsFor, onLoadOptionsChange, onLoad, onUnloadResident, onUnloadAll, onRefresh, onSynchronize, onSelectModel }: ModelRegistryProps): React.ReactNode {
+export function ModelRegistry({ models, residents, memory, maxLoadedModels, connected, loadOptionsFor, onLoadOptionsChange, onLoad, onUnloadResident, onUnloadAll, onFlushResident, onRefresh, onSynchronize, onSelectModel }: ModelRegistryProps): React.ReactNode {
   return (
     <main className="workspace model-registry">
       <header className="page-header">
@@ -321,6 +362,7 @@ export function ModelRegistry({ models, residents, memory, maxLoadedModels, conn
                   onLoad={onLoad}
                   onLoadOptionsChange={onLoadOptionsChange}
                   onSelectModel={onSelectModel}
+                  onFlushResident={onFlushResident}
                   onUnloadResident={onUnloadResident}
                   residents={residentsOf(residents, model.id)}
                 />
