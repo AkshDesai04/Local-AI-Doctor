@@ -99,7 +99,7 @@ RUN python -m pip install \
         --requirement /requirements/requirements.lock \
         --requirement /requirements/requirements-ml.lock \
         "local-ai-doctor" \
-    && python -c "import importlib.metadata as m; t=m.version('torch'); v=m.version('torchvision'); assert '+cpu' in t and '+cpu' in v, (t,v); assert not any(d.metadata['Name'].lower().startswith('nvidia-') for d in m.distributions())"
+    && python -c "import importlib.metadata as m; t=m.version('torch'); v=m.version('torchvision'); assert '+cpu' in t and '+cpu' in v, (t,v); assert not any(d.metadata['Name'].lower().startswith('nvidia-') or d.metadata['Name'].lower() == 'bitsandbytes' for d in m.distributions())"
 
 FROM ${PYTHON_IMAGE} AS nvidia-python
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
@@ -113,7 +113,7 @@ RUN python -m pip install \
         --requirement /requirements/requirements-ml.lock \
         --requirement /requirements/requirements-cuda.lock \
         "local-ai-doctor" \
-    && python -c "import importlib.metadata as m; t=m.version('torch'); v=m.version('torchvision'); assert '+cu' in t and t.partition('+')[2] == v.partition('+')[2], (t,v)"
+    && python -c "import importlib.metadata as m; t=m.version('torch'); v=m.version('torchvision'); assert '+cu' in t and t.partition('+')[2] == v.partition('+')[2], (t,v); assert m.version('bitsandbytes') == '0.50.2'"
 
 FROM ${PYTHON_IMAGE} AS runtime-base
 ARG APP_UID=10001

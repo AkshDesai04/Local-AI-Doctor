@@ -1,4 +1,7 @@
 # Native NVIDIA override. Install after requirements-ml.lock.
 --index-url https://download.pytorch.org/whl/cu128
+# bitsandbytes (load-time 4-bit/8-bit weight quantization) is published on PyPI only.
+--extra-index-url https://pypi.org/simple
 torch==2.8.0+cu128
 torchvision==0.23.0+cu128
+bitsandbytes==0.50.2

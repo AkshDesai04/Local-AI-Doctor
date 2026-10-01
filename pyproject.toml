@@ -32,6 +32,10 @@ ml = [
   "torchvision==0.23.0",
   "transformers==4.57.6",
 ]
+# CUDA-only extras; install the CUDA torch build from requirements-cuda.lock as well.
+cuda = [
+  "bitsandbytes==0.50.2",
+]
 dev = [
   "httpx==0.28.1",
   "mypy==2.3.1",
