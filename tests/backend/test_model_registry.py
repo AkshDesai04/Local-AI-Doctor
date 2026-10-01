@@ -9,10 +9,15 @@ from typing import Any, cast
 
 import pytest
 
-from local_ai_doctor.config import AppSettings, DType
+from local_ai_doctor.config import AppSettings, DType, Quantization
 from local_ai_doctor.domain.capabilities import Capability, CapabilityState
 from local_ai_doctor.domain.models import ModelTask
-from local_ai_doctor.errors import ModelNotResidentError, OutOfMemoryError, WorkerBusyError
+from local_ai_doctor.errors import (
+    CapabilityUnavailableError,
+    ModelNotResidentError,
+    OutOfMemoryError,
+    WorkerBusyError,
+)
 from local_ai_doctor.hardware.models import (
     AcceleratorDevice,
     BackendKind,
@@ -316,5 +321,38 @@ def test_unloading_a_model_that_is_not_resident_is_a_409() -> None:
             await registry.unload("no-such-key")
         result = await registry.unload_model("a")
         assert len(result["unloaded_model_keys"]) == 2
+
+    asyncio.run(scenario())
+
+
+def test_quantized_loads_get_their_own_key_and_reach_the_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("local_ai_doctor.services.models.bitsandbytes_available", lambda: True)
+
+    async def scenario() -> None:
+        registry, worker = _registry(10 * GiB, {"a": 4 * GiB})
+        plain = await registry.load("a")
+        nf4 = await registry.load("a", quantization=Quantization.BITSANDBYTES_4BIT)
+
+        assert nf4["model_key"] != plain["model_key"]
+        assert worker.entries[nf4["model_key"]]["quantization"] == "bitsandbytes-4bit"
+
+    asyncio.run(scenario())
+
+
+def test_quantization_the_backend_cannot_run_is_refused_before_the_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("local_ai_doctor.services.models.bitsandbytes_available", lambda: False)
+
+    async def scenario() -> None:
+        registry, worker = _registry(10 * GiB, {"a": 4 * GiB})
+        with pytest.raises(CapabilityUnavailableError, match="not installed"):
+            await registry.load("a", quantization=Quantization.BITSANDBYTES_8BIT)
+        registry._models["a"].metadata = {"weight_quantization": {"method": "bitsandbytes"}}
+        with pytest.raises(CapabilityUnavailableError, match="re-quantized"):
+            await registry.load("a", quantization=Quantization.BITSANDBYTES_4BIT)
+        assert worker.loads == []
 
     asyncio.run(scenario())
