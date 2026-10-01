@@ -16,6 +16,7 @@ const labels: Record<CapabilityKey, string> = {
   top_k_alternatives: "Top-K alternatives",
   prompt_scoring: "Prompt scoring",
   attention_capture: "Attention capture",
+  token_influence: "Token influence",
   hidden_state_capture: "Hidden states",
   streaming: "Streaming",
   batching: "Batching",

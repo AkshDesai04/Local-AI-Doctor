@@ -16,6 +16,8 @@ import type {
   GenerateResponse,
   HardwareSummary,
   HealthStatus,
+  InfluenceLayer,
+  InfluenceSource,
   LoadOptions,
   LoadResult,
   MemoryLedger,
@@ -30,6 +32,8 @@ import type {
   RunStreamEvent,
   TokenAlternative,
   TokenEvent,
+  TokenInfluence,
+  TokenInfluenceRequest,
   UnloadResult,
 } from "./types";
 import { formatBytes } from "../utils/format";
@@ -137,6 +141,7 @@ const capabilityAliases: Record<string, CapabilityKey> = {
   top_k_alternatives: "top_k_alternatives",
   prompt_scoring: "prompt_scoring",
   attention_capture: "attention_capture",
+  token_influence: "token_influence",
   hidden_state_capture: "hidden_state_capture",
   streaming: "streaming",
   batching: "batching",
@@ -392,6 +397,90 @@ function normalizeAttentionAttribution(value: unknown): AttentionAttribution | u
     retainedSourceCount: asOptionalNumber(raw.retainedSourceCount ?? raw.retained_source_count) ?? sourceTokens.length,
     retainedWeight,
     omittedWeight: asOptionalNumber(raw.omittedWeight ?? raw.omitted_weight) ?? (normalized ? Math.max(0, 1 - retainedWeight) : 0),
+  };
+}
+
+function asNullableInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
+}
+
+function normalizeInfluenceSource(value: unknown): InfluenceSource | null {
+  const raw = asRecord(value);
+  const kind = raw.source_kind;
+  const contextIndex = asNullableInteger(raw.context_index);
+  const weight = asOptionalNumber(raw.weight);
+  if (kind !== "prompt" && kind !== "generated" && kind !== "image" && kind !== "video") return null;
+  if (contextIndex === null || contextIndex < 0 || weight === undefined || weight < 0) return null;
+  const span = Array.isArray(raw.span) && raw.span.length === 2 && raw.span.every((item) => Number.isInteger(item))
+    ? [Number(raw.span[0]), Number(raw.span[1])] as [number, number]
+    : null;
+  return {
+    sourceKind: kind,
+    contextIndex,
+    span,
+    tokenCount: asNullableInteger(raw.token_count) ?? (span ? span[1] - span[0] : 1),
+    tokenId: asNullableInteger(raw.token_id),
+    piece: typeof raw.piece === "string" ? raw.piece : null,
+    displayText: asString(raw.display_text ?? raw.piece, ""),
+    generatedTokenIndex: asNullableInteger(raw.generated_token_index),
+    mediaIndex: asNullableInteger(raw.media_index),
+    isSpecial: typeof raw.is_special === "boolean" ? raw.is_special : null,
+    weight,
+  };
+}
+
+function normalizeInfluenceSources(value: unknown): InfluenceSource[] {
+  return Array.isArray(value)
+    ? value.map(normalizeInfluenceSource).filter((item): item is InfluenceSource => item !== null).sort((left, right) => left.contextIndex - right.contextIndex)
+    : [];
+}
+
+export function normalizeTokenInfluence(value: unknown): TokenInfluence {
+  const raw = asRecord(value);
+  const target = asRecord(raw.target);
+  const sources = normalizeInfluenceSources(raw.sources);
+  const retainedWeight = asOptionalNumber(raw.retained_weight) ?? sources.reduce((sum, item) => sum + item.weight, 0);
+  const layers = Array.isArray(raw.layers)
+    ? raw.layers.map((item): InfluenceLayer | null => {
+      const layer = asRecord(item);
+      const index = asNullableInteger(layer.layer);
+      if (index === null) return null;
+      const layerSources = normalizeInfluenceSources(layer.sources);
+      const layerRetained = asOptionalNumber(layer.retained_weight) ?? layerSources.reduce((sum, entry) => sum + entry.weight, 0);
+      return { layer: index, sources: layerSources, retainedWeight: layerRetained, omittedWeight: asOptionalNumber(layer.omitted_weight) ?? Math.max(0, 1 - layerRetained) };
+    }).filter((item): item is InfluenceLayer => item !== null)
+    : null;
+  const method = raw.method === "gradient_x_input" ? "gradient_x_input" : "attention";
+  const objective = raw.objective === "log_probability" || raw.objective === "logit_difference" ? raw.objective : null;
+  return {
+    method,
+    runId: asString(raw.run_id, ""),
+    tokenIndex: asNullableInteger(raw.token_index) ?? 0,
+    cached: raw.cached === true,
+    target: {
+      tokenId: asNullableInteger(target.token_id) ?? -1,
+      piece: asString(target.piece, ""),
+      displayText: asString(target.display_text ?? target.piece, ""),
+      alternativeTokenId: asNullableInteger(target.alternative_token_id),
+      alternativePiece: typeof target.alternative_piece === "string" ? target.alternative_piece : null,
+    },
+    contextTokenCount: asNullableInteger(raw.context_token_count) ?? sources.length,
+    promptTokenCount: asNullableInteger(raw.prompt_token_count),
+    sources,
+    retainedWeight,
+    omittedWeight: asOptionalNumber(raw.omitted_weight) ?? Math.max(0, 1 - retainedWeight),
+    layers,
+    capturedLayers: Array.isArray(raw.captured_layers) ? raw.captured_layers.filter((item): item is number => Number.isInteger(item)) : [],
+    headsPerLayer: asNullableInteger(raw.heads_per_layer),
+    objective,
+    objectiveValue: asNullableNumber(raw.objective_value),
+    semantics: asString(raw.semantics, ""),
+    normalization: asString(raw.normalization, "sum_to_one"),
+    modelFingerprint: asNullableString(raw.model_fingerprint),
+    durationMs: asNullableNumber(raw.duration_ms),
+    placement: asNullableString(raw.placement),
+    device: asNullableString(raw.device),
+    dtype: asNullableString(raw.dtype),
   };
 }
 
@@ -986,6 +1075,17 @@ export const api = {
         distribution: selection.distribution,
         rank: selection.rank,
         token_id: selection.tokenId,
+      }),
+    }));
+  },
+  async tokenInfluence(runId: string, tokenIndex: number, body: TokenInfluenceRequest): Promise<TokenInfluence> {
+    return normalizeTokenInfluence(await request(`/runs/${encodeURIComponent(runId)}/tokens/${String(tokenIndex)}/influence`, {
+      method: "POST",
+      body: JSON.stringify({
+        method: body.method,
+        ...(body.method === "attention" ? { layers: body.layers ?? "mean" } : {}),
+        ...(body.method === "gradient_x_input" && body.alternativeTokenId !== undefined && body.alternativeTokenId !== null ? { alternativeTokenId: body.alternativeTokenId } : {}),
+        ...(body.sourceLimit !== undefined ? { sourceLimit: body.sourceLimit } : {}),
       }),
     }));
   },

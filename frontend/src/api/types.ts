@@ -16,6 +16,7 @@ export type CapabilityKey =
   | "top_k_alternatives"
   | "prompt_scoring"
   | "attention_capture"
+  | "token_influence"
   | "hidden_state_capture"
   | "streaming"
   | "batching"
@@ -306,6 +307,74 @@ export interface AttentionAttribution {
   retainedSourceCount: number;
   retainedWeight: number;
   omittedWeight: number;
+}
+
+/** A server-computed influence method; "live" is the attention captured during generation. */
+export type InfluenceMethod = "attention" | "gradient_x_input";
+export type InfluenceSourceKind = "prompt" | "generated" | "image" | "video";
+
+/** One earlier context position (or one media item's placeholder run) and its weight. */
+export interface InfluenceSource {
+  sourceKind: InfluenceSourceKind;
+  contextIndex: number;
+  /** [start, end) positions for a grouped image or video; null for a single token. */
+  span: [number, number] | null;
+  tokenCount: number;
+  tokenId: number | null;
+  piece: string | null;
+  displayText: string;
+  generatedTokenIndex: number | null;
+  mediaIndex: number | null;
+  /** True for tokenizer special tokens; null when the source did not record it. */
+  isSpecial: boolean | null;
+  weight: number;
+}
+
+export interface InfluenceLayer {
+  layer: number;
+  sources: InfluenceSource[];
+  retainedWeight: number;
+  omittedWeight: number;
+}
+
+export interface TokenInfluence {
+  method: InfluenceMethod | "live_attention";
+  runId: string;
+  tokenIndex: number;
+  cached: boolean;
+  target: {
+    tokenId: number;
+    piece: string;
+    displayText: string;
+    alternativeTokenId: number | null;
+    alternativePiece: string | null;
+  };
+  contextTokenCount: number;
+  promptTokenCount: number | null;
+  sources: InfluenceSource[];
+  retainedWeight: number;
+  omittedWeight: number;
+  layers: InfluenceLayer[] | null;
+  capturedLayers: number[];
+  headsPerLayer: number | null;
+  objective: "log_probability" | "logit_difference" | null;
+  objectiveValue: number | null;
+  semantics: string;
+  normalization: string;
+  modelFingerprint: string | null;
+  durationMs: number | null;
+  placement: string | null;
+  device: string | null;
+  dtype: string | null;
+}
+
+export interface TokenInfluenceRequest {
+  method: InfluenceMethod;
+  /** Attention only. */
+  layers?: "mean" | "all" | number[];
+  /** Gradient only: explain logit(target) − logit(alternative). */
+  alternativeTokenId?: number | null;
+  sourceLimit?: number;
 }
 
 export interface TokenEvent {

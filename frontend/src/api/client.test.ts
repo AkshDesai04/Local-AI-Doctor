@@ -714,4 +714,54 @@ describe("resident models and memory", () => {
     expect(loaded).toMatchObject({ type: "stage.changed", evictedModelKeys: ["key-a"] });
     expect(failed?.type === "error" ? failed.message : "").toMatch(/^Not enough system memory: needs 2 GiB, 1 GiB available\./);
   });
+
+  it("requests token influence in the browser shape and normalizes grouped sources", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      run_id: "run-1",
+      token_index: 3,
+      method: "gradient_x_input",
+      cached: true,
+      target: { token_id: 9, piece: "Ġyes", display_text: " yes", alternative_token_id: 12, alternative_piece: "Ġno" },
+      context_token_count: 40,
+      prompt_token_count: 37,
+      sources: [
+        { source_kind: "generated", context_index: 38, span: null, token_count: 1, token_id: 5, piece: "Ġa", display_text: " a", generated_token_index: 1, media_index: null, is_special: false, weight: 0.25 },
+        { source_kind: "image", context_index: 4, span: [4, 20], token_count: 16, token_id: null, piece: null, display_text: "image 1", generated_token_index: null, media_index: 0, is_special: false, weight: 0.5 },
+        { source_kind: "unknown", context_index: 1, weight: 0.1 },
+      ],
+      retained_weight: 0.75,
+      omitted_weight: 0.25,
+      layers: null,
+      captured_layers: [],
+      heads_per_layer: null,
+      objective: "logit_difference",
+      objective_value: 2.5,
+      semantics: "local first-order sensitivity",
+      normalization: "sum_to_one",
+      model_fingerprint: "abc",
+      duration_ms: 31.5,
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const influence = await api.tokenInfluence("run 1", 3, { method: "gradient_x_input", alternativeTokenId: 12, sourceLimit: 64 });
+
+    const [url, init] = fetchMock.mock.calls[0] ?? [];
+    expect(url).toBe("/api/v1/runs/run%201/tokens/3/influence");
+    expect(JSON.parse(init?.body as string)).toEqual({ method: "gradient_x_input", alternativeTokenId: 12, sourceLimit: 64 });
+    expect(influence).toMatchObject({ method: "gradient_x_input", cached: true, objective: "logit_difference", objectiveValue: 2.5, retainedWeight: 0.75, omittedWeight: 0.25, durationMs: 31.5 });
+    expect(influence.target).toEqual({ tokenId: 9, piece: "Ġyes", displayText: " yes", alternativeTokenId: 12, alternativePiece: "Ġno" });
+    // Unknown kinds are dropped and sources come back in context order.
+    expect(influence.sources.map((item) => [item.sourceKind, item.contextIndex, item.span, item.tokenCount])).toEqual([["image", 4, [4, 20], 16], ["generated", 38, null, 1]]);
+    expect(influence.sources[1]?.generatedTokenIndex).toBe(1);
+  });
+
+  it("sends layers only for attention", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ method: "attention", sources: [], layers: [{ layer: 2, sources: [], retained_weight: 0, omitted_weight: 1 }] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const influence = await api.tokenInfluence("run-1", 0, { method: "attention", layers: "all" });
+
+    expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)).toEqual({ method: "attention", layers: "all" });
+    expect(influence.layers).toEqual([{ layer: 2, sources: [], retainedWeight: 0, omittedWeight: 1 }]);
+  });
 });
