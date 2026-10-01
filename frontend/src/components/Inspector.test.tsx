@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { ModelSummary, RunDetails } from "../api/types";
@@ -67,9 +67,11 @@ describe("alternative-token branching", () => {
   it("keeps older runs usable when no attention attribution was captured", () => {
     render(view(true));
 
-    const attentionPanel = screen.getByLabelText("Context attention");
-    expect(attentionPanel).toHaveTextContent("Not captured for this token");
-    expect(attentionPanel).toHaveTextContent("Full or Expert instrumentation");
+    const influence = screen.getByLabelText("Influence for token 4");
+    expect(within(influence).getByRole("tab", { name: "Heatmap" })).toHaveAttribute("aria-disabled", "true");
+    expect(within(influence).queryByRole("radio", { name: "Live attention" })).toBeNull();
+    // The backend never reported token influence for this model, so nothing is offered.
+    expect(influence).toHaveTextContent("The model adapter did not report this capability.");
     expect(screen.getByText("All generated tokens")).toBeInTheDocument();
   });
 
@@ -159,6 +161,10 @@ describe("alternative-token branching", () => {
 
     render(<Inspector activeTab="tokens" branching={false} configuration={null} health={null} model={model} nerdMode onBranchAlternative={vi.fn()} onClose={vi.fn()} onSelectToken={onSelectToken} onTabChange={vi.fn()} open run={attentionRun} selectedToken={1} />);
 
+    // Live attention opens as the influence web; the heatmap is the alternative view.
+    expect(screen.getByRole("radio", { name: "Live attention" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("group", { name: /Influence web for token #1: 2 sources/ })).toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: "Heatmap" }));
     const attentionPanel = screen.getByLabelText("Context attention for token 1");
     expect(attentionPanel).toHaveTextContent("2 of 3 positions retained");
     expect(attentionPanel).toHaveTextContent("80% attention mass shown");

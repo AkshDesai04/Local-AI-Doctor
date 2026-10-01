@@ -22,7 +22,7 @@ import type { AlternativeDistribution, AttentionContextToken, CapabilityKey, Con
 import { fetchRunExport } from "../api/client";
 import { capabilityOf, supportsGeneration } from "../domain/capabilities";
 import { displayTokenText, downloadBlob, formatBytes, formatDuration, formatNumber, formatPercent, shortFingerprint, tokenTextHint } from "../utils/format";
-import { AttentionAttributionView } from "./AttentionAttribution";
+import { InfluenceSection } from "./InfluenceSection";
 import { type ChartMetric, TraceChart } from "./TraceChart";
 import { Badge, type BadgeTone, Button, Callout, Card, EmptyState, IconButton, Select, Stat, Tabs } from "./ui";
 import { VirtualTokenTable } from "./VirtualTokenTable";
@@ -135,7 +135,9 @@ function Alternatives({ title, distribution, alternatives, currentTokenId, nerdM
   );
 }
 
-function TokenDetail({ token, contextTokens, nerdMode, branching, canBranch, branchUnavailableReason, onBranchAlternative, onSelectToken }: {
+function TokenDetail({ run, model, token, contextTokens, nerdMode, branching, canBranch, branchUnavailableReason, onBranchAlternative, onSelectToken }: {
+  run: RunDetails | null;
+  model: ModelSummary | null;
   token: TokenEvent | undefined;
   contextTokens?: AttentionContextToken[];
   nerdMode: boolean;
@@ -164,7 +166,7 @@ function TokenDetail({ token, contextTokens, nerdMode, branching, canBranch, bra
         <code>{selectedTokenLabel}</code>
         <span>token #{String(token.index)}</span>
       </div>
-      <AttentionAttributionView attribution={token.attentionAttribution} contextTokens={contextTokens} onSelectGeneratedToken={onSelectToken} targetTokenIndex={token.index} />
+      {run && <InfluenceSection contextTokens={contextTokens} model={model} onSelectToken={onSelectToken} run={run} token={token} />}
       <dl className="kv-grid">
         <div><dt>Token ID</dt><dd className="mono">{String(token.tokenId)}</dd></div>
         <div><dt>Bytes</dt><dd className="mono">{token.bytes ?? "Not captured"}</dd></div>
@@ -405,7 +407,7 @@ export function Inspector({ open, model, run, health, configuration, activeTab, 
           ? [...promptContextTokens, ...generatedContextTokens]
           : undefined;
         return nerdMode
-          ? <div className="inspector-stack"><TokenDetail branchUnavailableReason={branchUnavailableReason} branching={branching} canBranch={runComplete && tokenPersisted} contextTokens={attentionContextTokens} nerdMode onBranchAlternative={onBranchAlternative} onSelectToken={onSelectToken} token={selected} /><Card flush icon={ListOrdered} title="All generated tokens"><VirtualTokenTable onSelectToken={onSelectToken} selectedToken={selectedToken} tokens={run?.tokens ?? []} /></Card></div>
+          ? <div className="inspector-stack"><TokenDetail branchUnavailableReason={branchUnavailableReason} branching={branching} canBranch={runComplete && tokenPersisted} contextTokens={attentionContextTokens} model={model} nerdMode onBranchAlternative={onBranchAlternative} onSelectToken={onSelectToken} run={run} token={selected} /><Card flush icon={ListOrdered} title="All generated tokens"><VirtualTokenTable onSelectToken={onSelectToken} selectedToken={selectedToken} tokens={run?.tokens ?? []} /></Card></div>
           : <EmptyState description="Enable Nerd Mode to inspect raw token boundaries, protocol markers, and alternative distributions." icon={Binary} title="Token details are hidden" />;
       }
       case "probability": return <div className="inspector-stack">{chart("Chosen-token probability", probabilityMetrics)}{chart("Chosen-token log probability", logProbabilityMetrics)}{chart("Uncertainty", uncertaintyMetrics)}{chart("Exact model rank", rankMetrics)}{chart("Running perplexity", perplexityMetrics)}</div>;

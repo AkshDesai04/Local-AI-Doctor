@@ -636,6 +636,46 @@ button.attention-source-token:hover { border-color: var(--accent-text); }
 .projection-view circle { fill: var(--viz-1); stroke: var(--text-primary); stroke-width: 1; }
 .projection-view text { fill: var(--text-secondary); font-size: 15px; }
 
+/* === Token influence === */
+.influence-section { background: var(--surface-2); border: 1px solid var(--border-default); border-radius: var(--radius-md); display: grid; gap: var(--space-3); min-width: 0; padding: var(--space-3); }
+.influence-header { align-items: center; display: flex; gap: var(--space-2); justify-content: space-between; min-width: 0; }
+.influence-header .tabs { flex: 1; min-width: 0; }
+.influence-panel { display: grid; gap: var(--space-3); min-width: 0; }
+.influence-panel > .attention-attribution { background: transparent; border: 0; padding: 0; }
+.influence-controls { display: grid; gap: var(--space-2); min-width: 0; }
+.influence-controls .segmented { flex-wrap: wrap; justify-self: start; max-width: 100%; }
+.influence-controls.expanded { align-items: end; gap: var(--space-3) var(--space-5); grid-template-columns: repeat(auto-fit, minmax(190px, max-content)); }
+.influence-controls.expanded .slider-field { min-width: 190px; }
+.influence-summary { align-items: center; color: var(--text-tertiary); display: flex; flex-wrap: wrap; font-size: var(--fs-11); gap: var(--space-1) var(--space-3); line-height: var(--lh-11); }
+.influence-summary strong { color: var(--text-primary); font-variant-numeric: tabular-nums; font-weight: var(--weight-medium); }
+.influence-note { flex-basis: 100%; }
+.influence-web-frame { min-width: 0; position: relative; }
+.influence-web { display: block; height: auto; overflow: visible; width: 100%; }
+.influence-web-expanded .influence-web { margin: 0 auto; width: min(100%, calc(100vh - 240px)); }
+.influence-web line, .influence-web g { transition: opacity var(--duration-fast) var(--ease-standard); }
+.influence-node { cursor: pointer; outline: none; }
+.influence-node:focus-visible .influence-node-hit { stroke: var(--accent); stroke-width: 2; }
+.influence-tooltip { background: var(--overlay); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); box-shadow: var(--elevation-1); color: var(--text-secondary); font-size: var(--fs-11); line-height: var(--lh-11); max-width: 240px; padding: var(--space-2); pointer-events: none; position: absolute; transform: translate(-50%, calc(-100% - 14px)); width: max-content; z-index: 3; }
+.influence-tooltip code { color: var(--text-primary); display: block; font-size: var(--fs-12); margin-bottom: var(--space-1); overflow-wrap: anywhere; }
+.influence-tooltip dl { display: grid; gap: 2px var(--space-2); grid-template-columns: auto 1fr; margin: 0 0 2px; }
+.influence-tooltip dl > div { display: contents; }
+.influence-tooltip dt { color: var(--text-tertiary); }
+.influence-tooltip dd { color: var(--text-primary); font-variant-numeric: tabular-nums; margin: 0; }
+.influence-tooltip small { color: var(--text-tertiary); font-size: var(--fs-11); }
+.influence-hint, .influence-compute p { color: var(--text-tertiary); font-size: var(--fs-11); line-height: var(--lh-11); margin: 0; }
+.influence-compute { align-items: start; background: var(--bg); border: 1px dashed var(--border-default); border-radius: var(--radius-sm); display: grid; gap: var(--space-2); justify-items: start; padding: var(--space-3); }
+.influence-loading { align-items: center; color: var(--text-secondary); display: flex; font-size: var(--fs-12); gap: var(--space-2); justify-content: center; min-height: 120px; }
+.influence-exports { display: flex; gap: var(--space-2); }
+.influence-table summary { color: var(--text-secondary); cursor: pointer; font-size: var(--fs-12); margin-bottom: var(--space-2); }
+.influence-table .data-table { max-height: 320px; overflow-y: auto; }
+.influence-grid { grid-template-columns: 40px minmax(0, 1.3fr) 56px minmax(0, 1.3fr) 48px; }
+.drawer.influence-dialog { width: 100%; }
+.influence-dialog .drawer-body { padding: var(--space-4) var(--space-5); }
+.influence-expanded { display: grid; gap: var(--space-4); }
+.influence-expanded-grid { align-items: start; display: grid; gap: var(--space-5); grid-template-columns: minmax(0, 1fr) minmax(300px, 420px); }
+.influence-expanded-side { display: grid; gap: var(--space-3); min-width: 0; }
+.influence-expanded-side .influence-table .data-table { max-height: calc(100vh - 400px); min-height: 160px; }
+
 /* === Responsive === */
 /* Workspace pages respond to their own width, which the inspector also changes. */
 @container (max-width: 980px) {
@@ -670,6 +710,8 @@ button.attention-source-token:hover { border-color: var(--accent-text); }
 }
 
 @media (max-width: 1120px) {
+  .influence-expanded-grid { grid-template-columns: 1fr; }
+  .influence-web-expanded .influence-web { width: min(100%, 640px); }
   .inspector { bottom: 0; box-shadow: var(--elevation-2); max-width: calc(100% - 48px); position: absolute; right: 0; top: 0; transform: translateX(105%); transition: transform var(--duration-slow) var(--ease-standard), opacity var(--duration-fast); width: 400px; }
   .inspector.open { flex-basis: auto; transform: translateX(0); width: 400px; }
 }
