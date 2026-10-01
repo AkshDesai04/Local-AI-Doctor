@@ -21,7 +21,7 @@ def write_json(path: Path, value: Any) -> None:
 def write_safetensors(path: Path, tensors: dict[str, tuple[str, list[int]]]) -> None:
     """Write a structurally valid, tiny SafeTensors fixture without the package."""
 
-    dtype_sizes = {"F32": 4, "F16": 2, "BF16": 2, "I64": 8}
+    dtype_sizes = {"F32": 4, "F16": 2, "BF16": 2, "I64": 8, "U8": 1, "I8": 1}
     header: dict[str, Any] = {}
     offset = 0
     for name, (dtype, shape) in tensors.items():

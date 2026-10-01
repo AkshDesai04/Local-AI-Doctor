@@ -91,8 +91,17 @@ def estimate_load_bytes(
 
     size = DTYPE_BYTES.get(compute_dtype, 4)
     quantized = _QUANTIZED_BYTES.get(quantization)
+    nested = config.get("text_config")
+    # A tied LM head shares the embedding matrix in memory even when the checkpoint
+    # also stores a copy (Qwen3 does), so that copy adds nothing.
+    tied = config.get("tie_word_embeddings") is True or (
+        isinstance(nested, Mapping) and nested.get("tie_word_embeddings") is True
+    )
+    embedded = any("embed_tokens" in name for name in tensors)
     weights = 0.0
     for name, shape in tensors.items():
+        if tied and embedded and name.endswith("lm_head.weight"):
+            continue
         parameters = math.prod(shape)
         if (
             quantized is not None

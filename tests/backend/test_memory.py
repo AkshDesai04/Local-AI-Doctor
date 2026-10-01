@@ -9,6 +9,7 @@ import pytest
 from local_ai_doctor.workers.memory import (
     available_ram,
     available_vram,
+    checkpoint_stored_bytes,
     checkpoint_tensor_shapes,
     device_map_kwargs,
     estimate_load_bytes,
@@ -114,3 +115,34 @@ def test_placement_is_read_back_from_the_produced_device_map() -> None:
     assert placement_of({"model.embed": 0, "model.layers.9": "cpu"}, "gpu") == "offload"
     assert placement_of({"": "cpu"}, "gpu") == "cpu"
     assert placement_of(None, "gpu") == "gpu"
+
+
+def test_a_tied_lm_head_copy_is_counted_once() -> None:
+    tied = estimate_load_bytes(TENSORS, {**CONFIG, "tie_word_embeddings": True})
+    nested = estimate_load_bytes(TENSORS, {"text_config": {"tie_word_embeddings": True}})
+    untied = estimate_load_bytes(TENSORS, CONFIG)
+
+    assert untied["weights"] == 464
+    assert tied["weights"] == nested["weights"] == 464 - 40 * 4
+
+
+def test_vision_modules_stay_at_the_compute_dtype_when_quantized() -> None:
+    tensors = {"model.visual.blocks.0.attn.qkv.weight": [8, 4]}
+    nf4 = estimate_load_bytes(
+        tensors, {}, quantization="bitsandbytes-4bit", compute_dtype="bfloat16"
+    )
+    assert nf4["weights"] == 64
+
+
+def test_prequantized_checkpoints_count_their_stored_bytes(
+    tmp_path: Path, safetensors_writer: Any
+) -> None:
+    safetensors_writer(tmp_path / "model.safetensors", {"a.weight": ("U8", [16, 1])})
+    stored = checkpoint_stored_bytes(tmp_path)
+
+    estimate = estimate_load_bytes(
+        checkpoint_tensor_shapes(tmp_path), CONFIG, stored_weight_bytes=stored, kv_reserve_tokens=1
+    )
+    assert stored == (tmp_path / "model.safetensors").stat().st_size
+    assert estimate["weights"] == stored
+    assert estimate["total"] == stored + estimate["kv_reserve"]
