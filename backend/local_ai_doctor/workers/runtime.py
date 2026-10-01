@@ -7,6 +7,7 @@ import gc
 import importlib
 import importlib.metadata
 import json
+import logging
 import math
 import os
 import queue
@@ -1185,6 +1186,9 @@ class WorkerRuntime:
 
             config_class: Any = BitsAndBytesConfig
             model_kwargs["quantization_config"] = config_class(**resident.quantization_config)
+            # LLM.int8 casts bf16 activations to fp16 inside every matmul and logs it each
+            # time; the cast is inherent to the kernel, so the per-call warning is noise.
+            logging.getLogger("bitsandbytes.autograd._functions").setLevel(logging.ERROR)
         task = str(model["task"])
         if task in {"text_generation", "encoder_decoder_generation"}:
             from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
