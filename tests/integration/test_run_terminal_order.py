@@ -206,17 +206,20 @@ def test_generation_persists_and_publishes_error_when_telemetry_has_failed(
         return {"status": "loaded"}
 
     async def fake_generate(**_kwargs: object) -> AsyncIterator[dict[str, Any]]:
-        yield {
-            "event_type": "token",
-            "payload": {
-                "token_index": 0,
-                "token_id": 42,
-                "piece": "partial",
-                "escaped_bytes": "partial",
-                "display_text": "partial",
-                "alternatives": {},
-            },
-        }
+        try:
+            yield {
+                "event_type": "token",
+                "payload": {
+                    "token_index": 0,
+                    "token_id": 42,
+                    "piece": "partial",
+                    "escaped_bytes": "partial",
+                    "display_text": "partial",
+                    "alternatives": {},
+                },
+            }
+        finally:
+            terminal_order.append("worker_stream_closed")
 
     async def failed_submit(_sql: str, _rows: object) -> None:
         terminal_order.append("telemetry_submit_failed")
@@ -296,6 +299,9 @@ def test_generation_persists_and_publishes_error_when_telemetry_has_failed(
             dtype=None,
             reservation=reservation,
         )
+        # A consumer failure must close the worker stream (which cancels the
+        # worker) before the run finishes, not whenever the generator is collected.
+        assert "worker_stream_closed" in terminal_order
         terminal = await asyncio.wait_for(observer, timeout=2)
         persisted_run = await repository.get_run(run_id)
         persisted_message = await repository.get_message(message["id"])

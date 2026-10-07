@@ -66,6 +66,7 @@ defaults:
     count: 1
     startup_timeout_seconds: 120
     load_timeout_seconds: 600
+    unload_timeout_seconds: 60
     inference_timeout_seconds: 3600
     shutdown_grace_seconds: 15
   telemetry:

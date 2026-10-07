@@ -28,7 +28,18 @@ Structured application errors use:
 }
 ```
 
-Validation errors use code `invalid_request` with a bounded `details.issues` array. Some direct HTTP resource/conflict errors use FastAPI's `{"detail":"..."}` shape. Clients should handle both.
+Validation errors use code `invalid_request` with a bounded `details.issues` array. Resource and conflict errors use the same envelope: `chat_not_found` (404, including creating a message or run in a chat that does not exist) and `run_not_found` (404), `not_found` for an unknown `/api` path (404), `run_not_cancellable`, `confirmation_required`, and `model_not_loaded` (409, unloading a model by ID while a different model is resident), and `limit_exceeded` (413). Errors raised by the router itself use the envelope too: an unsupported method on a known or unknown path returns 405 `method_not_allowed` (with the `Allow` header), and a missing static asset returns 404 `not_found`; any other framework status uses code `http_error`. The message is the canned HTTP status phrase, never request text. Client-side application routes still fall back to the frontend shell for `GET`. The bundled client also accepts the older `{"detail":"..."}` shape.
+
+Failures reported by the model worker (model load and unload, embeddings, prompt scoring) use the same envelope with the worker's error code and a status chosen from it. The message and hint are the worker's fixed, redacted text; exception text and paths never appear.
+
+| Worker code | HTTP status | Envelope `code` |
+| --- | --- | --- |
+| `model_out_of_memory`, `out_of_memory` | 507 | `out_of_memory` (the original worker code is kept in `details.worker_code`) |
+| `model_worker_timeout`, `inference_timeout` | 504 | unchanged |
+| `model_worker_state_mismatch` | 409 | unchanged |
+| any other code (for example `cuda_runtime_error`, `model_worker_error`) | 502 | unchanged |
+
+Out-of-memory and timeout failures are marked `retryable`.
 
 POST, PUT, and PATCH bodies are bounded before route parsing. Non-multipart bodies may use at most `limits.prompt_bytes + 1 MiB`; upload multipart bodies may use at most `limits.upload_bytes + 1 MiB`. The inner services separately enforce the exact prompt/content and uploaded-file limits. A declared or streamed envelope overrun returns HTTP 413 with code `limit_exceeded`.
 
@@ -88,7 +99,7 @@ The portable document uses `"schema":"local-ai-doctor/chat-workspace"` and `"sch
 | --- | --- | --- |
 | `POST` | `/runs` or `/runs/generation` | Persist and schedule a generation; returns 202 immediately. |
 | `GET` | `/runs/{run_id}` | Run record, token rows/alternatives, phase metrics, environment snapshot, and terminal summary when present. |
-| `POST` | `/runs/{run_id}/cancel` | Request cancellation for queued/loading/running work. |
+| `POST` | `/runs/{run_id}/cancel` | Request cancellation for queued/loading/running work. An unknown run returns 404 `run_not_found`; a run that has already finished returns 409 `run_not_cancellable`. |
 | `POST` | `/runs/{run_id}/replay` | Schedule a new generation from a completed run as a sibling assistant branch. |
 | `GET` | `/runs/{run_id}/export?format=json` | Run metadata and token rows. |
 | `GET` | `/runs/{run_id}/export?format=jsonl` | Durable raw protocol events as NDJSON. |
@@ -123,6 +134,8 @@ Canonical generation request:
   "attachment_ids": []
 }
 ```
+
+The endpoint also accepts a browser-shaped body: `chatId`, `modelId`, `content`, `parentMessageId`, `attachmentIds`, and a nested `settings` object with `device`, `dtype`, `instrumentation`, `reasoning`, `seed`, `deterministic`, `temperature`, `alternatives`, `maxOutputTokens`, `topK`, `topP`, `minP`, `repetitionPenalty`, `frequencyPenalty`, `presencePenalty`, and `stopSequences`. Canonical top-level fields (including `deterministic_reference_mode`) and an explicit `sampling` object always win; `settings` only fills what is not already set. An unrecognized key inside `settings` (including a snake_case one) or a `settings` value that is not an object is rejected with 422 `invalid_request`.
 
 The response includes camel-case convenience fields and canonical objects:
 
@@ -164,6 +177,8 @@ Prompt scoring is available only for causal generation models. Generic encoder-d
 The upload route determines type from content signature, not filename. It can identify PNG, JPEG, GIF, WebP, MP4, WebM, WAV, FLAC, MP3, PDF, and UTF-8 text. Identification is not acceptance: the current route accepts only native image/video/audio media advertised by the selected model. Plain-text and PDF uploads are rejected because no extracted-text inference adapter is registered; PDF extraction is not installed. Native embedding execution currently consumes local image/video paths, and audio is rejected for the supplied Qwen embedding model.
 
 Accepted media is decoder-validated before the attachment record is created. Images undergo container verification plus dimension and animation-frame checks; video and audio streams are decoded while their bounds are enforced. Defaults cap an image at 40,000,000 pixels, video at 256 decoded frames and 8,500,000 pixels per frame, cumulative animated-image/video expansion at 500,000,000 pixels, and video/audio duration at 600 seconds. These values are configurable under `limits`.
+
+Upload failures caused by the file itself are client errors, not 500s: an unrecognized signature returns 415 `unsupported_media_type`; an invalid filename, a declared MIME type that contradicts the signature, invalid UTF-8 text, or media that fails decoder validation returns 422 `invalid_upload`. Oversized files and decode limits return 413 `limit_exceeded`, and a file the selected model cannot process returns 409 `capability_unavailable`.
 
 Embedding request:
 

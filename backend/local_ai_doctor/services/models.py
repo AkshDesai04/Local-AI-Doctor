@@ -241,5 +241,5 @@ class ModelRegistry:
     async def unload(self) -> dict[str, Any]:
         async with self.admission.lifecycle("unload"):
             return await self.worker.unload(
-                timeout_seconds=self.settings.workers.shutdown_grace_seconds
+                timeout_seconds=self.settings.workers.unload_timeout_seconds
             )

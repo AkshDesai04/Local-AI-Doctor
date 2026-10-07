@@ -10,7 +10,13 @@ import pytest
 from fastapi import UploadFile
 from starlette.datastructures import Headers
 
-from local_ai_doctor.errors import PathSecurityError, PayloadTooLargeError, WorkbenchError
+from local_ai_doctor.errors import (
+    InvalidUploadError,
+    PathSecurityError,
+    PayloadTooLargeError,
+    UnsupportedMediaTypeError,
+    WorkbenchError,
+)
 from local_ai_doctor.persistence import Database, WorkspaceRepository
 from local_ai_doctor.services.uploads import UploadStore
 
@@ -69,6 +75,66 @@ async def test_mime_signature_mismatch_is_rejected_and_temp_file_is_removed(
 
     assert list(root.iterdir()) == []
     assert await database.fetch_one("SELECT COUNT(*) AS count FROM attachments") == {"count": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("data", "filename", "content_type", "modalities", "error", "status"),
+    [
+        (
+            b"\xfe\xfe\xfe not a known format",
+            "blob.bin",
+            "application/octet-stream",
+            {"text"},
+            UnsupportedMediaTypeError,
+            415,
+        ),
+        (b"plain text", "bad\x00name.txt", "text/plain", {"text"}, InvalidUploadError, 422),
+        (b"a" * 4096 + b"\xff", "malformed.txt", "text/plain", {"text"}, InvalidUploadError, 422),
+        (
+            b"\x89PNG\r\n\x1a\n" + bytes(32),
+            "fake.txt",
+            "text/plain",
+            {"image"},
+            InvalidUploadError,
+            422,
+        ),
+        (
+            b"\x89PNG\r\n\x1a\n" + bytes(32),
+            "fake.png",
+            "image/png",
+            {"image"},
+            InvalidUploadError,
+            422,
+        ),
+    ],
+    ids=[
+        "unsupported-signature",
+        "invalid-filename",
+        "invalid-utf8",
+        "mime-mismatch",
+        "undecodable-image",
+    ],
+)
+async def test_user_caused_upload_failures_are_client_errors(
+    upload_store: tuple[UploadStore, WorkspaceRepository, Database, Path],
+    data: bytes,
+    filename: str,
+    content_type: str,
+    modalities: set[str],
+    error: type[WorkbenchError],
+    status: int,
+) -> None:
+    _store, repository, _database, root = upload_store
+    store = UploadStore(root, repository, maximum_bytes=8192)
+    with pytest.raises(error) as caught:
+        await store.save(
+            _upload(data, filename, content_type), supported_modalities=frozenset(modalities)
+        )
+
+    assert type(caught.value) is error
+    assert caught.value.http_status == status
+    assert list(root.iterdir()) == []
 
 
 @pytest.mark.asyncio

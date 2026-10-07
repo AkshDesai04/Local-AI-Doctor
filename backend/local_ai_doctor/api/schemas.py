@@ -86,6 +86,24 @@ class SamplingRequest(StrictRequest):
         return value
 
 
+# Keys of the browser-shaped `settings` object (the frontend's GenerationSettings).
+_BROWSER_SETTINGS_KEYS = frozenset(
+    {"device", "dtype", "instrumentation", "reasoning", "seed", "deterministic"}
+)
+_BROWSER_SAMPLING_KEYS = {
+    "temperature": "temperature",
+    "alternatives": "alternatives",
+    "maxOutputTokens": "max_output_tokens",
+    "topK": "top_k",
+    "topP": "top_p",
+    "minP": "min_p",
+    "repetitionPenalty": "repetition_penalty",
+    "frequencyPenalty": "frequency_penalty",
+    "presencePenalty": "presence_penalty",
+    "stopSequences": "stop_sequences",
+}
+
+
 class GenerationRunCreate(StrictRequest):
     chat_id: str
     model_id: str
@@ -117,33 +135,39 @@ class GenerationRunCreate(StrictRequest):
             if source in data and target not in data:
                 data[target] = data.pop(source)
         browser_settings = data.pop("settings", None)
-        if isinstance(browser_settings, Mapping):
+        if browser_settings is not None:
+            if not isinstance(browser_settings, Mapping):
+                raise ValueError("settings must be an object")
             settings = dict(browser_settings)
+            unknown = sorted(
+                str(key)
+                for key in settings
+                if key not in _BROWSER_SETTINGS_KEYS and key not in _BROWSER_SAMPLING_KEYS
+            )
+            if unknown:
+                raise ValueError(f"unknown settings fields: {', '.join(unknown[:10])}")
+            # Top-level canonical fields always win over the nested browser shape.
             for name in ("device", "dtype", "instrumentation", "reasoning"):
                 if name in settings and name not in data:
                     data[name] = settings[name]
             raw_seed = settings.get("seed")
-            if raw_seed not in {None, ""} and "seed" not in data:
-                data["seed"] = int(raw_seed)
-            if "deterministic" in settings:
+            if raw_seed not in (None, "") and "seed" not in data:
+                try:
+                    data["seed"] = int(raw_seed)
+                except (TypeError, ValueError):
+                    raise ValueError("settings.seed must be an integer") from None
+            if "deterministic" in settings and "deterministic_reference_mode" not in data:
                 data["deterministic_reference_mode"] = settings["deterministic"]
-            sampling_aliases = {
-                "maxOutputTokens": "max_output_tokens",
-                "topK": "top_k",
-                "topP": "top_p",
-                "minP": "min_p",
-                "repetitionPenalty": "repetition_penalty",
-                "frequencyPenalty": "frequency_penalty",
-                "presencePenalty": "presence_penalty",
-                "stopSequences": "stop_sequences",
-            }
-            sampling: dict[str, Any] = {}
-            for key, item in settings.items():
-                if key in {"temperature", "alternatives"}:
-                    sampling[key] = item
-                elif key in sampling_aliases:
-                    sampling[sampling_aliases[key]] = item
-            data["sampling"] = sampling
+            explicit_sampling = data.get("sampling")
+            if explicit_sampling is None or isinstance(explicit_sampling, Mapping):
+                data["sampling"] = {
+                    **{
+                        _BROWSER_SAMPLING_KEYS[key]: item
+                        for key, item in settings.items()
+                        if key in _BROWSER_SAMPLING_KEYS
+                    },
+                    **(explicit_sampling or {}),
+                }
         return data
 
 

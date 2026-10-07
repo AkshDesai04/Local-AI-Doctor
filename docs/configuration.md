@@ -159,7 +159,8 @@ Declared `Content-Length` and streamed bytes are both checked. Oversized request
 | `startup_timeout_seconds` | `120` | Maximum wait for the spawned inference worker's IPC readiness handshake. |
 | `load_timeout_seconds` | `600` | Model-load request timeout. |
 | `inference_timeout_seconds` | `3600` | Generation, embedding, and prompt-score timeout. |
-| `shutdown_grace_seconds` | `15` | Worker unload/exit grace and model unload timeout. |
+| `unload_timeout_seconds` | `60` | Model-unload request timeout (at least `1`). A timeout recycles the worker, so this is kept separate from the shutdown grace. |
+| `shutdown_grace_seconds` | `15` | Grace for the worker to exit cleanly when the application shuts down. |
 
 ### `telemetry`
 

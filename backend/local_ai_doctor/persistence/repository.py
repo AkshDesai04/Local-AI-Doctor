@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from ..errors import ActiveRunConflictError, InvalidRequestError
+from ..errors import ActiveRunConflictError, ChatNotFoundError, InvalidRequestError
 from .database import Database, utc_now
 
 
@@ -379,7 +379,7 @@ class WorkspaceRepository:
         async with self.database.transaction() as connection:
             chat_cursor = await connection.execute("SELECT id FROM chats WHERE id = ?", (chat_id,))
             if await chat_cursor.fetchone() is None:
-                raise InvalidRequestError("chat not found", details={"chat_id": chat_id})
+                raise ChatNotFoundError("chat not found", details={"chat_id": chat_id})
             if parent_id is not None:
                 parent_cursor = await connection.execute(
                     "SELECT chat_id FROM messages WHERE id = ?", (parent_id,)
@@ -503,9 +503,25 @@ class WorkspaceRepository:
                 INSERT INTO messages(
                     id, chat_id, parent_id, role, content, status, branch_index,
                     metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, 'user', ?, 'complete', 0, '{}', ?, ?)
+                ) VALUES (
+                    ?, ?, ?, 'user', ?, 'complete',
+                    (
+                        SELECT COALESCE(MAX(branch_index), -1) + 1 FROM messages
+                        WHERE chat_id = ? AND parent_id IS ?
+                    ),
+                    '{}', ?, ?
+                )
                 """,
-                (user_message_id, chat_id, parent_message_id, user_content, now, now),
+                (
+                    user_message_id,
+                    chat_id,
+                    parent_message_id,
+                    user_content,
+                    chat_id,
+                    parent_message_id,
+                    now,
+                    now,
+                ),
             )
             await connection.execute(
                 """

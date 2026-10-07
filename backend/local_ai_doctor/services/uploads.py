@@ -15,8 +15,10 @@ from fastapi import UploadFile
 from ..errors import (
     AttachmentNotFoundError,
     CapabilityUnavailableError,
+    InvalidUploadError,
     PathSecurityError,
     PayloadTooLargeError,
+    UnsupportedMediaTypeError,
     WorkbenchError,
 )
 from ..persistence import WorkspaceRepository
@@ -141,7 +143,7 @@ class UploadStore:
                 "decoded image exceeds Pillow's decompression safety limit"
             ) from exc
         except (OSError, ValueError) as exc:
-            raise WorkbenchError("image failed decoder validation") from exc
+            raise InvalidUploadError("image failed decoder validation") from exc
 
     def _validate_av_media(self, path: Path, family: str) -> dict[str, Any]:
         try:
@@ -156,7 +158,7 @@ class UploadStore:
             with av.open(str(path), mode="r") as container:
                 streams = [stream for stream in container.streams if stream.type == family]
                 if not streams:
-                    raise WorkbenchError(f"file does not contain a decodable {family} stream")
+                    raise InvalidUploadError(f"file does not contain a decodable {family} stream")
                 stream = streams[0]
                 duration: float | None = None
                 if stream.duration is not None and stream.time_base is not None:
@@ -221,7 +223,7 @@ class UploadStore:
                                 },
                             )
                 if decoded_units == 0:
-                    raise WorkbenchError(f"file contains no decodable {family} frames")
+                    raise InvalidUploadError(f"file contains no decodable {family} frames")
                 return {
                     "duration_seconds": duration,
                     "decoded_frames": decoded_units,
@@ -231,7 +233,7 @@ class UploadStore:
         except (PayloadTooLargeError, WorkbenchError):
             raise
         except Exception as exc:
-            raise WorkbenchError(f"{family} failed decoder validation") from exc
+            raise InvalidUploadError(f"{family} failed decoder validation") from exc
 
     async def save(
         self,
@@ -242,7 +244,7 @@ class UploadStore:
     ) -> dict[str, Any]:
         original_name = Path(upload.filename or "upload").name
         if not original_name or "\x00" in original_name:
-            raise WorkbenchError("upload filename is invalid")
+            raise InvalidUploadError("upload filename is invalid")
         temporary = self.root / f".upload-{uuid.uuid4().hex}.tmp"
         digest = hashlib.sha256()
         size = 0
@@ -262,7 +264,7 @@ class UploadStore:
                     handle.write(chunk)
             detected = _detect_media_type(header)
             if detected is None:
-                raise WorkbenchError(
+                raise UnsupportedMediaTypeError(
                     "upload file signature is not supported",
                     hint="Use a supported image, video, audio, plain-text, or PDF file.",
                 )
@@ -271,14 +273,14 @@ class UploadStore:
                 try:
                     _validate_utf8(temporary)
                 except UnicodeDecodeError as exc:
-                    raise WorkbenchError("plain-text upload is not valid UTF-8") from exc
+                    raise InvalidUploadError("plain-text upload is not valid UTF-8") from exc
             claimed = (upload.content_type or "").lower()
             if (
                 claimed
                 and claimed != "application/octet-stream"
                 and _media_family(claimed) != _media_family(media_type)
             ):
-                raise WorkbenchError(
+                raise InvalidUploadError(
                     "declared MIME type does not match the file signature",
                     details={"declared": claimed, "detected": media_type},
                 )

@@ -7,7 +7,7 @@ import json
 import logging
 import secrets
 import uuid
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
@@ -21,7 +21,13 @@ from ..api.schemas import (
 )
 from ..config import AppSettings, DeviceMode, DType, InstrumentationLevel
 from ..domain.models import ModelDescriptor, ModelTask
-from ..errors import CapabilityUnavailableError, InvalidRequestError, WorkbenchError
+from ..errors import (
+    CapabilityUnavailableError,
+    ChatNotFoundError,
+    InvalidRequestError,
+    RunNotFoundError,
+    WorkbenchError,
+)
 from ..persistence import TelemetryWriter, WorkspaceRepository
 from ..workers import InferenceReservation, ModelWorkerSupervisor, WorkerFailure
 from .events import EventBroker
@@ -149,7 +155,7 @@ class RunManager:
             )
         chat = await self.repository.get_chat(request.chat_id)
         if chat is None:
-            raise WorkbenchError("chat not found", details={"chat_id": request.chat_id})
+            raise ChatNotFoundError("chat not found", details={"chat_id": request.chat_id})
         lineage: list[dict[str, Any]] = []
         if request.parent_message_id is not None:
             lineage = await self.repository.get_message_lineage(request.parent_message_id)
@@ -382,6 +388,7 @@ class RunManager:
         persisted_token_count = 0
         persisted_trace_bytes = 0
         persistence_limit_reported = False
+        stream: AsyncGenerator[dict[str, Any], None] | None = None
         try:
             await self.events.publish(
                 run_id,
@@ -398,7 +405,7 @@ class RunManager:
             started = _now()
             await self.repository.update_run(run_id, status="running", started_at=started)
             await self.repository.update_message(message_id, content="", status="streaming")
-            async for worker_event in self.worker.generate(
+            stream = self.worker.generate(
                 run_id=run_id,
                 messages=messages,
                 sampling=sampling,
@@ -410,7 +417,8 @@ class RunManager:
                 timeout_seconds=self.settings.workers.inference_timeout_seconds,
                 forced_prefix_token_ids=forced_prefix_token_ids or (),
                 reasoning=reasoning,
-            ):
+            )
+            async for worker_event in stream:
                 event_type = str(worker_event["event_type"])
                 payload = dict(worker_event.get("payload", {}))
                 if event_type == "stage" and payload.get("stage") == "prefill":
@@ -578,11 +586,19 @@ class RunManager:
             with suppress(Exception):
                 await self.events.publish(run_id, "error", error)
         finally:
+            # Close the worker stream before freeing the lease so a failure in the
+            # loop above stops the worker at once instead of when the generator is
+            # garbage collected.
+            if stream is not None:
+                with suppress(Exception):
+                    await stream.aclose()
             reservation.release()
 
     async def cancel(self, run_id: str) -> bool:
         run = await self.repository.get_run(run_id)
-        if run is None or run["status"] not in {"queued", "loading", "running"}:
+        if run is None:
+            raise RunNotFoundError("run not found", details={"run_id": run_id})
+        if run["status"] not in {"queued", "loading", "running"}:
             return False
         reservation = self._reservations.get(run_id)
         if reservation is not None and reservation.cancel_if_waiting():

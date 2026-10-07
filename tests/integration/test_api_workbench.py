@@ -5,12 +5,15 @@ import hashlib
 import json
 from functools import partial
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import Response
 from starlette.websockets import WebSocketDisconnect
 
 from local_ai_doctor.config import AppSettings, ProfileName, SettingsLoader
+from local_ai_doctor.workers import WorkerFailure
 
 API_TOKEN = "integration-test-token"
 API_HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
@@ -269,6 +272,19 @@ def test_http_origin_and_websocket_authentication_are_enforced(api_client: TestC
     )
     assert preflight.status_code == 200
     assert preflight.headers["access-control-allow-origin"] == "http://vite.test"
+
+    # Saving model roots from the Vite dev origin uses PUT.
+    put_preflight = api_client.options(
+        "/api/v1/configuration/model-roots",
+        headers={
+            "Origin": "http://vite.test",
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+    assert put_preflight.status_code == 200
+    assert put_preflight.headers["access-control-allow-origin"] == "http://vite.test"
+    assert "PUT" in put_preflight.headers["access-control-allow-methods"]
 
     malformed_preflight = api_client.options(
         "/api/v1/chats",
@@ -566,3 +582,251 @@ def test_model_refresh_replaces_fingerprint_derived_id_atomically(
     persisted = portal.call(api_client.app.state.services.repository.list_models)
     assert len(persisted) == 1
     assert persisted[0]["id"] == after["id"]
+
+
+@pytest.mark.parametrize(
+    ("worker_error", "status", "code", "retryable"),
+    [
+        (
+            {"code": "model_out_of_memory", "message": "model worker exhausted available memory"},
+            507,
+            "out_of_memory",
+            True,
+        ),
+        ({"code": "out_of_memory", "message": "out of memory"}, 507, "out_of_memory", True),
+        (
+            {"code": "model_worker_timeout", "message": "timed out"},
+            504,
+            "model_worker_timeout",
+            True,
+        ),
+        ({"code": "inference_timeout", "message": "timed out"}, 504, "inference_timeout", True),
+        (
+            {"code": "model_worker_state_mismatch", "message": "different model loaded"},
+            409,
+            "model_worker_state_mismatch",
+            False,
+        ),
+        (
+            {"code": "cuda_runtime_error", "message": "CUDA failed", "exception": "RuntimeError"},
+            502,
+            "cuda_runtime_error",
+            False,
+        ),
+        ({"message": "model worker operation failed"}, 502, "model_worker_error", False),
+    ],
+)
+def test_worker_failures_return_the_error_envelope_with_the_worker_code(
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_error: dict[str, str],
+    status: int,
+    code: str,
+    retryable: bool,
+) -> None:
+    services = api_client.app.state.services
+    model_id = api_client.get("/api/v1/models", headers=API_HEADERS).json()["models"][0]["id"]
+    error = {**worker_error, "hint": "safe guidance", "details": {"requested": "a", "loaded": "b"}}
+
+    async def failing_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise WorkerFailure(error)
+
+    async def failing_unload(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise WorkerFailure(error)
+
+    monkeypatch.setattr(services.worker, "load_model", failing_load)
+    monkeypatch.setattr(services.worker, "unload", failing_unload)
+
+    for response in (
+        api_client.post(f"/api/v1/models/{model_id}/load", headers=API_HEADERS),
+        api_client.post("/api/v1/models/unload", headers=API_HEADERS),
+        api_client.post(
+            "/api/v1/runs/prompt-score",
+            headers=API_HEADERS,
+            json={"model_id": model_id, "text": "score me"},
+        ),
+    ):
+        assert response.status_code == status
+        body = response.json()["error"]
+        assert body["code"] == code
+        assert body["message"] == worker_error["message"]
+        assert body["retryable"] is retryable
+        assert body["hint"] == "safe guidance"
+        assert body["details"]["requested"] == "a"
+        assert "RuntimeError" not in response.text
+        if worker_error.get("code") == "model_out_of_memory":
+            assert body["details"]["worker_code"] == "model_out_of_memory"
+
+
+def test_generating_into_a_missing_chat_returns_404(api_client: TestClient) -> None:
+    model_id = api_client.get("/api/v1/models", headers=API_HEADERS).json()["models"][0]["id"]
+
+    response = api_client.post(
+        "/api/v1/runs",
+        headers=API_HEADERS,
+        json={"chat_id": "no-such-chat", "model_id": model_id, "prompt": "hello"},
+    )
+
+    assert response.status_code == 404
+    error = response.json()["error"]
+    assert error["code"] == "chat_not_found"
+    assert error["details"] == {"chat_id": "no-such-chat"}
+
+
+def test_resource_and_conflict_errors_use_the_error_envelope(
+    api_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    services = api_client.app.state.services
+    model_id = api_client.get("/api/v1/models", headers=API_HEADERS).json()["models"][0]["id"]
+
+    def error_of(response: Response, status: int, code: str) -> dict[str, Any]:
+        assert response.status_code == status
+        payload = response.json()
+        assert set(payload) == {"error"}
+        assert payload["error"]["code"] == code
+        assert payload["error"]["retryable"] is False
+        return cast(dict[str, Any], payload["error"])
+
+    for method, path in (
+        ("get", "/chats/missing"),
+        ("get", "/chats/missing/export"),
+        ("get", "/chats/missing/messages"),
+        ("patch", "/chats/missing"),
+        ("delete", "/chats/missing"),
+    ):
+        kwargs = {"json": {"title": "x"}} if method == "patch" else {}
+        response = getattr(api_client, method)(f"/api/v1{path}", headers=API_HEADERS, **kwargs)
+        error = error_of(response, 404, "chat_not_found")
+        assert error["details"] == {"chat_id": "missing"}
+
+    for path in ("/runs/missing", "/runs/missing/events", "/runs/missing/export"):
+        response = api_client.get(f"/api/v1{path}", headers=API_HEADERS)
+        assert error_of(response, 404, "run_not_found")["details"] == {"run_id": "missing"}
+
+    error_of(
+        api_client.post("/api/v1/runs/missing/cancel", headers=API_HEADERS),
+        404,
+        "run_not_found",
+    )
+    error_of(
+        api_client.delete("/api/v1/chats", headers=API_HEADERS, params={"confirm": "false"}),
+        409,
+        "confirmation_required",
+    )
+    error_of(api_client.get("/api/v1/does-not-exist", headers=API_HEADERS), 404, "not_found")
+
+    too_many = api_client.post(
+        "/api/v1/embeddings",
+        headers=API_HEADERS,
+        json={
+            "model_id": model_id,
+            "inputs": [
+                {"modality": "image", "attachment_id": f"a{index}"}
+                for index in range(services.settings.limits.attachment_count + 1)
+            ],
+        },
+    )
+    error_of(too_many, 413, "limit_exceeded")
+
+    monkeypatch.setattr(services.worker, "_loaded", {"model_id": "some-other-model"})
+    other = api_client.post(f"/api/v1/models/{model_id}/unload", headers=API_HEADERS)
+    error_of(other, 409, "model_not_loaded")
+
+
+def test_unknown_browser_settings_key_is_a_422_invalid_request(api_client: TestClient) -> None:
+    response = api_client.post(
+        "/api/v1/runs",
+        headers=API_HEADERS,
+        json={"chatId": "c", "modelId": "m", "content": "hi", "settings": {"top_k": 3}},
+    )
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "invalid_request"
+    assert "top_k" in error["details"]["issues"][0]["message"]
+
+
+def test_unload_uses_its_own_timeout_not_the_shutdown_grace(
+    api_client: TestClient,
+    api_settings: AppSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = api_client.app.state.services
+    observed: list[float] = []
+
+    async def fake_unload(*, timeout_seconds: float) -> dict[str, object]:
+        observed.append(timeout_seconds)
+        return {"unloaded_model_id": None}
+
+    monkeypatch.setattr(services.worker, "unload", fake_unload)
+
+    response = api_client.post("/api/v1/models/unload", headers=API_HEADERS)
+
+    assert response.status_code == 200
+    assert api_settings.workers.shutdown_grace_seconds == 1.0
+    assert observed == [api_settings.workers.unload_timeout_seconds]
+    assert observed == [60.0]
+
+
+@pytest.mark.parametrize(
+    ("content", "content_type", "status", "code"),
+    [
+        (
+            b"\xfe\xfe\xfe not a known format",
+            "application/octet-stream",
+            415,
+            "unsupported_media_type",
+        ),
+        (b"a" * 4096 + b"\xff", "text/plain", 422, "invalid_upload"),
+        (b"\x89PNG\r\n\x1a\n" + bytes(32), "text/plain", 422, "invalid_upload"),
+    ],
+    ids=["unsupported-signature", "invalid-utf8", "mime-mismatch"],
+)
+def test_bad_uploads_return_client_error_envelopes(
+    api_client: TestClient, content: bytes, content_type: str, status: int, code: str
+) -> None:
+    model_id = api_client.get("/api/v1/models", headers=API_HEADERS).json()["models"][0]["id"]
+
+    response = api_client.post(
+        "/api/v1/attachments",
+        headers=API_HEADERS,
+        data={"model_id": model_id},
+        files={"file": ("upload.dat", content, content_type)},
+    )
+
+    assert response.status_code == status
+    assert response.json()["error"]["code"] == code
+
+
+def test_cancelling_a_finished_run_conflicts_but_a_missing_run_is_not_found(
+    api_client: TestClient,
+) -> None:
+    services = api_client.app.state.services
+    portal = api_client.portal
+    assert portal is not None
+    portal.call(
+        services.repository.create_run,
+        {"id": "finished-run", "status": "complete", "effective_seed": 0},
+    )
+
+    finished = api_client.post("/api/v1/runs/finished-run/cancel", headers=API_HEADERS)
+    assert finished.status_code == 409
+    assert finished.json()["error"]["code"] == "run_not_cancellable"
+
+    missing = api_client.post("/api/v1/runs/never-existed/cancel", headers=API_HEADERS)
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "run_not_found"
+    assert missing.json()["error"]["details"] == {"run_id": "never-existed"}
+
+
+def test_posting_a_message_to_a_missing_chat_returns_404(api_client: TestClient) -> None:
+    response = api_client.post(
+        "/api/v1/chats/no-such-chat/messages",
+        headers=API_HEADERS,
+        json={"role": "user", "content": "hello"},
+    )
+
+    assert response.status_code == 404
+    error = response.json()["error"]
+    assert error["code"] == "chat_not_found"
+    assert error["details"] == {"chat_id": "no-such-chat"}
