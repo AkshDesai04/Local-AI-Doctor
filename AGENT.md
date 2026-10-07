@@ -93,6 +93,13 @@ The following requirements came directly from the project conversation and are b
 - This feature must always be described as **post-softmax self-attention allocation averaged across captured layers and heads**. It is not causal attribution, not proof of grounding, not the probability that a source caused the selected token, and not a hallucination detector by itself.
 - The attention row belongs to the prediction step/prefix and does not depend on which vocabulary candidate the sampler ultimately selected. Residual paths, value-vector content, MLPs, normalization, and the output projection also affect the result.
 
+### 3.5.1 Token influence web
+
+- In the Nerd Mode token inspector, a selected generated token can show an influence web: the token in the centre, every shown earlier source on a ring in sequence order (prompt/history and generated arcs apart, an image or video as one grouped node), and an edge per source whose width, opacity, sequential-blue colour, and written 0-1 label carry its weight.
+- Methods: live attention (the stored capture), attention recomputed from the persisted prefix (mean or one layer), and gradient x input at the residual stream entering the first decoder layer for log p(token) or for the logit difference to a chosen alternative. Both computed methods run on demand through `POST /runs/{id}/tokens/{index}/influence` and are cached.
+- Attention must be described as **allocation**, and gradient x input as **a local first-order sensitivity**; neither is causal attribution, grounding evidence, or a hallucination detector. Every view shows that caveat.
+- Hiding special tokens rescales the rest and says so. A table, SVG/JSON export, keyboard selection, and a full-screen Expand view are part of the feature; the attention heatmap stays as the Heatmap view.
+
 ### 3.6 Interface design
 
 - The canonical primary accent is blue (`#60a5fa` in the current theme), not green.
@@ -155,6 +162,7 @@ Do not overstate these boundaries:
 - MoE schemas/interfaces exist, but no production router hook is currently composed. The supplied checkpoints are dense.
 - Hidden-state probes, activation probes, logit lens, KV-cache inspection, and continuous hardware sampling are not implemented production telemetry.
 - Attention capture is partial, bounded, decoder-only, and unavailable when the model cannot return alignable eager attention tensors.
+- Token influence is partial: decoder-only text generation only, recomputed on demand, gradient x input bounded by `influence_max_gradient_tokens` and unavailable for layer-offloaded models. Neither method is causal attribution.
 - Audio embedding is unsupported for the supplied Qwen checkpoint. PDF/text extraction is not an implemented upload adapter.
 - Nearest-neighbor indexing and persisted PCA/UMAP are not implemented services.
 - The application is single-user and loopback-oriented, not multi-tenant or internet-ready.
@@ -591,6 +599,10 @@ Implementation requirements:
 
 The frontend heat scale is normalized against the strongest retained source across prompt and generated positions together. Unretained sources are gray. Coverage displays retained/total positions, retained/omitted mass, layers × heads, method, and aggregation.
 
+### 10.7.1 Token influence
+
+Influence analysis re-tokenizes the persisted rendered prompt through generation's own path, refuses with `influence_prompt_mismatch` when the count differs, and analyzes `prompt + generated[0..t-1]` at the final position. Attention reuses `_mean_causal_self_attention(per_layer=True)` (head-weighted mean, per-layer head means). Gradient x input uses a forward pre-hook on the first decoder layer, frozen weights, eval mode, one backward pass, `|sum_d grad * h|`, normalized to one, capped by `inference.influence_max_gradient_tokens`, and refused for offloaded placements. Contiguous media placeholders group into one source before the top-`source_limit` cut, special tokens are flagged from `all_special_ids`, and retained/omitted mass is exact. Results are cached in `token_influence` (migration `0005`) per run, token, method, parameters, and fingerprint.
+
 ### 10.8 MoE telemetry
 
 Only expose routing when the architecture and runtime path genuinely provide it. Desired fields include router logits/probabilities, selected and executed experts, normalized weights, shared experts, overflow/drops, entropy, counts, load, imbalance, and drop rate.
@@ -621,7 +633,7 @@ The current returned similarity matrix is a dot product. It is cosine similarity
 
 SQLite uses one WAL-mode connection, foreign keys, explicit transactions, indexed queries, append-only migrations, and a write lock. Existing databases are backed up before pending migrations.
 
-Current migrations cover the initial schema, reasoning slices, token attention attribution, and the per-chat system prompt (`chats.system_prompt`). Never edit an already released migration; add the next migration and test upgrade, backup, restart, and failure behavior.
+Current migrations cover the initial schema, reasoning slices, token attention attribution, the per-chat system prompt (`chats.system_prompt`), and the token-influence cache (`token_influence`). Never edit an already released migration; add the next migration and test upgrade, backup, restart, and failure behavior.
 
 Persistent concepts include:
 
@@ -631,6 +643,7 @@ Persistent concepts include:
 - Generation runs and replay parentage.
 - Environment/configuration snapshots and phase metrics.
 - Token rows, alternatives, reasoning slices, and optional attention summaries.
+- Cached token-influence analyses, deleted with their run.
 - Router records/aggregates for future supported paths.
 - Embedding runs/inputs and optionally vectors.
 - Raw versioned protocol events.
@@ -734,6 +747,7 @@ Runs/scoring:
 - `POST /runs/{run_id}/cancel`
 - `POST /runs/{run_id}/replay`
 - `POST /runs/{run_id}/branch`
+- `POST /runs/{run_id}/tokens/{token_index}/influence`
 - `GET /runs/{run_id}/export?format=json|jsonl|csv`
 - `GET /runs/compare/summary?ids=...`
 - `POST /runs/prompt-score`

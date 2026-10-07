@@ -136,7 +136,8 @@ backend/local_ai_doctor/
   hardware/          probe.py (psutil/torch/nvidia-smi inventory), selection.py (device/dtype choice)
   workers/           supervisor.py (async side, spawn ctx, resident map), runtime.py (in-worker residents + sessions),
                      memory.py (pure load estimate, device maps, VRAM cap), admission.py (FIFO lease)
-  services/          models.py (ModelRegistry), runs.py (RunManager), events.py (EventBroker), uploads.py, workspace.py
+  services/          models.py (ModelRegistry), runs.py (RunManager), influence.py (InfluenceService), events.py (EventBroker),
+                     uploads.py, workspace.py
   persistence/       database.py (aiosqlite, migrations, TelemetryWriter batcher), repository.py (all SQL), migrations/*.sql
   sampling/metrics.py  numpy fp32 reference math for distributions/ranks/perplexity (see §5.7)
   reasoning/segments.py  streaming tag segmenter (<think>…</think>) with code-point slices
@@ -150,8 +151,10 @@ frontend/src/
   components/ui/     design-system primitives (Button, Tabs, Field, Switch, Card, Callout, Popover, Drawer, ...)
   styles/            tokens.css, base.css, components.css, views.css
   components/        ChatView, Composer, ContextMeter, Inspector, VirtualTokenTable, TraceChart, AttentionAttribution,
-                     GenerationControls, ModelRegistry, ModelRootSettings, EmbeddingsWorkspace, Sidebar, WorkbenchHeader
+                     GenerationControls, ModelRegistry, ModelRootSettings, EmbeddingsWorkspace, Sidebar, WorkbenchHeader,
+                     InfluenceSection (controls/fetch/table/export/Expand dialog), InfluenceWeb (radial SVG)
   domain/capabilities.ts  isUsable() etc. for capability gating
+  domain/influence.ts     influence web math: weights/top-N/hide-special/scale, ring layout, edge labels + collision pass
   utils/format.ts    displayTokenText / tokenTextHint (whitespace glyphs ␠ ↵ ⇥), formatting, downloadBlob
   utils/markdown.ts  splitAssistantOutput(): reasoning/answer/termination-marker split for normal mode
   tests/workbench.spec.ts  Playwright with intercepted fixture API
@@ -172,7 +175,7 @@ Browser/Electron -> static UI + same-origin /api/v1 + /ws/v1
        --multiprocessing "spawn" Queues (bounded dicts only)--> worker process: workers/runtime.py WorkerRuntime
 ```
 - Model, tokenizer, processor, CUDA state, KV caches, and full-vocabulary tensors exist **only** in the worker.
-- Worker commands are dicts with `op` set to one of `load | unload | generate | cancel | embed | score_prompt | memory_status | flush | shutdown`. Model ops take an optional `model_key` (absent means the active resident).
+- Worker commands are dicts with `op` set to one of `load | unload | generate | cancel | embed | score_prompt | analyze_influence | memory_status | flush | shutdown`. Model ops take an optional `model_key` (absent means the active resident).
 - The worker sends back `ready`, `reply` (`request_id`, `ok`, `payload|error`), `run_event` (`run_id`, `event_type`, `payload`), and `diagnostic` (a bounded traceback that stays in logs).
 - Errors crossing the boundary go through `_safe_error`, which returns a generic code/message plus the exception class name only, with no paths or exception text.
 - The worker sets `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`, and `CUBLAS_WORKSPACE_CONFIG` before torch is imported.
@@ -221,6 +224,7 @@ Routes (all under `/api/v1`):
   - `runs/{id}` (run with `tokens`, `branchable_through_token_index`, `phases`, `environment`, `summary`, `warnings`)
   - `runs/{id}/events`, `runs/{id}/cancel`, `runs/{id}/replay`
   - `runs/{id}/branch` (body `{tokenIndex, distribution: "raw"|"sampling", rank, tokenId}`)
+  - `runs/{id}/tokens/{index}/influence` (body `{method: "attention"|"gradient_x_input", layers?, alternativeTokenId?, sourceLimit?}`; cached)
   - `runs/{id}/export?format=json|jsonl|csv`, `runs/compare/summary?ids=` (2 to 8), `runs/prompt-score`
 - **Media:** `attachments` or `uploads` (multipart `model_id` + `file`), `attachments/{id}/content`, `embeddings` or `runs/embeddings`.
 
@@ -345,6 +349,10 @@ Inside the worker (`GenerationSession`):
   - The route computes `similarityMatrix` as a **dot product**, which is cosine only when vectors are normalized.
   - The Qwen3-VL embedding loader applies a key mapping `^model\.` → `""` (`_embedding_model_kwargs`). Don't remove it without revalidation.
 - **Prompt scoring:** a teacher-forced causal pass that excludes the first position.
+- **Token influence** (`services/influence.py` → worker `_analyze_influence`):
+  - Validates a `complete`/`cancelled` decoder-only generation, a token inside the durable prefix, and the same registered fingerprint (else 409 `model_fingerprint_changed`); answers from the `token_influence` cache; otherwise takes a lease (`influence_analysis`), calls `load_reserved` with the run's recorded device/dtype/quantization/strict_vram, and sends the persisted `rendered_prompt`, the `prompt_renderer` recorded in the tokenization phase details, lineage media, and the generated prefix.
+  - The worker re-tokenizes through `_encode_prompt` (shared with `GenerationSession`) and refuses a count mismatch (`influence_prompt_mismatch`). Attention: efficient prefix + one eager step, `_mean_causal_self_attention(per_layer=True)`. Gradient x input: pre-hook on the first decoder layer (`_first_decoder_layer`), frozen weights, `|sum_d grad * h|` for `log p(target)` or `logit(target) - logit(alt)`, capped by `inference.influence_max_gradient_tokens`, refused for offload.
+  - Media placeholder runs group into one source before the top-`sourceLimit` cut; `is_special` comes from `all_special_ids`. Describe attention as allocation and gradient x input as a local first-order sensitivity; never as causal attribution.
 
 ### 5.8 Events (`services/events.py`)
 - Envelope: `{version:1, run_id, sequence (per-run, from 1), type, monotonic_ns, server_time, payload}`.
@@ -355,7 +363,7 @@ Inside the worker (`GenerationSession`):
 
 ### 5.9 Persistence (`persistence/`)
 - One aiosqlite connection, WAL, foreign keys, a write lock, and explicit transactions. **All SQL lives in `repository.py`**, except the token and alternative INSERTs in `runs.py` and the raw-event INSERT in `main.py`, which go through `TelemetryWriter.submit`.
-- Migrations: `0001_initial.sql`, `0002_token_reasoning_slices.sql` (`reasoning_slices_json`), `0003_token_attention_attribution.sql` (`attention_attribution_json`), `0004_chat_system_prompt.sql` (`chats.system_prompt`). They are **append-only**: add `000N_*.sql` and never edit an applied one.
+- Migrations: `0001_initial.sql`, `0002_token_reasoning_slices.sql` (`reasoning_slices_json`), `0003_token_attention_attribution.sql` (`attention_attribution_json`), `0004_chat_system_prompt.sql` (`chats.system_prompt`), `0005_token_influence.sql` (`token_influence` cache, cascades with its run). They are **append-only**: add `000N_*.sql` and never edit an applied one.
 - Tables:
   - `models` and `model_capabilities`
   - `chats` (pinned, archived, optional `system_prompt`) and `messages` (a parent_id tree with `branch_index`; status `pending|streaming|complete|cancelled|failed`)
@@ -398,6 +406,7 @@ Inside the worker (`GenerationSession`):
 - **Normal mode vs Nerd Mode:**
   - Normal mode uses safe Markdown: `react-markdown`, GFM, math/KaTeX, and raw HTML is **never** rendered. `splitAssistantOutput` hides protocol and termination markers and puts reasoning in a collapsed `<details>` labeled `Thinking…`. Copy strips markers.
   - Nerd Mode shows raw tokens colored by raw probability, sampler probability, surprise, latency, or segment. Clicking a token locks the inspector selection, which exposes raw and sampler alternatives and "Branch out with selected token". Very old token boundaries collapse past 1,200.
+  - The token detail's Influence section shows the influence web (live attention, recomputed attention, or gradient x input; computed methods run only after "Compute"), the attention heatmap as its Heatmap tab, a table, SVG/JSON export, and an Expand dialog portaled to `document.body`. Web text scales so it never renders below 11px.
   - Token chips are a fixed 30 px high and use `displayTokenText`/`tokenTextHint`, keeping the raw piece in the tooltip.
 - **Inspector tabs:** Overview, Tokens, Probability, Timing, Experts, Context, Embeddings, Hardware, Configuration, Raw Events. Each is capability-gated with an exact reason, and none is ever filled with fake data. Chart tooltips outside Nerd Mode must not leak hidden token text.
 - **Composer:** a popover sets reasoning, temperature, top-k, top-p, and the chat's system prompt (`useWorkbench` debounces the PATCH by 500 ms, flushes it before submit, and keeps a draft for a chat without an id until create). A "System prompt active" composer icon and a collapsed card at the top of `ChatView` show it. Enter sends and Shift+Enter inserts a newline. `GenerationControls` exposes the full settings: token, device, dtype, instrumentation, seed, deterministic mode, all sampler knobs, stop sequences, and reset to backend defaults. Ctrl/Cmd+K creates a new chat when connected.
@@ -478,7 +487,7 @@ Inside the worker (`GenerationSession`):
 - A CUDA request runs on CUDA or fails clearly. There is no silent CPU fallback in Docker. The UI's device selection is intent, not proof.
 - One worker process, N resident models bounded by VRAM and `max_loaded_models`, one admitted job at a time (a comparison is one job). Residents the running job uses are never evicted; Strict VRAM (default) fails with 507 rather than spilling into system RAM. Don't raise worker counts without revalidating ordering and shutdown.
 - Reasoning presentation rules (normal vs Nerd Mode). Never rebuild visible text by concatenating tokenizer pieces.
-- Attention is described only as allocation, never causation. Perplexity is not factuality. Alternatives are "top alternatives under this distribution".
+- Attention is described only as allocation, never causation; gradient x input only as a local first-order sensitivity. Perplexity is not factuality. Alternatives are "top alternatives under this distribution".
 - Unsupported features stay visible and disabled with a reason. No demo or fake telemetry in real sessions.
 - Errors and logs never contain prompts, outputs, tokens, credentials, or unredacted paths (`logging.log_prompts`/`log_model_output` must stay false).
 - Blue accent, readability floor, 30 px token chips, accessibility.

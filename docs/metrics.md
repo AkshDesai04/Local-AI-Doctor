@@ -99,6 +99,39 @@ Persisting every source weight for every generated token would grow quadraticall
 
 Capture is supported only for decoder-only causal text generation. Encoder-decoder models have distinct decoder self-attention and encoder cross-attention distributions, so the workbench does not merge them into a misleading single score. A model must also support switching to eager attention and expose usable per-layer tensors. Otherwise the run emits an `attention_capture_unavailable` warning and continues without attribution.
 
+## Token influence (on demand)
+
+`POST /runs/{run_id}/tokens/{token_index}/influence` answers, for one generated token `y_t`, how much each earlier context position weighed in its prediction by one stated method. Both methods recompute from the persisted run instead of reading the live capture, so they work at any instrumentation level once the run is `complete` or `cancelled`.
+
+**The re-run sequence.** The worker re-tokenizes the persisted `rendered_prompt` exactly as generation did (`_encode_prompt`: the tokenizer with `add_special_tokens=False`, the plain-text fallback's BOS when the run's recorded `prompt_renderer` is `plain_text_fallback`, and the processor with the conversation's image/video attachments for media runs). If that does not reproduce the run's `prompt_token_count`, the request fails with 409 `influence_prompt_mismatch` instead of analyzing a different sequence. The analyzed sequence is `ids = prompt_ids + generated_ids[0..t-1]` of length `S`; position `S-1` is the one whose logits predicted `y_t`.
+
+**Attention.** As live capture does, an efficient-kernel forward fills the cache for positions `0..S-2`, then one eager step at `S-1` returns each layer's post-softmax rows. For layer `l` with `H_l` heads:
+
+```text
+layer_row[l,j] = (1 / H_l) * sum over h of A[l,h,S-1,j]          (sliding-window layers left-padded with 0)
+mean_row[j]    = sum over l,h of A[l,h,S-1,j] / sum over l of H_l  (the live statistic)
+selected[j]    = sum over l in L of H_l * layer_row[l,j] / sum over l in L of H_l
+```
+
+Every row is clamped at zero for float underflow and renormalized to unit mass. `layers` may be `"mean"`, `"all"` (the mean plus one entry per captured layer), or a list of layer indices (their head-weighted mean plus one entry per layer). The rows are the same whichever vocabulary candidate is the target, and they are allocation, not causation: the caveats of [Context attention attribution](#context-attention-attribution) apply unchanged. Up to kernel floating-point differences the mean equals the live capture for the same token.
+
+**Gradient x input.** Let `h_i` (dimension `d`) be the residual stream entering the first text-decoder layer at position `i`: the token embeddings after any family-specific scaling, with image/video features already merged. A forward pre-hook replaces that input with a detached leaf, so `input_ids` (and therefore RoPE/mRoPE positions and media merging) are unchanged. With `z` the final-position logits in fp32:
+
+```text
+f = log_softmax(z)[target]                         (default: the chosen token)
+f = z[target] - z[alternative]                     (when alternativeTokenId is set)
+score_i  = | sum over d of (df / dh[i,d]) * h[i,d] |
+weight_i = score_i / sum over k of score_k
+```
+
+The model stays in eval mode (no dropout) with every weight frozen; one forward and one backward pass run over the whole sequence and the graph is freed afterwards. The response reports `objective` (`log_probability` in nats, or `logit_difference` in logits) and its recomputed `objective_value`; for the chosen token the latter should match the run's recorded raw log probability up to kernel differences. This is the first-order Taylor term of `f` along each position's input vector: a local sensitivity. The absolute value drops the sign, saturated or non-linear effects are invisible to it, and it is not causal attribution. Features a model injects after the first decoder layer (for example Qwen3-VL's deepstack visual features) bypass `h` and are not attributed.
+
+**Sources and normalization.** Contiguous image (or video) placeholder positions that belong to one attachment are grouped into a single source (`source_kind` `image`/`video`, `span` `[start, end)`, `token_count`, weight = the sum of its positions) before ranking, so one image competes as one source. Every other position is a `prompt` or `generated` source. `is_special` is true exactly for ids in the tokenizer's `all_special_ids`; template text such as role names is not special, and media groups are never special. The `source_limit` (8 to 512, default 128) heaviest sources are kept and reported in context order with their original weights; `retained_weight` is their exact sum and `omitted_weight = 1 - retained_weight`. Retained weights are not renormalized. Generated sources carry the text the run streamed rather than a one-token decode. All weights are dimensionless shares that sum to one across the full sequence (`normalization: "sum_to_one"`).
+
+**In the UI.** Edge labels show the weight with two decimals, or `<0.01` below one hundredth. "Relative to max" divides by the largest shown weight. Hiding special tokens divides each remaining weight by `1 - (sum of retained special weights)`, counting positions beyond the retained limit as visible because their status is unknown; the view states that rescale. The live-attention option shows the stored live capture: it has no special-token flags and keeps media placeholders as single positions, because only the top retained positions were stored.
+
+**Unavailable states.** Encoder-decoder and embedding models, runs that are not `complete`/`cancelled`, and models that cannot switch to eager attention return 409 `influence_unavailable`; a token beyond the contiguous persisted prefix, a bad method/field combination, an out-of-range layer, or an alternative equal to the chosen token returns 422 `invalid_request`; a changed or unregistered checkpoint returns 409 `model_fingerprint_changed`; gradient x input on a layer-offloaded model returns 409 `influence_offload_unsupported`, and on a sequence longer than `inference.influence_max_gradient_tokens` 409 `influence_sequence_too_long`; running out of device memory returns 507. Results are cached per run, token, method, canonical parameters, and model fingerprint.
+
 ## Prompt scoring
 
 `POST /api/v1/runs/prompt-score` performs a separate teacher-forced forward pass for causal generation models only. Encoder-decoder scoring is rejected because this endpoint has one text field rather than distinct source and target inputs. For tokens `x_0 ... x_(n-1)`, the logit row at position `t-1` scores target `x_t`. The first token has no preceding in-sequence distribution and is excluded.

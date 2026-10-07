@@ -284,6 +284,7 @@ The portable document uses `"schema":"local-ai-doctor/chat-workspace"` and `"sch
 | `GET` | `/runs/{run_id}` | Run record, token rows/alternatives, phase metrics, environment snapshot, and terminal summary when present. |
 | `POST` | `/runs/{run_id}/cancel` | Request cancellation for queued/loading/running work. An unknown run returns 404 `run_not_found`; a run that has already finished returns 409 `run_not_cancellable`. |
 | `POST` | `/runs/{run_id}/replay` | Schedule a new generation from a completed run as a sibling assistant branch. |
+| `POST` | `/runs/{run_id}/tokens/{token_index}/influence` | Weigh every earlier context position for one generated token by attention or gradient x input (cached). |
 | `GET` | `/runs/{run_id}/export?format=json` | Run metadata and token rows. |
 | `GET` | `/runs/{run_id}/export?format=jsonl` | Durable raw protocol events as NDJSON. |
 | `GET` | `/runs/{run_id}/export?format=csv` | Selected token identity, likelihood, timing, and segment columns. |
@@ -348,6 +349,52 @@ When the chat has a system prompt, generation prepends it as a `system` message 
 Generation, embeddings, and prompt scoring share single-worker admission. At most one job is runnable/active and `runtime.queue_limit` additional operations may wait. Queue overflow is a structured 429 and occurs before a generation creates chat/run state. Explicit model load/unload returns a worker-busy conflict while any inference is admitted.
 
 Replay requires a completed generation, an attached assistant/user branch, and a currently registered model with the recorded fingerprint. It creates a new assistant sibling and run linked through `parent_run_id`, reconstructs that branch's messages, and executes with the recorded seed, sampler, instrumentation, and deterministic-mode settings. The response has the same `runId`, `messageId`, `websocketUrl`, `run`, and `assistant_message` fields as creation, plus `parentRunId`. Replay is a new forward pass; matching output still depends on the recorded environment being reproducible.
+
+#### Token influence
+
+`POST /runs/{run_id}/tokens/{token_index}/influence` weighs every earlier context position for one generated token by one stated method, recomputed from the persisted prefix. The run must be a `complete` or `cancelled` decoder-only generation whose model is still registered with the run's fingerprint, and the token must lie inside the contiguous persisted prefix (`branchable_through_token_index`). The first request for a parameter set takes an admission lease (429 when the queue is full), makes the model resident with the run's recorded device, dtype, quantization, and Strict VRAM, and runs the worker op `analyze_influence`; the result is cached, and a repeated request returns it with `cached: true`.
+
+Body (browser camelCase; snake_case is also accepted):
+
+```json
+{"method": "attention", "layers": "all", "sourceLimit": 128}
+{"method": "gradient_x_input", "alternativeTokenId": 1234, "sourceLimit": 128}
+```
+
+- `method`: `attention` (post-softmax self-attention at the predicting position) or `gradient_x_input` (|gradient · input| at the residual stream entering the first decoder layer).
+- `layers` (attention only): `"mean"` (default), `"all"`, or a list of layer indices.
+- `alternativeTokenId` (gradient only): explain `logit(target) - logit(alternative)` instead of `log p(target)`; it must differ from the chosen token.
+- `sourceLimit`: 8 to 512 sources after grouping, default 128.
+
+Response:
+
+```json
+{
+  "run_id": "RUN_UUID", "token_index": 6, "method": "attention", "cached": false,
+  "target": {"token_id": 12095, "piece": "Paris", "display_text": "Paris", "alternative_token_id": null, "alternative_piece": null},
+  "context_token_count": 39, "prompt_token_count": 33, "source_limit": 128,
+  "sources": [
+    {"source_kind": "prompt", "context_index": 0, "span": null, "token_count": 1, "token_id": 151644, "piece": "<|im_start|>",
+     "display_text": "<|im_start|>", "generated_token_index": null, "media_index": null, "is_special": true, "weight": 0.55},
+    {"source_kind": "image", "context_index": 14, "span": [14, 78], "token_count": 64, "token_id": null, "piece": null,
+     "display_text": "image 1", "generated_token_index": null, "media_index": 0, "is_special": false, "weight": 0.12},
+    {"source_kind": "generated", "context_index": 37, "span": null, "token_count": 1, "token_id": 374, "piece": "Ġis",
+     "display_text": " is", "generated_token_index": 4, "media_index": null, "is_special": false, "weight": 0.06}
+  ],
+  "retained_weight": 1.0, "omitted_weight": 0.0,
+  "layers": [{"layer": 0, "sources": [], "retained_weight": 1.0, "omitted_weight": 0.0}],
+  "captured_layers": [0, 1], "heads_per_layer": 16,
+  "objective": null, "objective_value": null,
+  "semantics": "Post-softmax self-attention ... Allocation, not causal attribution.",
+  "normalization": "sum_to_one", "special_token_source": "tokenizer.all_special_ids",
+  "attention_implementation": "eager", "placement": "gpu", "device": "cuda:0", "dtype": "bfloat16",
+  "model_fingerprint": "FINGERPRINT", "duration_ms": 41.2
+}
+```
+
+`sources` are the `source_limit` heaviest sources in context order with their original weights (not renormalized); contiguous image/video placeholders of one attachment form one source with a `span`. `layers` is `null` unless `layers` was `"all"` or a list. For `gradient_x_input`, `captured_layers` is empty, `heads_per_layer` is `null`, and `objective` is `log_probability` or `logit_difference` with the recomputed `objective_value`. Definitions and normalization are in [Metrics](metrics.md#token-influence-on-demand).
+
+Errors: 404 `run_not_found`; 409 `influence_unavailable` (not a generation run, run not `complete`/`cancelled`, not a decoder-only model, no persisted prompt, eager attention unavailable), `model_fingerprint_changed`, `influence_prompt_mismatch` (details `expected_prompt_tokens`, `actual_prompt_tokens`), `influence_sequence_too_long` (details `sequence_tokens`, `max_sequence_tokens`), `influence_offload_unsupported`; 422 `invalid_request` (token outside the persisted prefix, method/field mismatch, out-of-range layer with `layer_count`, out-of-vocabulary id with `vocabulary_size`); 429 when the admission queue is full; 507 `out_of_memory`.
 
 Prompt-score body:
 
